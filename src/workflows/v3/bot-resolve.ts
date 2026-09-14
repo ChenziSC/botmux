@@ -72,6 +72,7 @@ export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotS
     larkAppId: bot.larkAppId,
     cliId: bot.cliId,
     ...(bot.cliPathOverride ? { cliPathOverride: bot.cliPathOverride } : {}),
+    ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),
     ...(bot.model ? { model: bot.model } : {}),
     ...(bot.sandbox === true ? { sandbox: true } : {}),
     ...(sandboxPathsSnapshot(bot.sandboxPaths) ? { sandboxPaths: sandboxPathsSnapshot(bot.sandboxPaths)! } : {}),
@@ -136,6 +137,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     'larkAppId',
     'cliId',
     'cliPathOverride',
+    'wrapperCli',
     'model',
     'sandbox',
     'sandboxPaths',
@@ -165,7 +167,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     if (typeof obj.workingDir !== 'string' || obj.workingDir.length === 0) {
       throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].workingDir must be a non-empty string`);
     }
-    for (const field of ['cliPathOverride', 'model'] as const) {
+    for (const field of ['cliPathOverride', 'wrapperCli', 'model'] as const) {
       if (obj[field] !== undefined && typeof obj[field] !== 'string') {
         throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].${field} must be a string`);
       }
@@ -207,6 +209,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
       larkAppId: obj.larkAppId,
       cliId: obj.cliId as BotSnapshot['cliId'],
       ...(obj.cliPathOverride !== undefined ? { cliPathOverride: obj.cliPathOverride as string } : {}),
+      ...(obj.wrapperCli !== undefined ? { wrapperCli: obj.wrapperCli as string } : {}),
       ...(obj.model !== undefined ? { model: obj.model as string } : {}),
       ...(obj.sandbox !== undefined ? { sandbox: obj.sandbox as boolean } : {}),
       ...(parsedSandboxPaths ? { sandboxPaths: parsedSandboxPaths } : {}),

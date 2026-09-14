@@ -6428,7 +6428,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   workflow list [--json] | show <名称|workflowId>
                                        运行 / 查看 Saved Workflow
   workflow new|spec-finalize|approve-spec|revise-spec|architect|revise-dag [...]
-  workflow approve-dag|start [...]     创建、修订并运行一次性即兴 Workflow
+  workflow approve-dag|start [...]     创建、修订并运行一次性即兴 Workflow；approve-dag 支持 --working-dir
   workflow cancel <runId> [--reason <text>] [--bot <larkAppId>]
                                        持久化取消 v3 run 并中断活动节点
   workflow retry|grant [...]           处理受阻节点 / loop

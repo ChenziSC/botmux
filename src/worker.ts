@@ -168,6 +168,7 @@ import {
 } from './bot-registry.js';
 import { readGlobalConfig, isWorkflowFeatureEnabled } from './global-config.js';
 import {
+  shouldWrapCommandInSessionScope,
   stopSessionScope,
   wrapCommandInSessionScope,
 } from './core/session-scope.js';
@@ -15888,7 +15889,13 @@ async function spawnCli(
     if (codexAppControlBootstrapPathForSpawn) {
       childEnv[CODEX_APP_CONTROL_BOOTSTRAP_ENV] = codexAppControlBootstrapPathForSpawn;
     }
-    if (!cfg.adoptMode && !willReattachPersistent && !isRemoteBackendType(effectiveBackendType)) {
+    const workflowWorker = isWorkflowWorker();
+    if (shouldWrapCommandInSessionScope({
+      adoptMode: !!cfg.adoptMode,
+      willReattachPersistent,
+      remoteBackend: isRemoteBackendType(effectiveBackendType),
+      workflowWorker,
+    })) {
       // Wrap the command executed INSIDE the pane, not `tmux new-session`.
       // The shared tmux server keeps its own cgroup while the owned CLI and all
       // of its command descendants enter this per-session scope.
@@ -15914,6 +15921,12 @@ async function spawnCli(
       } else if (scoped.capabilities.reason) {
         log(`Session scope unavailable; using backend lifecycle cleanup: ${scoped.capabilities.reason}`);
       }
+    } else if (workflowWorker) {
+      // A workflow attempt already has a durable worker fence and always uses a
+      // throwaway worker. Its tmux backend owns a deterministic, disposable
+      // session and the pool's close/TERM/KILL path remains the attempt lifecycle
+      // authority, so do not nest another systemd scope around the pane command.
+      log('Workflow worker: using direct backend lifecycle under the attempt worker fence');
     }
     backend.spawn(spawnBin, spawnArgs, {
       cwd: spawnCwd,

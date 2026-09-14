@@ -1513,7 +1513,7 @@ botmux workflow architect <runId>
 
 > 编排好的流程是这样，对吗？确认就开跑。
 
-用户确认 → \`botmux workflow approve-dag <runId>\`，然后 \`botmux workflow start <runId>\` 交 daemon 驱动开跑（**别用 \`botmux v3 run\`**——那是 dev 终端路径，没有飞书审批卡）。daemon 路径下，节点的 \`risk_gate\`（humanGate）执行期会在本话题**弹审批卡**，用户点「通过/拒绝」才继续；daemon 重启也能恢复待审批的卡。要改：需求要改 → \`botmux workflow revise-spec <runId>\`（退回 grilling，原 DAG 作废）重走 grill→spec→architect；需求没变、只是流程不满意 → \`botmux workflow revise-dag <runId>\`（退回 spec_approved）重跑 architect 重编。
+用户确认 → \`botmux workflow approve-dag <runId> --working-dir <任务工作目录>\`，然后 \`botmux workflow start <runId>\` 交 daemon 驱动开跑。\`--working-dir\` 会在 Gate-2 把 DAG 中所有机器人快照锁到同一个任务目录；研发任务应传入已确认的具体 Featspace 根目录。**别用 \`botmux v3 run\`**——那是 dev 终端路径，没有飞书审批卡。daemon 路径下，节点的 \`risk_gate\`（humanGate）执行期会在本话题**弹审批卡**，用户点「通过/拒绝」才继续；daemon 重启也能恢复待审批的卡。要改：需求要改 → \`botmux workflow revise-spec <runId>\`（退回 grilling，原 DAG 作废）重走 grill→spec→architect；需求没变、只是流程不满意 → \`botmux workflow revise-dag <runId>\`（退回 spec_approved）重跑 architect 重编。
 
 ## 关键纪律
 - 全程飞书一问一答，用 botmux send 对话。

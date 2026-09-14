@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   probeSessionScopeCapabilities,
   sessionScopeUnitName,
+  shouldWrapCommandInSessionScope,
   stopSessionScope,
   userSystemdBusEnv,
   wrapCommandInSessionScope,
@@ -12,6 +13,20 @@ function result(status: number, stdout = '', stderr = ''): any {
 }
 
 describe('owned session systemd scope', () => {
+  it('wraps only ordinary local fresh sessions, never workflow workers', () => {
+    const base = {
+      adoptMode: false,
+      willReattachPersistent: false,
+      remoteBackend: false,
+      workflowWorker: false,
+    };
+    expect(shouldWrapCommandInSessionScope(base)).toBe(true);
+    expect(shouldWrapCommandInSessionScope({ ...base, workflowWorker: true })).toBe(false);
+    expect(shouldWrapCommandInSessionScope({ ...base, adoptMode: true })).toBe(false);
+    expect(shouldWrapCommandInSessionScope({ ...base, willReattachPersistent: true })).toBe(false);
+    expect(shouldWrapCommandInSessionScope({ ...base, remoteBackend: true })).toBe(false);
+  });
+
   it('derives the canonical user bus environment from a verified socket', () => {
     const isSocket = vi.fn((path: string) => path === '/run/user/1001/bus');
     expect(userSystemdBusEnv({ platform: 'linux', uid: 1001, isSocket })).toEqual({

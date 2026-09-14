@@ -172,6 +172,18 @@ export interface ScopedCommand {
   capabilities: SessionScopeCapabilities;
 }
 
+export function shouldWrapCommandInSessionScope(options: {
+  adoptMode: boolean;
+  willReattachPersistent: boolean;
+  remoteBackend: boolean;
+  workflowWorker: boolean;
+}): boolean {
+  return !options.adoptMode
+    && !options.willReattachPersistent
+    && !options.remoteBackend
+    && !options.workflowWorker;
+}
+
 export function wrapCommandInSessionScope(
   sessionId: string,
   bin: string,

@@ -59,6 +59,24 @@ describe('Codex startup readiness', () => {
     expect(idle).toHaveBeenCalledTimes(1);
   });
 
+  it('releases a resumed 0.154 session that redraws the composer and Context footer without the loaded banner', () => {
+    detector.feed(LOADING);
+    detector.reset();
+    detector.feed('› Ask Codex to do anything\n  gpt-6-astra low · Context 85% used · weekly 38% left');
+    quiet();
+    expect(idle).toHaveBeenCalledTimes(1);
+    expect(detector.isStartupPending()).toBe(false);
+  });
+
+  it('accepts the same resumed screen when cursor movement removes the line boundary', () => {
+    detector.feed(LOADING);
+    detector.reset();
+    detector.feed('› Ask Codex to do anything\x1b[49;1H  gpt-6-astra low · Context 85% used');
+    quiet();
+    expect(idle).toHaveBeenCalledTimes(1);
+    expect(detector.isStartupPending()).toBe(false);
+  });
+
   it('accepts a warm initialized session and its later ordinary prompt', () => {
     detector.feed(LOADED);
     quiet();

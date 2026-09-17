@@ -449,7 +449,12 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // models/paths. The footer can already show a model during loading. Match
     // cell boundaries, not literal newlines: PTY redraws also move the cursor.
     startupPendingPattern: /│[ \t]+(?:model|directory):[ \t]+loading\b/,
-    startupReadyPattern: /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/,
+    // Fresh starts render the initialized model/directory banner. A resumed
+    // Codex 0.154 session may instead replace the loading skeleton directly
+    // with the composer plus its Context footer, without redrawing that banner.
+    // Require both anchors for the resume form: a prompt alone is also present
+    // in the loading skeleton and is not sufficient readiness evidence.
+    startupReadyPattern: /(?:│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│)|(?:›(?![ \t]*\d+\.)[\s\S]{0,512}?\bContext[ \t]+\d+%[ \t]+(?:left|used)\b)/,
     // Codex cold starts can exceed the worker's 15s soft first-prompt timeout.
     // Wait for the real composer marker so the bare-shell guard does not treat
     // a still-loading zsh wrapper as a failed launch.

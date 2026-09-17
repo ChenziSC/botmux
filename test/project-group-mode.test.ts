@@ -304,5 +304,9 @@ describe('project CLI parser', () => {
 
   it('rejects unknown options instead of silently changing project state', () => {
     expect(parseProjectArgs('update', ['--foucs', 'typo'])).toEqual({ ok: false, error: '未知选项: --foucs' });
+    expect(parseProjectArgs('update', ['--clear-next-milestone'])).toMatchObject({
+      ok: true,
+      action: { action: 'update', nextMilestone: '' },
+    });
   });
 });

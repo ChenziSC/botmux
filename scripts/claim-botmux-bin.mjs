@@ -89,13 +89,12 @@ function defaultBinaryPath() {
 //   ④ PATH 上合格的 node
 // 全都不合格就硬失败：写一个注定崩 fleet 的 wrapper 比不写更坏。
 //
-// 「合格」= 能加载 sqlite 引擎。判据取自 src/services/sqlite-compat.ts 的同一条契约
-// （node:sqlite 或 bun:sqlite），而不是比版本号字符串 —— 版本号会漂，能力不会。
+// 「合格」= 能直接解析运行当前 dist 使用的 node:sqlite 动态导入，而不是只具备
+// bun:sqlite。旧 Bun 可能通过 require("bun:sqlite") 探测，却会在加载 dist 时因
+// node:sqlite 的静态解析直接退出。
 // 全程不出现任何本机专有路径：候选一律从 PATH / execPath 现取，跨机可移植。
 function interpreterIsCapable(bin) {
-  // bun 有 bun:sqlite，node ≥22.13 有 node:sqlite。用 -e 真加载一次，别猜。
-  const probe = 'try{require("node:sqlite").DatabaseSync;console.log("OK")}catch(e){'
-    + 'try{require("bun:sqlite").Database;console.log("OK")}catch(e2){process.exit(3)}}';
+  const probe = 'import("node:sqlite").then(m=>{if(m.DatabaseSync)console.log("OK");else process.exit(3)}).catch(()=>process.exit(3))';
   try {
     const out = execFileSync(bin, ['-e', probe], { encoding: 'utf-8', timeout: 30_000, stdio: ['ignore', 'pipe', 'ignore'] });
     return out.includes('OK');
@@ -131,7 +130,7 @@ function resolveCapableInterpreter() {
   if (explicit) {
     const picked = consider(explicit, 'BOTMUX_INTERPRETER');
     if (picked) return picked;
-    console.error(`❌ BOTMUX_INTERPRETER=${explicit} 加载不出 SQLite 引擎（node:sqlite / bun:sqlite），拒绝写入。`);
+    console.error(`❌ BOTMUX_INTERPRETER=${explicit} 无法加载当前运行时要求的 node:sqlite，拒绝写入。`);
     process.exit(1);
   }
 
@@ -140,10 +139,10 @@ function resolveCapableInterpreter() {
     ?? consider(whichOnPath('node'), 'PATH node')
     ?? (() => {
       console.error(
-        '❌ 找不到能加载 SQLite 引擎的解释器（需要 node ≥ 22.13 的 node:sqlite，或任意 bun 的 bun:sqlite）。\n'
+        '❌ 找不到能加载当前运行时要求的 node:sqlite 的解释器（需要 node ≥ 22.13 或兼容实现）。\n'
         + `   已试: ${tried.map(t => `${t.label}=${t.abs}`).join(', ') || '(无)'}\n`
         + '   会话存储硬依赖它；写一个不合格的 wrapper 会让整个 fleet 启动即崩。\n'
-        + '   装 bun（https://bun.sh）或升级 node，或用 BOTMUX_INTERPRETER=<abs path> 显式指定。',
+        + '   升级 node，或用 BOTMUX_INTERPRETER=<abs path> 显式指定。',
       );
       process.exit(1);
     })();

@@ -154,6 +154,21 @@ describe('supersedePendingTriggerByCompletedSuccessorStrict', () => {
       'sess1', 'trg_old', 'trg_new', 4000, 'cli_test',
     )).toBe('already_superseded');
   });
+
+  it('upgrades an ambiguous dispatch failure when the exact successor proves completion', () => {
+    recordPending('sess1', 'trg_old', 1000, 'cli_test');
+    recordFailedStrict('sess1', 'trg_old', 1500, 'cli_test');
+    recordCompleted('sess1', 'trg_new', 'done', 2000, 'cli_test');
+
+    expect(supersedePendingTriggerByCompletedSuccessorStrict(
+      'sess1', 'trg_old', 'trg_new', 3000, 'cli_test',
+    )).toBe('superseded');
+    expect(lookup('sess1', 'trg_old')?.result).toMatchObject({
+      status: 'failed',
+      reason: 'turn_terminal',
+      terminalErrorCode: 'superseded_by_completed_successor:trg_new',
+    });
+  });
 });
 
 describe('owner stamping (cross-bot isolation)', () => {

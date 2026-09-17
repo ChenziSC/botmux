@@ -266,7 +266,9 @@ export function supersedePendingTriggerByCompletedSuccessorStrict(
       && predecessor.terminalErrorCode === `superseded_by_completed_successor:${successorTriggerId}`) {
       return 'already_superseded';
     }
-    if (predecessor?.status !== 'pending') return 'predecessor_not_pending';
+    const replaceableAmbiguousFailure = predecessor?.status === 'failed'
+      && predecessor.reason === 'dispatch_unknown';
+    if (predecessor?.status !== 'pending' && !replaceableAmbiguousFailure) return 'predecessor_not_pending';
     file.ownerLarkAppId = ownerLarkAppId;
     file.results[predecessorTriggerId] = {
       status: 'failed',

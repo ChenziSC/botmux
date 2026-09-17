@@ -141,9 +141,13 @@ describe('project group mode', () => {
     expect(f.cards[0]).not.toContain('总体进度');
     expect(f.cards[0]).not.toContain('%');
     expect(f.cards[0]).toContain('推进概况');
+    expect(f.cards[0]).toContain('项目按当前阶段推进');
     expect(f.cards[0]).toContain('当前推进');
-    expect(f.cards[0]).toContain('待办计划');
-    expect(f.cards[0]).toContain('完成记录');
+    expect(f.cards[0]).not.toContain('待办计划');
+    expect(f.cards[0]).not.toContain('完成记录');
+    expect(f.cards[0]).not.toContain('等待拆解首批任务');
+    expect(f.cards[0]).not.toContain('子任务状态（0）');
+    expect(f.cards[0]).not.toContain('最近里程碑（0 项）');
     const heroText = rendered.body.elements
       .filter((element: { tag?: string }) => element.tag === 'interactive_container')
       .flatMap((element: { elements?: Array<{ text_size?: string }> }) => element.elements ?? []);
@@ -279,7 +283,10 @@ describe('project group mode', () => {
     await f.coordinator.run(f.context, { action: 'refresh' });
     expect(f.transport.updateCard).toHaveBeenCalledTimes(1);
     expect(f.cards.at(-1)).toContain('compact-list');
-    expect(f.cards.at(-1)).toContain('等待拆解首批任务');
+    expect(f.cards.at(-1)).toContain('项目按当前阶段推进');
+    expect(f.cards.at(-1)).not.toContain('等待拆解首批任务');
+    expect(f.cards.at(-1)).not.toContain('尚未派发子任务');
+    expect(f.cards.at(-1)).not.toContain('子任务（0）');
     expect(f.cards.at(-1)).not.toContain('%');
     expect(f.cards.at(-1)).not.toContain('目标：完成目标');
     expect(f.cards.at(-1)).not.toContain('最近里程碑');

@@ -240,6 +240,18 @@ describe('codex 启动闸：worker 侧接线', () => {
 });
 
 describe('Codex restored ZMX history startup evidence', () => {
+  it.each([false, true])('accepts the 0.154 Context footer without a banner, loading observed=%s', (loadingSeen) => {
+    const { detector, idle } = newDetector();
+    try {
+      if (loadingSeen) detector.feed(LOADING_SCREEN);
+      const history = '› Ask Codex to do anything\n  gpt-6-astra low · Context 85% used · weekly 38% left';
+      expect(detector.observeStartupHistory(history)).toBe(true);
+      expect(detector.isStartupPending()).toBe(false);
+      expect(detector.isStartupComplete()).toBe(true);
+      expect(idle).not.toHaveBeenCalled();
+    } finally { detector.dispose(); }
+  });
+
   it('accepts the native initialized banner above a long conversation when its bottom composer is Ready', () => {
     const { detector, idle } = newDetector();
     try {
@@ -278,6 +290,8 @@ describe('Codex restored ZMX history startup evidence', () => {
     ['dialog after footer', RESUMED_HISTORY + '\nPress enter to continue'],
     ['stale ready before loading', RESUMED_HISTORY + '\n' + LOADING_SCREEN],
     ['uninitialized footer', RESUMED_HISTORY.replace(' · Ready', '')],
+    ['context footer with a draft', '› unsent draft\n  gpt-6-astra low · Context 85% used'],
+    ['context footer before loading', '› Ask Codex to do anything\n  gpt-6-astra low · Context 85% used\n' + LOADING_SCREEN],
   ])('keeps input held for %s', (_name, history) => {
     const { detector, idle } = newDetector();
     try {

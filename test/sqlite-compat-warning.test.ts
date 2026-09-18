@@ -25,4 +25,19 @@ describe('sqlite-compat 不把 Node 的实验特性警告漏到 stderr', () => {
     expect(String(r.stderr)).not.toMatch(/ExperimentalWarning/);
     expect(String(r.stderr)).not.toMatch(/SQLite is an experimental feature/);
   });
+
+  it('异步入口复用运行时分流加载器', () => {
+    const r = spawnSyncTsEvalWithRepoImports(
+      `import { openDatabaseSync } from './src/services/sqlite-compat.js';
+       const db = await openDatabaseSync(':memory:');
+       db.exec('CREATE TABLE smoke (value TEXT)');
+       db.prepare('INSERT INTO smoke (value) VALUES (?)').run('ready');
+       process.stdout.write(String(db.prepare('SELECT value FROM smoke').get().value));
+       db.close();`,
+      { encoding: 'utf-8', cwd: process.cwd() },
+    );
+    expect(r.status).toBe(0);
+    expect(String(r.stdout)).toBe('ready');
+    expect(String(r.stderr)).not.toMatch(/Could not resolve|node:sqlite/);
+  });
 });

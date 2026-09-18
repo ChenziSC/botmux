@@ -157,6 +157,57 @@ describe('project group mode', () => {
     expect(readFileSync(join(f.dataDir, 'project-groups.json'), 'utf8')).not.toContain('larkAppSecret');
   });
 
+  it.each(['status-dashboard', 'compact-list'] as const)('renders and clears a next-only milestone in %s', async (templateId) => {
+    const f = fixture();
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId,
+      workerAppIds: ['cli_worker'],
+      progressCard: { schemaVersion: 1, templateId, sections: ['milestones'], milestonesExpanded: false },
+    });
+    await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '完成目标' });
+    await f.coordinator.run(f.context, { action: 'update', nextMilestone: '发布' });
+    expect(f.cards.at(-1)).toContain('最近里程碑（0 项 · 下一节点 发布）');
+    const parsed = parseProjectArgs('update', ['--clear-next-milestone']);
+    if (!parsed.ok || parsed.help) throw new Error('expected update action');
+    await f.coordinator.run(f.context, parsed.action);
+    expect(readProjectGroup(f.dataDir, f.context.chatId)).not.toHaveProperty('nextMilestone');
+    expect(f.cards.at(-1)).not.toContain('最近里程碑');
+    await f.coordinator.run(f.context, { action: 'update', milestone: '设计完成' });
+    expect(f.cards.at(-1)).toContain('最近里程碑（1 项）');
+    expect(f.cards.at(-1)).toContain('设计完成');
+  });
+
+  it('clears the next milestone on close while retaining completion evidence', async () => {
+    const f = fixture();
+    await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '完成目标' });
+    await f.coordinator.run(f.context, { action: 'update', nextMilestone: '发布' });
+    await f.coordinator.run(f.context, { action: 'close', milestone: '用户验收通过' });
+    const stored = readProjectGroup(f.dataDir, f.context.chatId)!;
+    expect(stored).not.toHaveProperty('nextMilestone');
+    expect(stored.milestones.at(-1)?.content).toBe('用户验收通过');
+    expect(f.cards.at(-1)).not.toContain('下一节点');
+  });
+
+  it('summarizes blockers without inventing subtask counts', async () => {
+    const f = fixture();
+    await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '完成目标' });
+    await f.coordinator.run(f.context, { action: 'update', blocker: '等待依赖', focus: '等待依赖' });
+    const card = JSON.parse(f.cards.at(-1)!);
+    expect(card.config.summary.content).toContain('1 项阻塞');
+    expect(card.config.summary.content).not.toContain('子任务');
+    await f.coordinator.run(f.context, { action: 'update', clearBlockers: true });
+    expect(JSON.parse(f.cards.at(-1)!).config.summary.content).toContain('项目按当前阶段推进');
+  });
+
+  it('does not point remaining-plan overflow at a missing subtask table', async () => {
+    const f = fixture();
+    await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '完成目标' });
+    await f.coordinator.run(f.context, { action: 'update', remaining: '一·二·三·四·五' });
+    expect(f.cards.at(-1)).toContain('另有 1 项');
+    expect(f.cards.at(-1)).not.toContain('见下方子任务表');
+    expect(JSON.parse(f.cards.at(-1)!).body.elements.some((e: { tag: string }) => e.tag === 'table')).toBe(false);
+  });
+
   it('registers dispatch topics, resolves real topic links, and applies report progress', async () => {
     const f = fixture();
     await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '交付可验收结果' });

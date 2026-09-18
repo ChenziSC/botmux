@@ -8,6 +8,14 @@ export const PROJECT_GROUP_STORE_FILE = 'project-groups.json';
 export type ProjectGroupStatus = 'active' | 'paused' | 'completed';
 export type ProjectWorkstreamStatus = 'pending' | 'in_progress' | 'blocked' | 'completed' | 'failed';
 
+export interface ProjectWorkstreamReport {
+  content: string;
+  status: ProjectWorkstreamStatus;
+  progress: number;
+  remaining?: string;
+  createdAt: string;
+}
+
 export interface ProjectWorkstream {
   dispatchRoot: string;
   threadId?: string;
@@ -18,6 +26,7 @@ export interface ProjectWorkstream {
   progress: number;
   remaining?: string;
   lastReport?: string;
+  reports?: ProjectWorkstreamReport[];
   blocker?: string;
   createdAt: string;
   updatedAt: string;

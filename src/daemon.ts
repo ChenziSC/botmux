@@ -85,6 +85,7 @@ import {
   type VcMeetingConsumerProfileConfig,
 } from './bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from './im/lark/streaming-card-buttons.js';
+import { buildMarkdownCard } from './im/lark/md-card.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
@@ -6395,6 +6396,7 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
       ? {
           sessionId: ds.session.sessionId,
           larkAppId: ds.larkAppId,
+          chatId: ds.chatId,
           receiver: !!ds.session.vcMeetingReceiver,
           scope: ds.scope ?? ds.session.scope,
           rootMessageId: ds.session.rootMessageId,
@@ -6417,23 +6419,31 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
   }
 
   const targetDaemon = findOnlineDaemon(decision.target.larkAppId);
-  if (!targetDaemon) {
-    return jsonRes(res, 503, { ok: false, error: 'orchestrator_daemon_offline' });
+  if (!targetDaemon && decision.delivery === 'relay') {
+    return jsonRes(res, 503, { ok: false, error: 'relay_target_daemon_offline' });
   }
-  const trigger = buildOrchestratorReportTrigger(decision, {
-    requestId: `report:${decision.source.sessionId}:${Date.now()}`,
-    receivedAt: new Date().toISOString(),
-  });
   try {
-    const response = await fetchDaemonIpc(targetDaemon.ipcPort, '/api/trigger', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(trigger),
-    });
-    const responseBody: unknown = await response.json().catch(() => ({}));
+    let publishedMessageId: string | undefined;
+    if (decision.delivery === 'publish' || decision.delivery === 'publish-and-relay') {
+      try {
+        publishedMessageId = await sendMessage(
+          decision.source.larkAppId,
+          decision.source.chatId,
+          buildMarkdownCard(decision.content, undefined, ''),
+          'interactive',
+        );
+      } catch (error) {
+        return jsonRes(res, 502, {
+          ok: false,
+          error: 'result_publish_failed',
+          detail: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
     let projectSynced = false;
     let projectSyncError: string | undefined;
-    if (response.ok) {
+    if (targetDaemon) {
       try {
         const projectResponse = await fetchDaemonIpc(
           targetDaemon.ipcPort,
@@ -6455,19 +6465,57 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
       } catch (error) {
         projectSyncError = error instanceof Error ? error.message : String(error);
       }
+    } else {
+      projectSyncError = 'relay_target_daemon_offline';
     }
+
+    if (decision.delivery === 'publish') {
+      return jsonRes(res, 200, {
+        ok: true,
+        delivery: 'publish',
+        reportTarget: decision.target,
+        publishedMessageId,
+        projectSynced,
+        ...(projectSyncError ? { projectSyncError } : {}),
+      });
+    }
+
+    if (!targetDaemon) {
+      return jsonRes(res, 503, {
+        ok: false,
+        error: 'relay_target_daemon_offline',
+        delivery: 'publish-and-relay',
+        reportTarget: decision.target,
+        publishedMessageId,
+        projectSynced,
+        projectSyncError,
+      });
+    }
+
+    const trigger = buildOrchestratorReportTrigger(decision, {
+      requestId: `report:${decision.source.sessionId}:${Date.now()}`,
+      receivedAt: new Date().toISOString(),
+      publishedMessageId,
+    });
+    const response = await fetchDaemonIpc(targetDaemon.ipcPort, '/api/trigger', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(trigger),
+    });
+    const responseBody: unknown = await response.json().catch(() => ({}));
     return jsonRes(res, response.status, {
       ...(responseBody && typeof responseBody === 'object' && !Array.isArray(responseBody)
         ? responseBody as Record<string, unknown>
         : {}),
       reportTarget: decision.target,
+      ...(publishedMessageId ? { publishedMessageId } : {}),
       projectSynced,
       ...(projectSyncError ? { projectSyncError } : {}),
     });
   } catch (error) {
     return jsonRes(res, 502, {
       ok: false,
-      error: 'orchestrator_daemon_unreachable',
+      error: 'relay_target_daemon_unreachable',
       detail: error instanceof Error ? error.message : String(error),
     });
   }

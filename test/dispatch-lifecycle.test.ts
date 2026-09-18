@@ -96,6 +96,27 @@ describe('dispatch lifecycle persistence', () => {
     });
   });
 
+  it('preserves the first acceptance while recording repeated dispatch acceptance', async () => {
+    const { dataDir, path } = fixture();
+    for (const now of ['2026-08-31T01:00:00.000Z', '2026-08-31T02:00:00.000Z']) {
+      await persistDispatchLifecycle({
+        dataDir,
+        dispatchRoot: 'om_root',
+        sourceSessionId: 'source',
+        status: 'accepted',
+        transportState: 'dispatched',
+        acceptanceState: 'accepted',
+        errorCode: null,
+        now,
+      });
+    }
+    expect(JSON.parse(readFileSync(path, 'utf8')).om_root).toMatchObject({
+      acceptedAt: '2026-08-31T01:00:00.000Z',
+      lastAcceptedAt: '2026-08-31T02:00:00.000Z',
+      acceptanceCount: 2,
+    });
+  });
+
   it('rejects contradictory transport and lifecycle states before mutation', async () => {
     const { dataDir, path } = fixture();
     await expect(persistDispatchLifecycle({

@@ -41,6 +41,7 @@ import {
 type WorkerEvent = WorkerToDaemon;
 
 export const GOAL_COMMAND = '/goal';
+export const WORKFLOW_BACKEND_TYPE = 'tmux' as const;
 
 export interface EphemeralPoolDeps {
   /**
@@ -242,12 +243,17 @@ async function runNodeImpl(
     cliInstanceBinding: req.botSnapshot.cliInstanceBinding,
     cliRuntime: req.botSnapshot.cliRuntime,
     cliPathOverride: req.botSnapshot.cliPathOverride,
+    wrapperCli: req.botSnapshot.wrapperCli,
     model: req.botSnapshot.model,
     // Workflow workers require CLI bypass permissions by product contract.
     // Restricted bots are rejected before a BotSnapshot is created.
     disableCliBypass: false,
     ...workflowSandboxInitFields(req.botSnapshot),
-    backendType: 'pty' as const,
+    // Compiled Bun workers cannot reliably host the CLI directly through
+    // node-pty. The tmux selection uses TmuxPipeBackend: the CLI runs in a
+    // detached, attempt-owned pane and the worker observes it through a FIFO.
+    // The ordinary close message below destroys that deterministic session.
+    backendType: WORKFLOW_BACKEND_TYPE,
     prompt: '',
     resume: false,
     larkAppId: req.botSnapshot.larkAppId,

@@ -537,6 +537,39 @@ describe('host — approve-dag（gate-2）', () => {
     }
   });
 
+  it('approve-dag --working-dir 将所有 bot snapshot 锁到任务目录', async () => {
+    const b = base();
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const { runDir } = await toDagReady(b);
+      const dagPath = readGrillState(runDir)!.dagPath!;
+      mkdirSync(dirname(dagPath), { recursive: true });
+      writeFileSync(dagPath, JSON.stringify({
+        runId: 'r',
+        nodes: [
+          { id: 'develop', type: 'goal', bot: 'cli_dev', goal: 'develop', depends: [], inputs: [] },
+          { id: 'review', type: 'goal', bot: 'cli_review', goal: 'review', depends: ['develop'], inputs: [] },
+        ],
+      }));
+      const taskRoot = '/featspace/task-root';
+      await cmdWorkflowHost('approve-dag', ['r', '--base-dir', b, '--working-dir', taskRoot], {
+        loadBots: () => [
+          { larkAppId: 'cli_dev', cliId: 'claude-code', workingDir: '/global/dev' } as any,
+          { larkAppId: 'cli_review', cliId: 'claude-code', workingDir: '/global/review' } as any,
+        ],
+        resolveChatBinding: () => undefined,
+      });
+
+      expect(loadAuthorizedV3Run(runDir).botSnapshots).toMatchObject({
+        cli_dev: { workingDir: taskRoot },
+        cli_review: { workingDir: taskRoot },
+      });
+    } finally {
+      log.mockRestore();
+      rmSync(b, { recursive: true, force: true });
+    }
+  });
+
   it('Gate-2 commit 后若崩在 dag_ready，所有改稿/重编排 fail-closed，replay 只完成 dag_approved transition', async () => {
     const b = base();
     try {

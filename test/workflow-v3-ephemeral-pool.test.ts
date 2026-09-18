@@ -5,7 +5,12 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { createEphemeralPool, buildGoalCommand, GOAL_COMMAND } from '../src/workflows/v3/ephemeral-pool.js';
+import {
+  createEphemeralPool,
+  buildGoalCommand,
+  GOAL_COMMAND,
+  WORKFLOW_BACKEND_TYPE,
+} from '../src/workflows/v3/ephemeral-pool.js';
 import { GOAL_ENV, type RunNodeRequest } from '../src/workflows/v3/contract.js';
 import type { WorkerHandle, WorkerProcessFactory, WorkerSpawnOptions } from '../src/workflows/shared/worker-process.js';
 import { readV3AttemptWorkerFence } from '../src/workflows/v3/worker-fence.js';
@@ -151,6 +156,46 @@ describe('v3 ephemeral pool', () => {
     expect(worker.init?.larkAppSecret).toBe('secret');
     expect(worker.init?.prompt).toBe('');
     expect(worker.rawInputs).toEqual([buildGoalCommand(req)]);
+  });
+
+  it('passes the frozen wrapperCli to worker init', async () => {
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const req = request();
+    req.botSnapshot.cliId = 'codex';
+    req.botSnapshot.wrapperCli = 'aiden x codex';
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      quiesceMs: 1,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode(req);
+    await worker.waitForInit();
+    expect(worker.init?.wrapperCli).toBe('aiden x codex');
+    worker.emitExit(0);
+    await promise;
+  });
+
+  it('uses the disposable tmux pipe backend and requests worker cleanup on completion', async () => {
+    const worker = new ScriptedWorker({ autoReadyAfterInit: true });
+    const factory = factoryFor(worker);
+    const req = request();
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      quiesceMs: 1,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode(req);
+    await worker.waitForInit();
+    expect(worker.init?.backendType).toBe(WORKFLOW_BACKEND_TYPE);
+    worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+    await waitFor(() => worker.closeRequests === 1);
+    worker.emitExit(0);
+    await expect(promise).resolves.toMatchObject({ status: 'ok' });
   });
 
   it('does not carry the PM2 graceful-exit sentinel into the ephemeral worker env', async () => {
@@ -709,6 +754,7 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
   readonly pid = process.pid;
   readonly kills: string[] = [];
   readonly rawInputs: string[] = [];
+  closeRequests = 0;
   readonly autoReadyAfterInit: boolean;
   init: any;
   readyEmitted = false;
@@ -721,6 +767,7 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
   }
 
   send(msg: unknown): void {
+    if ((msg as any)?.type === 'close') this.closeRequests += 1;
     if ((msg as any)?.type === 'init' && !this.init) {
       this.init = msg;
       this.initResolve?.();

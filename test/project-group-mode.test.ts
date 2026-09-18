@@ -194,6 +194,10 @@ describe('project group mode', () => {
       status: 'completed', remaining: '无', milestone: '联调通过',
     });
     expect(reported.workstreams[0]).toMatchObject({ status: 'completed', progress: 100, lastReport: '全部用例通过' });
+    expect(reported.workstreams[0].reports).toEqual([{
+      content: '全部用例通过', status: 'completed', progress: 100, remaining: '无',
+      createdAt: reported.workstreams[0].updatedAt,
+    }]);
     expect(reported.milestones.at(-1)?.content).toBe('联调通过');
     expect(readProjectGroup(f.dataDir, f.context.chatId)?.workstreams[0]?.status).toBe('completed');
 
@@ -204,6 +208,14 @@ describe('project group mode', () => {
       title: '联调验证', purpose: '验证价格和库存链路', owners: ['worker-a'],
       status: 'completed', progress: 100,
     });
+
+    const repeated = await f.coordinator.run(f.context, {
+      action: 'report', dispatchRoot: 'om_subtask', content: '二次对比复核通过',
+      status: 'completed', remaining: '无',
+    });
+    expect(repeated.workstreams[0].reports?.map(report => report.content)).toEqual([
+      '全部用例通过', '二次对比复核通过',
+    ]);
   });
 
   it('rejects missing, generic, and overlong titles for new workstreams', async () => {

@@ -27,6 +27,15 @@ const bot = (extra: Partial<BotConfig> = {}): BotConfig => ({
 } as BotConfig);
 
 describe('blocker #2: sandboxPaths threads through the workflow chain', () => {
+  it('freezes and round-trips wrapperCli', () => {
+    const snap = botToSnapshot(bot({ cliId: 'codex', wrapperCli: 'aiden x codex' }), '/w');
+    expect(snap.wrapperCli).toBe('aiden x codex');
+
+    const frozen = serializeFrozenBotSnapshots(new Map([['app_x', snap]]));
+    const roundTrip = parseFrozenBotSnapshots(JSON.parse(JSON.stringify(frozen)));
+    expect(roundTrip.get('app_x')!.wrapperCli).toBe('aiden x codex');
+  });
+
   it('botToSnapshot carries the three tiers', () => {
     const snap = botToSnapshot(bot(), '/w');
     expect(snap.sandboxPaths).toEqual({

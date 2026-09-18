@@ -207,6 +207,9 @@ export function entryForSubcommand(token: string): BotmuxEntry | null {
  */
 export function spawnWorker(opts: {
   distDir: string;
+  /** Exact worker module for Node/source runs. Standalone binaries ignore it
+   * and re-enter through the hidden `__worker` subcommand. */
+  workerPath?: string;
   cwd: string;
   env: NodeJS.ProcessEnv;
   execArgv?: string[];
@@ -218,7 +221,7 @@ export function spawnWorker(opts: {
     return spawn(command, args, { windowsHide: true, stdio, cwd: opts.cwd, env: opts.env });
   }
   // Node path: keep using fork() so behavior + test mocks are unchanged.
-  return fork(join(opts.distDir, ENTRY_SCRIPT.worker), [], {
+  return fork(opts.workerPath ?? join(opts.distDir, ENTRY_SCRIPT.worker), [], {
     windowsHide: true,
     stdio,
     execArgv: opts.execArgv,

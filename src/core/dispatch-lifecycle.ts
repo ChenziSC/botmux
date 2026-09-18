@@ -85,7 +85,13 @@ export async function persistDispatchLifecycle(input: DispatchLifecycleUpdate): 
     entry.errorCode = input.errorCode ?? null;
     if (input.acceptedBotAppIds) entry.acceptedBotAppIds = [...input.acceptedBotAppIds];
     if (input.missingBotAppIds) entry.missingBotAppIds = [...input.missingBotAppIds];
-    if (input.status === 'accepted') entry.acceptedAt = now;
+    if (input.status === 'accepted') {
+      if (typeof entry.acceptedAt !== 'string') entry.acceptedAt = now;
+      entry.lastAcceptedAt = now;
+      entry.acceptanceCount = typeof entry.acceptanceCount === 'number'
+        ? entry.acceptanceCount + 1
+        : 1;
+    }
     if (input.status === 'failed' || input.status === 'timed_out') entry.failedAt = now;
     entry.updatedAt = now;
   });

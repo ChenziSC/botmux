@@ -352,6 +352,16 @@ export class ProjectCoordinator {
         item.progress = statusProgress(status, action.progress, item.progress);
         item.lastReport = boundedText(action.content, 1000);
         item.remaining = boundedText(action.remaining, 300) || undefined;
+        item.reports = [
+          ...(item.reports ?? []),
+          {
+            content: item.lastReport,
+            status: item.status,
+            progress: item.progress,
+            ...(item.remaining ? { remaining: item.remaining } : {}),
+            createdAt: now,
+          },
+        ].slice(-50);
         item.updatedAt = now;
         if (status === 'blocked' && item.lastReport) {
           const blocker = item.lastReport.slice(0, 300);

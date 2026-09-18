@@ -5754,7 +5754,7 @@ async function cmdProject(argv: string[]): Promise<void> {
   botmux project update [--goal <目标>] [--phase <阶段>] [--focus <当前焦点>]
                         [--progress <0-100>] [--remaining <待完成>]
                         [--blocker <阻塞>] [--clear-blockers]
-                        [--milestone <里程碑>] [--next-milestone <下一节点>]
+                        [--milestone <里程碑>] [--next-milestone <下一节点>] [--clear-next-milestone]
   botmux project close [--milestone <完成说明>]
   botmux project resume [--phase <阶段>] [--focus <当前焦点>]
 

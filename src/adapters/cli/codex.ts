@@ -36,7 +36,7 @@ function restoredCodexHistoryReady(history: string): boolean {
   // Codex 0.154 can resume straight into the composer without repainting the
   // banner or restoration marker. Its bottom Context footer is the positive
   // initialization evidence in that layout; the loading skeleton never has it.
-  const contextReady = /^\s*\S[^·\r\n]* · Context \d+% (?:left|used)(?: · [^\r\n]*)?$/.test(footer[0]!);
+  const contextReady = /^\s*\S[^\r\n]* · Context \d+% (?:left|used)(?: · [^\r\n]*)?$/.test(footer[0]!);
   if (!restoredReady && !contextReady) return false;
   // History has no viewport bounds: never guess how far above the composer a
   // loading/status row can be. Conflicting evidence remains conservatively held.

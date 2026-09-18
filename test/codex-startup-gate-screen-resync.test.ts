@@ -252,6 +252,18 @@ describe('Codex restored ZMX history startup evidence', () => {
     } finally { detector.dispose(); }
   });
 
+  it.each(['~/Code/example', '/tmp/project'])('accepts a compact Context footer with directory %s', (directory) => {
+    const { detector, idle } = newDetector();
+    try {
+      detector.feed(LOADING_SCREEN);
+      const history = `› Ask Codex to do anything\n  custom-model medium · ${directory} · Context 85% used · weekly 38% left`;
+      expect(detector.observeStartupHistory(history)).toBe(true);
+      expect(detector.isStartupPending()).toBe(false);
+      expect(detector.isStartupComplete()).toBe(true);
+      expect(idle).not.toHaveBeenCalled();
+    } finally { detector.dispose(); }
+  });
+
   it('accepts the native initialized banner above a long conversation when its bottom composer is Ready', () => {
     const { detector, idle } = newDetector();
     try {
@@ -280,7 +292,7 @@ describe('Codex restored ZMX history startup evidence', () => {
   });
 
   it.each([
-    ['no restoration marker', RESUMED_HISTORY.split('\n').slice(2).join('\n')],
+    ['no restoration marker or initialized footer', '› Ask Codex to do anything\n  custom-model medium · ~/Code/example · weekly 45% left'],
     ['footer before initialization', RESUMED_HISTORY.replace('› Ask', '│ model: loading │\n│ directory: loading │\n› Ask')],
     ['resuming', RESUMED_HISTORY.replace('› Ask', 'Resuming session...\n› Ask')],
     ['busy', RESUMED_HISTORY.replace('› Ask', 'Working (esc to interrupt)\n› Ask')],
@@ -289,7 +301,7 @@ describe('Codex restored ZMX history startup evidence', () => {
     ['picker', RESUMED_HISTORY.replace('› Ask Codex to do anything', '› 1. Continue')],
     ['dialog after footer', RESUMED_HISTORY + '\nPress enter to continue'],
     ['stale ready before loading', RESUMED_HISTORY + '\n' + LOADING_SCREEN],
-    ['uninitialized footer', RESUMED_HISTORY.replace(' · Ready', '')],
+    ['uninitialized footer', RESUMED_HISTORY.replace(' · Ready', '').replace(/ · Context \d+% used/, '')],
     ['context footer with a draft', '› unsent draft\n  gpt-6-astra low · Context 85% used'],
     ['context footer before loading', '› Ask Codex to do anything\n  gpt-6-astra low · Context 85% used\n' + LOADING_SCREEN],
   ])('keeps input held for %s', (_name, history) => {

@@ -51,10 +51,38 @@ function fakeDist(root: string, body: string): string {
 }
 
 const STAY = `
-console.log('daemon pid=' + process.pid + ' idx=' + process.env.BOTMUX_BOT_INDEX);
 process.on('SIGTERM', () => process.exit(90));
 setInterval(() => {}, 1000);
+console.log('daemon pid=' + process.pid + ' idx=' + process.env.BOTMUX_BOT_INDEX);
 `;
+
+// A PID exists before exec/runtime initialization has finished. In particular,
+// sampling a legacy command line that early can see the pre-exec process on
+// Linux. Wait for the fixture's post-initialization stdout marker instead.
+async function spawnReadyOrphan(args: string[]): Promise<ChildProcess> {
+  const child = spawn(process.execPath, args, { stdio: ['ignore', 'pipe', 'ignore'] });
+  hostProcs.push(child);
+  await new Promise<void>((resolve, reject) => {
+    let output = '';
+    const timer = setTimeout(() => finish(new Error('orphan fixture did not become ready')), 5000);
+    const onData = (data: Buffer) => {
+      output += data.toString();
+      if (output.includes('daemon pid=')) finish();
+    };
+    const onExit = () => finish(new Error('orphan fixture exited before ready'));
+    const finish = (error?: Error) => {
+      clearTimeout(timer);
+      child.stdout!.off('data', onData);
+      child.off('error', finish);
+      child.off('exit', onExit);
+      if (error) reject(error); else resolve();
+    };
+    child.stdout!.on('data', onData);
+    child.once('error', finish);
+    child.once('exit', onExit);
+  });
+  return child;
+}
 
 const bots: FleetBotSpec[] = [
   { name: 'botmux-0', appId: 'cli_a', botIndex: 0 },
@@ -390,9 +418,7 @@ describe('FleetSupervisor (live, integration)', () => {
     const statePath = join(root, 'fleet.json');
     // Orphan daemon from the "previous" supervisor generation (still alive).
     const distDir = fakeDist(root, STAY);
-    const orphan = spawn(process.execPath, [join(distDir, 'index-daemon.js')], { stdio: 'ignore' });
-    killLater(orphan.pid!);
-    await waitFor(() => pidAlive(orphan.pid!));
+    const orphan = await spawnReadyOrphan([join(distDir, 'index-daemon.js')]);
     // State records it online, under a prior (now-dead) supervisor pid.
     mutateFleetState(statePath, () => ({
       supervisorPid: 999_999, supervisorStartedAt: 'T-prior',
@@ -406,23 +432,25 @@ describe('FleetSupervisor (live, integration)', () => {
     }));
 
     const sup = new FleetSupervisor({ statePath, distDir, daemonEnv: {}, cwd: root, log: () => {} });
-    sup.start([bots[0]]); // takeover
-    // The orphan must be reclaimed: a NEW owned child is spawned (different pid),
-    // and the supervisor holds a live handle (so its loop won't drain → no self-exit).
-    const reclaimed = await waitFor(() => {
-      const p = readFleetState(statePath)?.procs[0];
-      return !!p && p.status === 'online' && p.pid !== orphan.pid && p.pid > 1 && pidAlive(p.pid);
-    });
-    expect(reclaimed).toBe(true);
-    const newPid = readFleetState(statePath)!.procs[0].pid;
-    killLater(newPid);
-    expect(newPid).not.toBe(orphan.pid);
-    // The old orphan was SIGTERM'd (it was a plain `setInterval` with no SIGTERM
-    // handler, so it dies) — no longer running unsupervised.
-    await waitFor(() => !pidAlive(orphan.pid!));
-    expect(pidAlive(orphan.pid!)).toBe(false);
-
-    await sup.stopAll();
+    try {
+      sup.start([bots[0]]); // takeover
+      // The orphan must be reclaimed: a NEW owned child is spawned (different pid),
+      // and the supervisor holds a live handle (so its loop won't drain → no self-exit).
+      const reclaimed = await waitFor(() => {
+        const p = readFleetState(statePath)?.procs[0];
+        return !!p && p.status === 'online' && p.pid !== orphan.pid && p.pid > 1 && pidAlive(p.pid);
+      });
+      expect(reclaimed).toBe(true);
+      const newPid = readFleetState(statePath)!.procs[0].pid;
+      killLater(newPid);
+      expect(newPid).not.toBe(orphan.pid);
+      // The initialized fixture handles SIGTERM and exits; it must no longer
+      // run unsupervised.
+      await waitFor(() => !pidAlive(orphan.pid!));
+      expect(pidAlive(orphan.pid!)).toBe(false);
+    } finally {
+      await sup.stopAll();
+    }
   });
 
   it('reclaims a built-in orphan after switching to another checkout path', async () => {
@@ -430,9 +458,7 @@ describe('FleetSupervisor (live, integration)', () => {
     const statePath = join(root, 'fleet.json');
     const oldDist = fakeDist(join(root, 'old-checkout'), STAY);
     const newDist = fakeDist(join(root, 'new-checkout'), STAY);
-    const orphan = spawn(process.execPath, [join(oldDist, 'index-daemon.js')], { stdio: 'ignore' });
-    killLater(orphan.pid!);
-    await waitFor(() => pidAlive(orphan.pid!));
+    const orphan = await spawnReadyOrphan([join(oldDist, 'index-daemon.js')]);
     mutateFleetState(statePath, () => ({
       supervisorPid: 999_999, supervisorStartedAt: 'T-prior',
       procs: [{
@@ -443,15 +469,18 @@ describe('FleetSupervisor (live, integration)', () => {
     }));
 
     const sup = new FleetSupervisor({ statePath, distDir: newDist, daemonEnv: {}, cwd: root, log: () => {} });
-    sup.start([bots[0]]);
-    const reclaimed = await waitFor(() => {
-      const p = readFleetState(statePath)?.procs[0];
-      return !!p && p.status === 'online' && p.pid !== orphan.pid && p.pid > 1 && pidAlive(p.pid);
-    });
-    expect(reclaimed).toBe(true);
-    expect(await waitFor(() => !pidAlive(orphan.pid!))).toBe(true);
-    killLater(readFleetState(statePath)?.procs[0]?.pid);
-    await sup.stopAll();
+    try {
+      sup.start([bots[0]]);
+      const reclaimed = await waitFor(() => {
+        const p = readFleetState(statePath)?.procs[0];
+        return !!p && p.status === 'online' && p.pid !== orphan.pid && p.pid > 1 && pidAlive(p.pid);
+      });
+      expect(reclaimed).toBe(true);
+      expect(await waitFor(() => !pidAlive(orphan.pid!))).toBe(true);
+      killLater(readFleetState(statePath)?.procs[0]?.pid);
+    } finally {
+      await sup.stopAll();
+    }
   });
 
   it('trusts a persisted birth identity even when the old command has no current role marker', async () => {

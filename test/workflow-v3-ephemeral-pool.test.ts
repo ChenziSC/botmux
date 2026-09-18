@@ -45,7 +45,7 @@ afterEach(async () => {
 });
 
 describe('v3 ephemeral pool', () => {
-  it('persists the explicit default instance and replays it into the existing PTY worker after config changes', async () => {
+  it('persists the explicit default instance and replays it into the workflow tmux worker after config changes', async () => {
     const home = join(dir, 'codex-a');
     mkdirSync(home, { mode: 0o700 });
     writeFileSync(join(home, 'config.toml'), 'cli_auth_credentials_store = "file"\n', { mode: 0o600 });
@@ -67,7 +67,7 @@ describe('v3 ephemeral pool', () => {
     const pool = createEphemeralPool({ factory, workerPath: '/tmp/worker.js', quiesceMs: 1, resolveLarkAppSecret: () => 'secret' });
     const running = pool.runNode(req);
     await worker.waitForInit();
-    expect(worker.init).toMatchObject({ backendType: 'pty', cliId: 'codex', cliInstanceBinding: restored.cliInstanceBinding, cliRuntime: restored.cliRuntime });
+    expect(worker.init).toMatchObject({ backendType: 'tmux', cliId: 'codex', cliInstanceBinding: restored.cliInstanceBinding, cliRuntime: restored.cliRuntime });
     worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
     worker.emitMessage({ type: 'prompt_ready' });
     worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });

@@ -396,7 +396,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
 
     expect(result).toMatchObject({ ok: true, target: { sessionId: 'sess_new' } });
     expect(mockSendMessage).toHaveBeenCalledWith(APP, CHAT, '开发机器人');
-    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, 'om_new_topic', '[External] alerts', 'group');
+    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, 'om_new_topic', '[External] alerts', 'group', undefined, { source: 'http' });
     expect(activeSessions.get(sessionKey(CHAT, APP))).toBe(incumbent);
     expect(activeSessions.get(sessionKey('om_new_topic', APP))?.scope).toBe('thread');
   });

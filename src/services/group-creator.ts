@@ -25,6 +25,7 @@ import { bindOncall } from './oncall-store.js';
 import { isValidRoleProfileId, readRoleProfileEntry } from './role-profile-store.js';
 import { writeRoleFile } from '../core/role-resolver.js';
 import { config } from '../config.js';
+import { t, localeForBot } from '../i18n/index.js';
 
 export interface CreateGroupOpts {
   creatorLarkAppId: string;
@@ -241,7 +242,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
         notifyMessageId = await sendMessage(
           opts.creatorLarkAppId,
           r.chatId,
-          `<at user_id="${notifyOwnerOpenId}"></at>`,
+          `<at user_id="${notifyOwnerOpenId}"></at> ${t('cmd.group.owner_notice', undefined, localeForBot(opts.creatorLarkAppId))}`,
           'text',
         );
       } catch (e: any) {

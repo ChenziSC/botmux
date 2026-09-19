@@ -77,7 +77,13 @@ describe('project group mode', () => {
       'om_card_1',
       expect.stringContaining('引导卡切换验收'),
     );
-    expect(f.cards.at(-1)).toContain('引导卡切换验收');
+    expect(f.transport.updateCard).toHaveBeenCalledWith(
+      'cli_coordinator', 'om_card_1', expect.stringContaining('项目已启动'),
+    );
+    const retiredGuide = vi.mocked(f.transport.updateCard).mock.calls
+      .filter(call => call[1] === 'om_card_1').at(-1)![2];
+    expect(retiredGuide).not.toContain('待启动');
+    expect(retiredGuide).not.toContain('直接执行');
     expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard).toBeUndefined();
   });
 
@@ -110,6 +116,24 @@ describe('project group mode', () => {
       'cli_coordinator', 'om_card_2', expect.stringContaining('项目已启动'),
     );
     expect(f.transport.unpinMessage).toHaveBeenCalledTimes(2);
+    expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard).toBeUndefined();
+  });
+
+  it('keeps the guide reference when updating its obsolete text fails and retries on refresh', async () => {
+    const f = fixture();
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId,
+      workerAppIds: ['cli_worker'],
+    });
+    await f.coordinator.ensureOnboardingCard(f.context, { coordinatorName: 'Bot', workerNames: [] });
+    vi.mocked(f.transport.updateCard).mockRejectedValueOnce(new Error('temporary_update_failure'));
+    await expect(f.coordinator.run(f.context, {
+      action: 'init', title: '启动测试', goal: '保留重试入口',
+    })).rejects.toThrow('temporary_update_failure');
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.card?.messageId).toBe('om_card_2');
+    expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard?.messageId).toBe('om_card_1');
+    await f.coordinator.run(f.context, { action: 'refresh' });
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(2);
     expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard).toBeUndefined();
   });
 

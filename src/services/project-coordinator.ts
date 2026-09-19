@@ -1,6 +1,7 @@
 import {
   buildProjectGroupCard,
   buildProjectGroupOnboardingCard,
+  buildProjectGroupStartedNoticeCard,
   type ProjectGroupOnboardingCardInput,
 } from '../im/lark/project-group-card.js';
 import type { Brand } from '../im/lark/lark-hosts.js';
@@ -162,6 +163,12 @@ export class ProjectCoordinator {
     const current = readGroupCollaborationMode(context.dataDir, context.chatId)?.onboardingCard;
     if (!current) return;
     if (current.larkAppId !== context.larkAppId) throw new Error('project_onboarding_coordinator_mismatch');
+    try {
+      await this.transport.updateCard(context.larkAppId, current.messageId,
+        JSON.stringify(buildProjectGroupStartedNoticeCard()));
+    } catch (error) {
+      if (!this.transport.isMessageWithdrawn(error)) throw error;
+    }
     if (current.pinned) {
       try {
         const unpinned = await this.transport.unpinMessage(context.larkAppId, current.messageId);

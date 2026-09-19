@@ -116,6 +116,16 @@ function heroElement(label: string, content: string, color: string, background: 
   };
 }
 
+/** Replace an obsolete setup guide after the live progress card is published. */
+export function buildProjectGroupStartedNoticeCard(): Record<string, unknown> {
+  return {
+    schema: '2.0',
+    config: { update_multi: true, summary: { content: '项目已启动，请查看置顶进度卡' } },
+    header: { template: 'blue', title: { tag: 'plain_text', content: '项目已启动' } },
+    body: { elements: [{ tag: 'markdown', content: '后续进展请查看置顶项目卡，无需再次发送启动指令。' }] },
+  };
+}
+
 export interface ProjectGroupOnboardingCardInput {
   coordinatorName: string;
   workerNames: string[];

@@ -668,6 +668,7 @@ export const messages: Record<string, string> = {
   'cmd.group.empty_fallback': '新会话 {ts}',
   'cmd.group.no_bot': '⚠️ 无法识别当前响应的机器人，/group 创建失败。',
   'cmd.group.no_sender': '⚠️ 无法获取发起人 open_id，/group 创建失败。',
+  'cmd.group.owner_notice': '群已创建，后续进展将在本群同步。',
   'cmd.group.created': '✅ 已新建群「{name}」\n👉 {link}\n\n直接在新群里开聊就行，整个群是一个独立的 CLI 会话。{hints}',
   'cmd.group.failed': '⚠️ 建群失败：{error}',
   'cmd.group.warn_invite_rejected': '⚠️ 飞书拒绝了自动邀请（你可能不在当前机器人的 app scope 下）。请到群里手动加入。',

@@ -26,3 +26,36 @@ describe('sqlite-compat 不把 Node 的实验特性警告漏到 stderr', () => {
     expect(String(r.stderr)).not.toMatch(/SQLite is an experimental feature/);
   });
 });
+
+
+describe('sqlite-compat Promise API', () => {
+  it('opens a database, preserves read-only mode and rejects an invalid path', () => {
+    const r = spawnSyncTsEvalWithRepoImports(
+      `import { openDatabaseSync } from './src/services/sqlite-compat.js';
+       import { mkdtempSync, rmSync } from 'node:fs';
+       import { join } from 'node:path';
+       import { tmpdir } from 'node:os';
+       import assert from 'node:assert/strict';
+       const dir = mkdtempSync(join(tmpdir(), 'sqlite-async-'));
+       try {
+         const file = join(dir, 'case.db');
+         const pending = openDatabaseSync(file);
+         assert.ok(pending instanceof Promise);
+         const db = await pending;
+         db.exec('create table cases (id integer); insert into cases values (42)');
+         assert.equal(db.prepare('select id from cases').get().id, 42);
+         db.close();
+         const readOnly = await openDatabaseSync(file, {readOnly: true});
+         assert.equal(readOnly.prepare('select id from cases').get().id, 42);
+         assert.throws(() => readOnly.exec('insert into cases values (43)'));
+         readOnly.close();
+         await assert.rejects(openDatabaseSync(join(dir, 'missing', 'case.db')));
+         process.stdout.write('ok');
+       } finally { rmSync(dir, {recursive: true, force: true}); }`,
+      { encoding: 'utf-8', cwd: process.cwd() },
+    );
+    expect(r.status).toBe(0);
+    expect(String(r.stdout)).toBe('ok');
+    expect(String(r.stderr)).not.toMatch(/ExperimentalWarning|Could not resolve/);
+  });
+});

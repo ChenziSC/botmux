@@ -148,14 +148,25 @@ export function sqliteEngineAvailable(): boolean {
 }
 
 /**
- * Promise-based facade over the same runtime-specific engine as the sync API.
- * Keep runtime-only modules behind createRequire: older Bun versions resolve
- * a literal node:sqlite import while loading the CLI dependency graph, before
- * the runtime branch can select bun:sqlite. Callers retain a Promise and open
- * failures remain rejections.
+ * Open a SQLite database with the right engine for the current runtime, returning
+ * a unified synchronous handle. Async because Node's binding is imported lazily
+ * (matches the existing `await import('node:sqlite')` call sites, and keeps the
+ * `node:sqlite` specifier out of the Bun bundle's static graph — Bun's bundler
+ * would otherwise try to resolve a module that doesn't exist there).
  */
 export async function openDatabaseSync(path: string, opts: OpenOptions = {}): Promise<DatabaseSyncLike> {
-  return openWithLoadedEngine(path, opts);
+  if (isBunRuntime()) {
+    // Dynamic specifier keeps `bun:sqlite` out of Node's static resolution too.
+    const { Database } = await import('bun:sqlite' as string);
+    // Omit the options arg entirely when not read-only: both engines reject an
+    // explicit `undefined` second arg ("options argument must be an object").
+    const db = opts.readOnly ? new Database(path, { readonly: true }) : new Database(path);
+    return wrapBunDatabase(db as never);
+  }
+  const { DatabaseSync } = await import('node:sqlite');
+  const db = opts.readOnly ? new DatabaseSync(path, { readOnly: true }) : new DatabaseSync(path);
+  // node:sqlite's DatabaseSync already matches DatabaseSyncLike structurally.
+  return db as unknown as DatabaseSyncLike;
 }
 
 /**

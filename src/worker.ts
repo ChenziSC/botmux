@@ -95,7 +95,7 @@ import {
   READ_ONLY_REMOTE_SCROLL_WINDOW_MS,
   ReadOnlyRemoteScrollLimiter,
 } from './utils/web-terminal-scroll.js';
-import { CodexUpdateDialogGuard } from './utils/codex-update-dialog.js';
+import { CodexUpdateDialogGuard, dismissCodexUpdatePicker } from './utils/codex-update-dialog.js';
 import { EffortConfirmDialogGuard, isEffortLevelCommand } from './utils/effort-confirm-dialog.js';
 import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
 import { resolveDarwinCodexCaBundle } from './utils/darwin-ca-bundle.js';
@@ -9720,12 +9720,21 @@ function dismissAidenCodexUpdateDialog(data: string): boolean {
   idleDetector?.reset();
   if (action === 'suppress') return true;
 
-  log('Codex startup update dialog detected behind Aiden, selecting the non-upgrade option...');
-  if (backend && 'sendSpecialKeys' in backend) {
-    (backend as any).sendSpecialKeys('Down', 'Enter');
-  } else {
-    backend?.write('\x1b[B\r');
-  }
+  log('Codex startup update dialog detected behind Aiden, confirming the non-upgrade selection...');
+  const target = backend;
+  const generation = cliSpawnGeneration;
+  if (!target) return true;
+  // A PTY redraw can precede the CLI's input handler. Defer, then confirm each
+  // selected row from a fresh viewport before submitting; do not batch Down+Enter.
+  void dismissCodexUpdatePicker({
+    isCurrent: () => backend === target && cliSpawnGeneration === generation && awaitingFirstPrompt,
+    capture: () => captureBackendScreen(target),
+    send: key => {
+      if ('sendSpecialKeys' in target) return (target as any).sendSpecialKeys(key);
+      target.write(key === 'Down' ? '\x1b[B' : '\r');
+    },
+  }).then(result => log(`Codex startup update dialog recovery: ${result}`))
+    .catch(error => log(`Codex startup update dialog recovery failed: ${error instanceof Error ? error.message : String(error)}`));
   return true;
 }
 

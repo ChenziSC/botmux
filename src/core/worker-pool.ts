@@ -1,3 +1,4 @@
+import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTriggerStreamingCard } from './trigger-streaming-card.js';
 /**
  * Worker pool — manages forking, killing, and lifecycle of worker processes.
  * Extracted from daemon.ts for modularity.
@@ -783,6 +784,8 @@ export interface WorkerPoolCallbacks {
   getActiveCount: () => number;
   /** Prepare trigger-user CLI identity before a delayed raw-input turn. */
   prepareRawInputTurn?: (ds: DaemonSession, turnId: string) => void | Promise<void>;
+  /** Connector-owned live card for a handoff whose exact input has started. */
+  onTriggerTurnStarted?: (ds: DaemonSession, title: string, turnId: string) => void;
   /** Close a stale session (message withdrawn, etc.). `false` means the
    * authoritative close failed and the active owner must remain retryable.
    * `void` is retained for older embedders/tests that implement a synchronous
@@ -12211,6 +12214,7 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored turn_input_rejected from stale worker generation`);
           break;
         }
+        discardTriggerStreamingCard(ds, msg.turnId);
         await rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg);
         break;
       }
@@ -12229,6 +12233,12 @@ function setupWorkerHandlers(
         // Compatibility/fallback: a commit also proves receipt if the earlier
         // receipt ACK was delayed or dropped on the reverse IPC channel.
         completeOrdinaryImDelivery(ds, msg.turnId, workerGeneration);
+        commitTriggerStreamingCard(ds, msg.turnId, (target, title, turnId) => {
+          if (!managedAuxUiSuppressed(turnId) && !streamingCardDisabled(target, turnId)
+            && !getBot(target.larkAppId).config.privateCard) {
+            cb.onTriggerTurnStarted?.(target, title, turnId);
+          }
+        });
         if (recordDispatchInputCommit(ds.session, msg.turnId, workerGeneration)) {
           sessionStore.updateSession(ds.session);
           if (msg.turnId.startsWith('mlrp_turn_')) {
@@ -12413,6 +12423,8 @@ function setupWorkerHandlers(
           ds.pendingSubstituteControlCard = false;
           void deliverSubstituteControlCard(ds);
         }
+
+        if (hasPendingTriggerStreamingCard(ds, msg.turnId)) break;
 
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
           logger.info(`[${t}] Managed/silent turn — suppressing ready/streaming card output`);
@@ -13218,6 +13230,7 @@ function setupWorkerHandlers(
         // the status patch; just don't touch any Lark card. Turn-exact: a
         // substitute turn's screen updates stay card-less even after a queued
         // normal turn overwrote currentReplyTarget (and vice versa).
+        if (hasPendingTriggerStreamingCard(ds, msg.turnId)) break;
         if (streamingCardDisabled(ds, msg.turnId)) { clearUsageRefreshTimer(ds); break; }
 
         // Restart recovery: a restored worker may emit screen updates as the CLI

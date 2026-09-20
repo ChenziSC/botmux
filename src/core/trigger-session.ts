@@ -1,3 +1,4 @@
+import { armTriggerStreamingCard } from './trigger-streaming-card.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import * as idempotencyStore from '../services/idempotency-store.js';
@@ -764,6 +765,7 @@ async function triggerSessionTurnAdmitted(
   const stableTurnId = internal?.stableTurnId?.trim();
   const triggerId = stableTurnId || `trg_${randomUUID()}`;
   const prepareStableDispatch = (target: DaemonSession, willFork: boolean): number | undefined => {
+    armTriggerStreamingCard(target, req, triggerId);
     if (!stableTurnId || !internal?.beforeDispatch) return undefined;
     const currentWorkerGeneration = Math.max(
       target.workerGeneration ?? 0,

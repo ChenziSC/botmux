@@ -151,6 +151,13 @@ describe('buildFooterAddressing', () => {
     )).toEqual({ sendTo: 'ou_substitute_caller', cc: [] });
   });
 
+  it('lets an explicit human recipient replace the default owner outside oncall chats', () => {
+    expect(buildFooterAddressing(
+      { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_caller' },
+      { isOncall: false, hasExplicitMention: true, knownBotOpenIds },
+    )).toEqual({ sendTo: undefined, cc: [] });
+  });
+
   it('uses the last caller in oncall chats when the caller is human', () => {
     expect(buildFooterAddressing(
       { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_human_caller' },

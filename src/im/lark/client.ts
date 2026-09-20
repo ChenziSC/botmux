@@ -700,8 +700,14 @@ export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ 
   };
 }
 
+export interface ChatUserMember {
+  openId: string;
+  name?: string;
+}
+
 /**
- * List the open_ids of a chat's (user) members, paginating until exhausted.
+ * List a chat's user members with app-scoped open_ids and optional display
+ * names, paginating until exhausted. Names support exact unique mention lookup.
  * Used by the 主动开工 场景① gate to check whether any of the bot's allowedUsers
  * is a member of a chat the bot was just added to. Open_ids are app-scoped, so
  * the result is only comparable against the SAME bot's resolvedAllowedUsers.
@@ -714,11 +720,6 @@ export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ 
  * truncated list would make members past the cap look like "not in the chat"
  * (wrong-answer fail-open), so a truncation is surfaced as an error instead.
  */
-export interface ChatUserMember {
-  openId: string;
-  name?: string;
-}
-
 export async function listChatUserMembers(larkAppId: string, chatId: string): Promise<ChatUserMember[]> {
   const c = getBotClient(larkAppId);
   const members: ChatUserMember[] = [];

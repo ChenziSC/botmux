@@ -830,7 +830,11 @@ async function triggerSessionTurnAdmitted(
     && !req.options?.waitForFinalOutput
     && !req.options?.asyncReturnSessionId
     && req.options?.suppressFinalOutput === true;
-  const loudTurnId = suppressLoudFinal ? triggerId : undefined;
+  // Card presentation also needs an exact worker turn id, independently of
+  // final-output suppression. Otherwise a reused worker invents its own id and
+  // its input-committed acknowledgement cannot consume the armed handoff card.
+  const loudTurnId = suppressLoudFinal || req.presentation?.liveCard === 'on-start'
+    ? triggerId : undefined;
   const armLoudFinalSuppression = (target: DaemonSession): void => {
     if (!suppressLoudFinal) return;
     armTriggerFinalSuppression(target, triggerId);
@@ -1833,6 +1837,7 @@ async function triggerSessionTurnAdmitted(
     // suppress a normal turn. The suppression is best-effort for this narrow race,
     // not a hard guarantee — consistent with the 256/TTL best-effort bound.
     if (loudTurnId) newDs.pendingTurnId = loudTurnId;
+    armTriggerStreamingCard(newDs, req, triggerId);
     armLoudFinalSuppression(newDs);
     const { runAutoWorktreeCommit } = await import('../im/lark/card-handler.js');
     void runAutoWorktreeCommit({
@@ -2171,6 +2176,7 @@ async function triggerSessionTurnAdmitted(
     releaseInitialReservation();
   }
   else if (loudTurnId) {
+    armTriggerStreamingCard(newDs, req, triggerId);
     armLoudFinalSuppression(newDs);
     forkWorker(newDs, promptInput, loudTurnId);
     releaseInitialReservation();

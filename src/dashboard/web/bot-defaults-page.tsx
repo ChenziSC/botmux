@@ -85,8 +85,13 @@ import {
  *  save, even though the wrapper only replaces the binary — `stripWrapperUnsafeArgs`
  *  removes `--settings`, botmux's `-c` overrides and `--dangerously-bypass-hook-trust`,
  *  never `--effort`. So resolve the key first. */
-function reasoningCatalogKey(cliKey: string): string | undefined {
+function selectedAgentCliId(cliKey: string): string {
   const cliId = lookupCliSelection(cliKey)?.cliId ?? cliKey;
+  return cliId;
+}
+
+function reasoningCatalogKey(cliKey: string): string | undefined {
+  const cliId = selectedAgentCliId(cliKey);
   if (cliId === 'grok' || cliId === 'traex' || cliId === 'claude-code') return cliId;
   if (cliId === 'codex' || cliId === 'codex-app') return 'codex';
   return undefined;
@@ -2449,7 +2454,7 @@ export function BotAgentSection(props: {
     } else {
       setModel(current => current.trim() === cliState.ttadkModelDefault ? '' : current);
     }
-    if (!isBackendVariantCliId(nextKey)) {
+    if (!isBackendVariantCliId(selectedAgentCliId(nextKey))) {
       setModelBackendVariant('');
       setModelBackendVariantTouched(true);
     }
@@ -2518,7 +2523,8 @@ export function BotAgentSection(props: {
       turnTimeoutField = parsed; // number (minutes→ms) or '' (clear)
     }
     const trimmedNativeModel = nativeModel.trim();
-    if (cliKey === 'traex') {
+    const saveCliId = selectedAgentCliId(cliKey);
+    if (saveCliId === 'traex') {
       const nextNativePolicyErrors: NativePolicyErrors = {
         model: nativeModelMode === 'custom' && !trimmedNativeModel ? tr('botDefaults.nativeSubagentModelRequired') : null,
         effort: nativeEffortMode === 'custom' && !nativeEffort ? tr('botDefaults.nativeSubagentReasoningEffortRequired') : null,
@@ -2544,7 +2550,7 @@ export function BotAgentSection(props: {
       const body = {
         cliId: cliKey,
         model,
-        ...(isBackendVariantCliId(cliKey) && modelBackendVariantTouched ? { modelBackendVariant } : {}),
+        ...(isBackendVariantCliId(saveCliId) && modelBackendVariantTouched ? { modelBackendVariant } : {}),
         reasoningEffort: cliSupportsReasoningEffort(cliKey) ? reasoningEffort : '',
         // dsh-only: only send when the user actually edited the field. Omitting
         // it makes the daemon preserve the current value; non-dsh selections
@@ -2555,7 +2561,7 @@ export function BotAgentSection(props: {
         ...(cliKey === 'dsh' && dshRuntimeTouched ? { dshRuntime } : {}),
         ...(cliKey === 'dsh' && dshProfileTouched ? { dshProfile: dshProfile || null } : {}),
         ...(runtimeTouched ? { cliRuntime } : {}),
-        ...(cliKey === 'traex' && nativePolicyTouched ? { nativeSubagentRuntime } : {}),
+        ...(saveCliId === 'traex' && nativePolicyTouched ? { nativeSubagentRuntime } : {}),
       };
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, body);
       if (res.ok && res.body.ok) {
@@ -2596,6 +2602,7 @@ export function BotAgentSection(props: {
             ? runtimeTouched ? null : bot.cliPathOverride ?? null
             : res.body.cliPathOverride,
           wrapperCli: res.body.wrapperCli ?? null,
+          cliLaunchMode: res.body.cliLaunchMode ?? null,
           model: res.body.model ?? '',
           modelBackendVariant: res.body.modelBackendVariant ?? undefined,
           reasoningEffort: res.body.reasoningEffort ?? undefined,
@@ -2604,6 +2611,8 @@ export function BotAgentSection(props: {
           dshRuntime: typeof res.body.dshRuntime === 'string' ? res.body.dshRuntime : bot.dshRuntime ?? null,
           dshProfile: typeof res.body.dshProfile === 'string' ? res.body.dshProfile : bot.dshProfile ?? null,
           agentSelectionKey: res.body.selectionKey ?? cliKey,
+          readIsolation: res.body.readIsolation === true,
+          readIsolationSupported: res.body.readIsolationSupported === true,
         });
         // Re-sync the minutes input from the authoritative saved ms and clear
         // the dirty flag so a subsequent unrelated save won't touch the field.
@@ -2749,12 +2758,13 @@ export function BotAgentSection(props: {
   }
 
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
-  const isRiff = cliKey === 'riff';
-  const isTraex = isBackendVariantCliId(cliKey);
-  const isCodexSelection = cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex');
+  const selectedCliId = selectedAgentCliId(cliKey);
+  const isRiff = selectedCliId === 'riff';
+  const isTraex = isBackendVariantCliId(selectedCliId);
+  const isCodexSelection = selectedCliId === 'codex' || selectedCliId === 'codex-app';
   const isReasoningSelection = cliSupportsReasoningEffort(cliKey);
   // The dsh adapter is the only one that forwards a runner turn timeout.
-  const isDsh = cliKey === 'dsh';
+  const isDsh = selectedCliId === 'dsh';
   const reasoningEffortOptions = useMemo(
     () => reasoningEffortsForCliModel(reasoningCatalogKey(cliKey), model),
     [cliKey, isCodexSelection, model],
@@ -2789,7 +2799,7 @@ export function BotAgentSection(props: {
   }, [nativeEffort, nativeEffortMode, nativePolicyErrors.effort]);
   useEffect(() => {
     if (
-      cliKey === 'traex'
+      isTraex
       && nativePolicyTouched
       && nativeEffortMode === 'custom'
       && nativeEffort
@@ -3136,9 +3146,9 @@ export function BotAgentSection(props: {
                 {
                   value: '',
                   label: tr(
-                    cliKey === 'grok'
+                    selectedCliId === 'grok'
                       ? 'botDefaults.agentReasoningEffortDefaultGrok'
-                      : cliKey === 'traex'
+                      : isTraex
                         ? 'botDefaults.agentReasoningEffortDefaultTraex'
                       : isCodexSelection
                         ? 'botDefaults.agentReasoningEffortDefaultCodex'
@@ -3155,7 +3165,7 @@ export function BotAgentSection(props: {
           </div>
         </div>
       )}
-      {cliKey === 'traex' && (
+      {isTraex && (
         <div className="bd-codex-runtime" data-native-subagent-runtime="">
           <div className="bd-runtime-heading">
             <FieldTitle help={tr('botDefaults.nativeSubagentHelp')}>{tr('botDefaults.nativeSubagentTitle')}</FieldTitle>
@@ -4767,8 +4777,7 @@ export function EnvelopeInjectionSection(props: { bot: BotDefaultsRow; patchBot:
 
 /** 最终回复投递方式：on = transcript（daemon 从 CLI 转写自动取最终回复，模型不再被
  *  要求 botmux send），off = send（模型自己 botmux send）。开关显示的是生效值：缺省
- *  按 CLI（claude-code 默认开，其它默认关），两个方向都显式落盘。当前 CLI 没有转写
- *  采集通道时开关禁用并说明。 */
+ *  为 send；两个方向都显式落盘。当前 CLI 没有转写采集通道时开关禁用并说明。 */
 export function ReplyDeliverySection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const [transcript, setTranscript] = useState(props.bot.replyDelivery === 'transcript');

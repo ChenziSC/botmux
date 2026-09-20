@@ -246,6 +246,7 @@ import {
   renameGroup,
   setPinStreamingCardForGroup,
   setDefaultModelsForGroup,
+  setSerialInputForGroup,
   unbindOncall,
   type GroupsActionDeps,
   type HandlerResult as GroupsHandlerResult,
@@ -2750,7 +2751,7 @@ function configuredBrands(): Map<string, string | undefined> {
   return brandMapByAppId(loadBotConfigs);
 }
 
-function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }> {
+function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }> {
   try {
     return new Map(loadBotConfigs().map(b => [b.larkAppId, {
       cliId: b.cliId,
@@ -2760,6 +2761,7 @@ function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: 
       // Bot Defaults endpoint.
       cliPathOverride: b.cliRuntime ? undefined : b.cliPathOverride,
       wrapperCli: b.wrapperCli,
+      cliLaunchMode: b.cliLaunchMode,
       model: b.model,
       modelBackendVariant: b.modelBackendVariant,
       reasoningEffort: b.reasoningEffort,
@@ -2807,6 +2809,7 @@ async function configuredBotDefaultsRecoveryRows(
           cliRuntime: bot.cliRuntime,
           cliPathOverride: bot.cliRuntime ? undefined : bot.cliPathOverride,
           wrapperCli: bot.wrapperCli,
+          cliLaunchMode: bot.cliLaunchMode,
           model: bot.model,
           modelBackendVariant: bot.modelBackendVariant,
           reasoningEffort: bot.reasoningEffort,
@@ -2831,18 +2834,19 @@ async function configuredBotDefaultsRecoveryRows(
   }
 }
 
-function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }>(
+function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }>(
   bot: T,
-  ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant'] }>,
-): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string } {
+  ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant'] }>,
+): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string } {
   const raw = ids.get(bot.larkAppId);
-  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
+  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
   return {
     ...bot,
     cliId: bot.cliId || fallback?.cliId,
     cliRuntime: bot.cliRuntime || fallback?.cliRuntime,
     cliPathOverride: bot.cliPathOverride || fallback?.cliPathOverride,
     wrapperCli: bot.wrapperCli || fallback?.wrapperCli,
+    cliLaunchMode: bot.cliLaunchMode || fallback?.cliLaunchMode,
     model: bot.model || fallback?.model,
     modelBackendVariant: bot.modelBackendVariant ?? fallback?.modelBackendVariant,
     reasoningEffort: bot.reasoningEffort || fallback?.reasoningEffort,
@@ -3053,7 +3057,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
       for (const c of j.chats ?? []) {
         const {
           oncallChat,
-          defaultModels, agentCliId, agentModel, agentReasoningEffort,
+          defaultModels, serialInput, agentCliId, agentModel, agentReasoningEffort,
           firstSeenAt,
           hasRole,
           hasMessageListener,
@@ -3079,6 +3083,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
           inChat: true,
           oncallChat: oncallChat ?? null,
           defaultModels: defaultModels ?? {},
+          serialInput: serialInput === true,
           agentCliId, agentModel, agentReasoningEffort,
           hasRole: hasRole ?? false,
           hasMessageListener: hasMessageListener ?? false,
@@ -5351,6 +5356,7 @@ const server = createServer(async (req, res) => {
           const availability = checkCliAvailability({
             cliId: o.cliId,
             wrapperCli: o.wrapperCli,
+            cliLaunchMode: o.cliLaunchMode,
           }, { shellFallback: false });
           // 静态模型候选（shell-free）：模型下拉的初始选项；live 增量由
           // /api/cli-options/models 按需探测。staticModelChoices 自身 fail-soft，
@@ -5367,6 +5373,7 @@ const server = createServer(async (req, res) => {
             available: availability.available,
             command: availability.command,
             availabilityReason: availability.reason,
+            ...(o.cliLaunchMode ? { cliLaunchMode: o.cliLaunchMode } : {}),
             modelChoices,
             // ttadk 网关项: 前端据此把模型框默认成 glm-5.1 并挂候选下拉; CoCo 不接受 -m.
             ...(isTtadkWrapper(o.wrapperCli)
@@ -5422,15 +5429,17 @@ const server = createServer(async (req, res) => {
       // { cliId, wrapperCli }——空 → 默认 claude-code; 非法键 → 400.
       let cliId: CliId;
       let wrapperCli: string | undefined;
+      let cliLaunchMode: BotConfig['cliLaunchMode'];
       try {
         const key = typeof parsed.cliId === 'string' && parsed.cliId.trim() ? parsed.cliId.trim() : 'claude-code';
         const sel = resolveCliSelection(key);
         cliId = sel.cliId;
         wrapperCli = sel.wrapperCli;
+        cliLaunchMode = sel.cliLaunchMode;
       } catch (err: any) {
         return jsonRes(res, 400, { ok: false, error: 'invalid_cli', message: err?.message ?? String(err) });
       }
-      const availability = checkCliAvailability({ cliId, wrapperCli });
+      const availability = checkCliAvailability({ cliId, wrapperCli, cliLaunchMode });
       if (!availability.available) {
         return jsonRes(res, 400, {
           ok: false,
@@ -5499,6 +5508,7 @@ const server = createServer(async (req, res) => {
         ...(registrationMode === 'web' ? { sessionMode, expectedIdentity } : {}),
         cliId,
         wrapperCli,
+        cliLaunchMode,
         workingDir,
         dirMode,
         model,
@@ -6678,6 +6688,18 @@ const server = createServer(async (req, res) => {
       }
     }
 
+    let mSerialInput: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mSerialInput = url.pathname.match(/^\/api\/groups\/([^/]+)\/serial-input\/([^/]+)$/))) {
+      let body: unknown;
+      try { body = await readJsonBody(req, 4096); }
+      catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      const result = await setSerialInputForGroup(
+        decodeURIComponent(mSerialInput[1]), decodeURIComponent(mSerialInput[2]),
+        JSON.stringify(body), groupsActionDeps,
+      );
+      return writeHandlerResult(res, result);
+    }
+
     let mDefaultModels: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mDefaultModels = url.pathname.match(/^\/api\/groups\/([^/]+)\/default-models\/([^/]+)$/))) {
       let body: unknown;
@@ -6737,6 +6759,9 @@ const server = createServer(async (req, res) => {
               ? j.cliPathOverride ?? undefined
               : d.cliPathOverride,
             wrapperCli: j.wrapperCli || d.wrapperCli,
+            cliLaunchMode: Object.prototype.hasOwnProperty.call(j, 'cliLaunchMode')
+              ? j.cliLaunchMode ?? undefined
+              : d.cliLaunchMode,
             model: j.model || d.model,
             modelBackendVariant: Object.prototype.hasOwnProperty.call(j, 'modelBackendVariant')
               ? j.modelBackendVariant ?? undefined
@@ -7410,8 +7435,8 @@ const server = createServer(async (req, res) => {
 
     // PUT /api/bots/:appId/reply-delivery — proxy to that bot's daemon.
     // Body `{ replyDelivery: 'transcript'|'send'|'' }` (''/other clears back to
-    // the CLI default: claude-code=transcript, others=send). 最终回复投递方式的
-    // per-bot 开关；'send' 与 'transcript' 都显式落盘。
+    // the default send). 最终回复投递方式的 per-bot 开关；'send' 与 'transcript'
+    // 都显式落盘。
     let mBotReplyDelivery: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotReplyDelivery = url.pathname.match(/^\/api\/bots\/([^/]+)\/reply-delivery$/))) {
       const appId = decodeURIComponent(mBotReplyDelivery[1]);

@@ -359,6 +359,23 @@ describe('turn-level idempotency — codex #818 P1 regressions', () => {
     expect(quarantined.has(SID)).toBe(false);
   });
 
+  it('P1-3b: boot reconcile preserves an interrupted turn lease and shared session', async () => {
+    idempotencyStore.claim({
+      ownerLarkAppId: APP, sessionId: SID, triggerId: 'trg_interrupted',
+      requestHash: 'sha256:x', ownerBootId: 'boot-OLD', key: `${SID}\u0000tk-interrupted`, now: 1, kind: 'turn',
+    });
+    idempotencyStore.transition(APP, `${SID}\u0000tk-interrupted`,
+      idempotencyStore.lookup(APP, `${SID}\u0000tk-interrupted`, 'turn')!, { state: 'attempting', now: 2 }, 'turn');
+    asyncTriggerStore.recordInterruptedStrict(SID, 'trg_interrupted', 3, APP);
+    mockCloseSession.mockClear();
+
+    const quarantined = await reconcileIdempotencyLeasesOnBoot(APP, 'boot-CURRENT', () => ({ chatId: CHAT }));
+
+    expect(asyncTriggerStore.lookup(SID, 'trg_interrupted')?.result.status).toBe('interrupted');
+    expect(mockCloseSession).not.toHaveBeenCalled();
+    expect(quarantined.has(SID)).toBe(false);
+  });
+
   it('P1-4: a keyed follow-up is refused RETRYABLY (no claim, no dispatch) while an activation gate is active', async () => {
     queuedActivationGateActive = true; // opening activation still owns submission order
     const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });

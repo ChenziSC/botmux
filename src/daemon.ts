@@ -361,7 +361,7 @@ import { fillNativeTopicId } from './core/native-topic-id.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
 import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, isSubstituteTurn, pickTurnReplyTarget, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sameTrustedPrincipal } from './core/active-turn-authority.js';
-import { trustedSessionController } from './core/trusted-session-controller.js';
+import { isSerialGroupInput, trustedSessionController } from './core/trusted-session-controller.js';
 import {
   continueCrossPrincipalOwnerWait,
   crossPrincipalOwnerWaitDisposition,
@@ -5839,6 +5839,7 @@ async function adoptCodexNotifierEvent(
     ds.session.cliId = 'codex-app';
     ds.session.cliPathOverride = botCfg.cliPathOverride;
     delete ds.session.wrapperCli;
+    delete ds.session.cliLaunchMode;
     delete ds.session.model;
     ds.spawnModelOverride = undefined;
     ds.session.agentFrozen = true;
@@ -18767,6 +18768,7 @@ function cloneIndependentLaunchPosture(source: Session, child: Session): void {
     : undefined;
   child.cliPathOverride = source.cliPathOverride;
   child.wrapperCli = source.wrapperCli;
+  child.cliLaunchMode = source.cliLaunchMode;
   child.agentFrozen = source.agentFrozen;
 }
 
@@ -19032,8 +19034,48 @@ function scheduleCrossPrincipalOwnerWait(ds: DaemonSession, deadlineAt: number):
   ds.crossPrincipalWaitTimer.unref?.();
 }
 
+async function askCrossPrincipalConfirmation(
+  ds: DaemonSession,
+  record: CrossPrincipalInterruption,
+  input: Parameters<typeof registerHostAsk>[0],
+): Promise<Awaited<ReturnType<typeof registerHostAsk>> | undefined> {
+  if (record.confirmationRetryAt && record.confirmationRetryAt > Date.now()) {
+    scheduleCrossPrincipalOwnerWait(ds, record.confirmationRetryAt);
+    return undefined;
+  }
+  const attempt = record.confirmationRetryCount ?? 0;
+  let result: Awaited<ReturnType<typeof registerHostAsk>>;
+  try {
+    result = await registerHostAsk({
+      ...input,
+      requestId: attempt ? `${input.requestId}:retry:${attempt}` : input.requestId,
+    });
+  } catch (err) {
+    result = { kind: 'invalidated', reason: err instanceof Error ? err.message : String(err),
+      selected: null, by: null, comment: null, timedOut: false };
+  }
+  const current = ds.session.crossPrincipalInterruptions?.find(item => item.id === record.id);
+  if (ds.session.status !== 'active' || !current) return undefined;
+  if (result.kind !== 'invalidated') {
+    delete current.confirmationRetryAt;
+    return result;
+  }
+  // A delivery/infrastructure failure is not a human rejection. Keep the
+  // original input and use a fresh, durable ask identity on the next attempt;
+  // replaying the failed identity would return the broker's retained failure.
+  current.confirmationRetryCount = attempt + 1;
+  current.confirmationRetryAt = Date.now() + Math.min(60_000 * 2 ** Math.min(attempt, 4), 600_000);
+  persistCrossPrincipalQueue(ds);
+  scheduleCrossPrincipalOwnerWait(ds, current.confirmationRetryAt);
+  logger.warn(`[${tag(ds)}] Confirmation unavailable; keeping input queued: ${result.reason}`);
+  if (attempt === 0) {
+    await notifyCrossPrincipalTerminal(ds, record, '确认卡片暂时不可用，消息仍保留且尚未执行；系统将重试，请勿重复发送。');
+  }
+  return undefined;
+}
+
 async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void> {
-  if (ds.crossPrincipalInterruptionDriving) return;
+  if (ds.session.status !== 'active' || ds.crossPrincipalInterruptionDriving) return;
   const record = ds.session.crossPrincipalInterruptions?.[0];
   if (!record) {
     clearTimeout(ds.crossPrincipalWaitTimer);
@@ -19073,7 +19115,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
         scheduleCrossPrincipalOwnerWait(ds, record.botClassifyDeadlineAt);
         return;
       }
-      const result = await registerHostAsk({
+      const result = await askCrossPrincipalConfirmation(ds, record, {
         larkAppId: ds.larkAppId,
         chatId: ds.chatId,
         rootMessageId: ds.scope === 'thread' ? ds.session.rootMessageId : null,
@@ -19091,6 +19133,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
           options: crossPrincipalClassificationOptions(loc),
         }],
       });
+      if (!result) return;
       const choice = choiceFromAskResult(result);
       const current = ds.session.crossPrincipalInterruptions?.find(item => item.id === record.id);
       if (!current) return;
@@ -19143,7 +19186,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
           scheduleCrossPrincipalOwnerWait(ds, record.ownerWaitDeadlineAt!);
           return;
         }
-        const waitResult = await registerHostAsk({
+        const waitResult = await askCrossPrincipalConfirmation(ds, record, {
           larkAppId: ds.larkAppId,
           chatId: ds.chatId,
           rootMessageId: ds.scope === 'thread' ? ds.session.rootMessageId : null,
@@ -19159,6 +19202,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
             options: crossPrincipalWaitOptions(loc),
           }],
         });
+        if (!waitResult) return;
         const waitChoice = choiceFromAskResult(waitResult);
         const current = ds.session.crossPrincipalInterruptions?.find(item => item.id === record.id);
         if (!current) return;
@@ -19180,7 +19224,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
         return;
       }
       const ownerTarget = pickTurnReplyTarget(ds.session, record.ownerTurnId);
-      const result = await registerHostAsk({
+      const result = await askCrossPrincipalConfirmation(ds, record, {
         larkAppId: ds.larkAppId,
         chatId: ds.chatId,
         rootMessageId: ownerTarget?.rootMessageId
@@ -19202,6 +19246,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
           ],
         }],
       });
+      if (!result) return;
       const choice = choiceFromAskResult(result);
       const current = ds.session.crossPrincipalInterruptions?.find(item => item.id === record.id);
       if (!current) return;
@@ -23214,6 +23259,7 @@ async function handleThreadReplyAdmitted(
   // Daemon-side hint: divert an already-known different principal before IPC.
   // The worker remains authoritative and hands a raced rejection back through
   // onOrdinaryImInputRejected; both paths converge on the same durable record.
+  const serialGroupInput = isSerialGroupInput(ds, threadTrustedCaller);
   //
   // Gated by the experimental XPI switch (default OFF). Off ⇒ fall through to
   // the existing-owner route below, i.e. deliver the message like any other —
@@ -23222,6 +23268,7 @@ async function handleThreadReplyAdmitted(
   const activePrincipalTurn = ds.activeInteractiveTurn;
   if (config.crossPrincipalInterruption
     && activePrincipalTurn
+    && !serialGroupInput
     && threadTrustedCaller
     && !sameTrustedPrincipal(activePrincipalTurn.caller, threadTrustedCaller)
     && !sameTrustedPrincipal(activePrincipalTurn.controller, threadTrustedCaller)) {
@@ -26747,6 +26794,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // refused and never persisted (delivery cannot be reconstructed to
     // completed/failed/cancelled after the fact). Keep the queue and dispatcher
     // live through worker teardown.
+    await (await import('./services/constrained-invocation/daemon.js')).closeConstrainedInvocations();
     stopMaintenance();
     vcMeetingTerminalReconciler?.stop();
     clearInterval(vcMeetingDeliveryLeaseTimer);

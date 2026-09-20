@@ -29,7 +29,7 @@ import { withFileLockSync } from '../utils/file-lock.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
 export interface PersistedAsyncTriggerResult {
-  status: 'pending' | 'completed' | 'failed';
+  status: 'pending' | 'completed' | 'failed' | 'interrupted';
   createdAt: number;
   completedAt?: number;
   content?: string;
@@ -43,6 +43,9 @@ export interface PersistedAsyncTriggerResult {
   /** Original structured worker terminal code retained for programmatic
    *  callers without widening TriggerResponse.errorCode with provider values. */
   terminalErrorCode?: string;
+  /** A caller-authorized turn-level interrupt was delivered to the exact live
+   * worker turn. The session deliberately remains open. */
+  interruptedAt?: number;
   /** Per-turn token usage captured at completion (codex-app). Optional — omitted
    *  when the turn produced no coherent usage. */
   usage?: {
@@ -122,7 +125,7 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 function isValidPersistedResult(value: unknown): value is PersistedAsyncTriggerResult {
   if (!isPlainObject(value)) return false;
   const status = value.status;
-  if (status !== 'pending' && status !== 'completed' && status !== 'failed') return false;
+  if (status !== 'pending' && status !== 'completed' && status !== 'failed' && status !== 'interrupted') return false;
   if (typeof value.createdAt !== 'number') return false;
   if (status === 'failed') {
     if (typeof value.failedAt !== 'number') return false;
@@ -137,6 +140,7 @@ function isValidPersistedResult(value: unknown): value is PersistedAsyncTriggerR
     }
   }
   if (status === 'completed' && typeof value.completedAt !== 'number') return false;
+  if (status === 'interrupted' && typeof value.interruptedAt !== 'number') return false;
   // steerParkedBy only makes sense on a parked-pending steer member; a present
   // non-string/empty value is a corrupt marker (fail-closed, like the fields
   // above), and it must never ride a terminal record.
@@ -232,6 +236,10 @@ export function recordCompleted(
     const file = load(sessionId);
     if (ownerLarkAppId) file.ownerLarkAppId = ownerLarkAppId;
     const prev = file.results[triggerId];
+    // An acknowledged explicit interrupt is the caller-selected terminal
+    // boundary. A late transcript final may have been emitted concurrently
+    // with Ctrl+C, but must not rewrite the externally observed cancellation.
+    if (prev?.status === 'interrupted') return;
     file.results[triggerId] = {
       status: 'completed',
       createdAt: prev?.createdAt ?? completedAt,
@@ -376,6 +384,7 @@ export function recordFailedStrict(
     }
     const prev = file.results[triggerId];
     if (prev?.status === 'completed') return 'already_completed'; // completed is stronger — keep it
+    if (prev?.status === 'interrupted') return 'written_failed';
     // An explicit worker terminal is stronger than a later worker-exit
     // `dispatch_unknown`; keep the precise failure while reporting terminal
     // convergence to the caller.
@@ -415,6 +424,7 @@ export function recordTerminalFailureStrict(
     }
     const prev = file.results[triggerId];
     if (prev?.status === 'completed') return 'already_completed';
+    if (prev?.status === 'interrupted') return 'written_failed';
     file.ownerLarkAppId = ownerLarkAppId;
     file.results[triggerId] = {
       status: 'failed',
@@ -423,6 +433,37 @@ export function recordTerminalFailureStrict(
       errorCode: 'trigger_failed',
       reason: 'turn_terminal',
       terminalErrorCode,
+    };
+    if (!file.latestTriggerId) file.latestTriggerId = triggerId;
+    saveStrict(sessionId, file);
+    return 'written_failed';
+  });
+}
+
+/** Persist a user-requested interrupt after the worker has positively confirmed
+ * it matched and delivered Ctrl+C to the exact live turn. Completion remains
+ * stronger evidence: an already captured final is never replaced. */
+export function recordInterruptedStrict(
+  sessionId: string,
+  triggerId: string,
+  interruptedAt: number,
+  ownerLarkAppId: string,
+): RecordFailedStrictOutcome {
+  if (!ownerLarkAppId) throw new Error('recordInterruptedStrict requires ownerLarkAppId');
+  ensureDir();
+  return withFileLockSync(getFilePath(sessionId), () => {
+    const file = loadStrict(sessionId);
+    if (file.ownerLarkAppId && file.ownerLarkAppId !== ownerLarkAppId) {
+      throw new Error(`recordInterruptedStrict owner mismatch: file owned by ${file.ownerLarkAppId}, caller ${ownerLarkAppId}`);
+    }
+    const prev = file.results[triggerId];
+    if (prev?.status === 'completed') return 'already_completed';
+    if (prev?.status === 'interrupted') return 'written_failed';
+    file.ownerLarkAppId = ownerLarkAppId;
+    file.results[triggerId] = {
+      status: 'interrupted',
+      createdAt: prev?.createdAt ?? interruptedAt,
+      interruptedAt,
     };
     if (!file.latestTriggerId) file.latestTriggerId = triggerId;
     saveStrict(sessionId, file);

@@ -84,6 +84,21 @@ describe('GET trigger-result — steer park-chain mirror after a daemon restart'
     expect(persisted?.result.steerParkedBy).toBeUndefined();
   });
 
+  it('returns a durable exact-turn interrupt after a daemon restart while its session remains open', async () => {
+    const sid = 'sid-interrupted-restart';
+    asyncTriggerStore.recordPending(sid, 'trg_stop', 1000, OWNER);
+    asyncTriggerStore.recordInterruptedStrict(sid, 'trg_stop', 7000, OWNER);
+
+    const res = await poll(sid, 'trg_stop');
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      ok: true,
+      state: 'interrupted',
+      triggerId: 'trg_stop',
+      finishedAt: new Date(7000).toISOString(),
+    });
+  });
+
   it('mirrors a turn_terminal successor: parked member fails with the provider terminal code', async () => {
     const sid = 'sid-steer-park-terminal';
     asyncTriggerStore.recordPending(sid, 'trg_root', 1000, OWNER);

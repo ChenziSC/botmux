@@ -34270,3 +34270,8 @@ a.card-menu-item {
 .bd-oncall-secret-input > button { min-width: 64px; }
 .bd-oncall-secret > small { font-size: 12px; }
 @media (max-width: 720px) { .bd-feedback-controls { grid-template-columns: minmax(0, 1fr); gap: 16px; } }
+
+.group-serial-input-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 0; }
+.group-serial-input-row > label { display: flex; align-items: center; gap: 6px; }
+.group-serial-input-row input { width: auto; }
+.group-serial-input-row > small { flex-basis: 100%; }

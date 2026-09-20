@@ -1,5 +1,6 @@
 // src/core/dashboard-ipc-server.ts
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
+import { randomBytes } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -56,6 +57,8 @@ import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
 import * as backendTypeStore from '../services/backend-type-store.js';
+import { setGroupSerialInput } from '../services/group-serial-input-store.js';
+import { parseGroupSerialInput } from './group-serial-input.js';
 import { setGroupDefaultModels } from '../services/group-default-models-store.js';
 import { parseGroupDefaultModels } from './group-default-models.js';
 import { setChatStreamingCardPin } from '../services/pin-streaming-card-mode-store.js';
@@ -78,6 +81,7 @@ import {
   CURRENT_ACTOR_ROUTE,
 } from '../cli/current-actor.js';
 import {
+  attestCurrentTurnLoopbackPeer,
   resolveDaemonCurrentActor,
   resolveLoopbackPeerProcesses,
 } from './current-actor-attestation.js';
@@ -87,7 +91,7 @@ import {
  *  The dashboard uses it to disable the toggle and to reject persisting an
  *  unenforceable flag, so flipping it on can never brick the bot's next session
  *  (the worker would otherwise refuse to start). Turning it OFF is always allowed. */
-function readIsolationEnforceableFor(cfg: { cliId?: string; cliPathOverride?: string; wrapperCli?: string }): boolean {
+function readIsolationEnforceableFor(cfg: { cliId?: string; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: string }): boolean {
   let adapterSupports = false;
   try {
     adapterSupports = createCliAdapterSync(cfg.cliId as never, cfg.cliPathOverride).supportsReadIsolation === true;
@@ -95,7 +99,7 @@ function readIsolationEnforceableFor(cfg: { cliId?: string; cliPathOverride?: st
   return evaluateReadIsolationGate({
     configured: true,
     adapterSupports,
-    wrapperCliSet: !!cfg.wrapperCli,
+    wrapperCliSet: !!cfg.wrapperCli || !!cfg.cliLaunchMode,
     platform: process.platform,
     sessionDataDirSet: true,
   }).enabled;
@@ -142,7 +146,7 @@ import {
   updateTaskWithOptionalPrecondition,
   type SchedulePreconditionMutation,
 } from './schedule-precondition-config.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
 import {
   awaitReadonlyTaskContinuationUser,
   cancelReadonlyTaskContinuationExplicit,
@@ -298,11 +302,14 @@ import {
   type SessionRow,
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
-import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
-import { tokenStoreProtection, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
+import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
+import { tokenStoreProtection, triggerUserAuthApplies, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
+import { getIdentity, resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
+import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
+import { refreshSessionIdentity } from './cli-identity.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
   normalizeSparseReplyStyleConfig,
@@ -778,6 +785,7 @@ function routeHasPublicAccess(method: string, pathname: string): boolean {
  *       · options.steer=true authorizes a best-effort native turn/steer into
  *         a live codex-app turn; same drive-my-own-turn trust surface, no extra
  *         route or capability.
+ *   POST /api/sessions/:id/turns/:triggerId/interrupt (stop exact turn)
  *   GET  /api/sessions/:id/trigger-result          (poll final)
  *   GET  /api/sessions/:id/insight                 (poll conversation/progress)
  * `/api/asks/answer` is deliberately EXCLUDED — it is askId-keyed with no
@@ -787,6 +795,7 @@ function routeHasPublicAccess(method: string, pathname: string): boolean {
  */
 function routeIsCoreOnlyPublic(method: string, pathname: string): boolean {
   if (method === 'POST' && pathname === '/api/trigger') return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/turns\/[^/]+\/interrupt$/.test(pathname)) return true;
   if (method === 'GET') {
     return /^\/api\/sessions\/[^/]+\/trigger-result$/.test(pathname)
       || /^\/api\/sessions\/[^/]+\/insight$/.test(pathname);
@@ -810,7 +819,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|rename|project|project-dispatch-policy|continuation)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|rename|project|project-dispatch-policy|continuation|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -1329,6 +1338,71 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
     }
     const r = await closeSession(params.sessionId);
     jsonRes(res, r.ok ? 200 : 502, r);
+  });
+});
+
+/** Stop exactly one active async trigger without closing its session. The
+ * worker confirms turn identity before Ctrl+C is injected; this endpoint never
+ * falls back to a broad session interrupt. */
+ipcRoute('POST', '/api/sessions/:sessionId/turns/:triggerId/interrupt', async (_req, res, params) => {
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds || ds.session.status === 'closed') {
+    return jsonRes(res, 404, { ok: false, errorCode: 'session_not_found', error: 'active session not found' });
+  }
+  if (isSessionTransferring(ds)) {
+    return jsonRes(res, 409, { ok: false, errorCode: 'trigger_failed', error: 'session transfer in progress' });
+  }
+  const larkAppId = ds.larkAppId;
+  return withBotTurnMutation(larkAppId, async () => {
+    // Recheck under the mutation fence: an accepted new turn must not be
+    // interrupted by a request that was admitted against an older snapshot.
+    if (findActiveBySessionId(params.sessionId) !== ds || ds.session.status === 'closed') {
+      return jsonRes(res, 404, { ok: false, errorCode: 'session_not_found', error: 'active session not found' });
+    }
+    const result = ds.asyncTriggerResults?.get(params.triggerId);
+    const durable = asyncTriggerStore.lookup(params.sessionId, params.triggerId);
+    if (!result && !durable) {
+      return jsonRes(res, 404, { ok: false, errorCode: 'bad_request', error: 'async trigger not found for this session' });
+    }
+    if (result?.status === 'interrupted' || durable?.result.status === 'interrupted') {
+      return jsonRes(res, 200, { ok: true, action: 'interrupted', sessionId: params.sessionId, triggerId: params.triggerId, idempotent: true });
+    }
+    if (result?.status === 'completed' || result?.status === 'failed'
+      || durable?.result.status === 'completed' || durable?.result.status === 'failed') {
+      return jsonRes(res, 409, { ok: false, errorCode: 'trigger_failed', error: 'async trigger is already terminal' });
+    }
+    // A durable pending row without a live in-memory turn cannot prove which
+    // CLI turn would be hit, so fail closed rather than sending a broad Ctrl+C.
+    if (!result || result.status !== 'pending') {
+      return jsonRes(res, 409, { ok: false, errorCode: 'trigger_failed', error: 'async trigger is not live in this daemon generation' });
+    }
+    const delivery = await interruptExactWorkerTurn(ds, params.triggerId);
+    if (!delivery.ok) {
+      const status = delivery.reason === 'stale_turn' ? 409 : 503;
+      return jsonRes(res, status, { ok: false, errorCode: 'trigger_failed', error: `interrupt not delivered: ${delivery.reason}` });
+    }
+    const interruptedAt = Date.now();
+    result.status = 'interrupted';
+    result.interruptedAt = interruptedAt;
+    try {
+      const outcome = asyncTriggerStore.recordInterruptedStrict(params.sessionId, params.triggerId, interruptedAt, larkAppId);
+      if (outcome === 'already_completed') {
+        ds.asyncTriggerResults?.delete(params.triggerId);
+        return jsonRes(res, 409, { ok: false, errorCode: 'trigger_failed', error: 'async trigger completed before interrupt was recorded' });
+      }
+    } catch (err) {
+      // Do not claim a durable terminal without its required restart proof.
+      // The process was interrupted, but callers must retry/poll after storage
+      // recovery rather than receiving an unsafe success acknowledgement.
+      result.status = 'pending';
+      result.interruptedAt = undefined;
+      return jsonRes(res, 503, { ok: false, errorCode: 'trigger_failed', error: `interrupt persistence failed: ${err instanceof Error ? err.message : String(err)}` });
+    }
+    // Only release worker-exit convergence after the durable interrupt proof
+    // exists. Otherwise an exit between Ctrl+C and fsync could rewrite this
+    // caller-selected terminal into dispatch_unknown.
+    ds.idempotentAsyncTurns?.delete(params.triggerId);
+    return jsonRes(res, 200, { ok: true, action: 'interrupted', sessionId: params.sessionId, triggerId: params.triggerId });
   });
 });
 
@@ -2063,6 +2137,130 @@ ipcRoute('GET', '/api/sessions/:sessionId/preview', (req, res, params) => {
   return jsonRes(res, 200, { ok: true, preview });
 });
 
+const sessionAuthRequests = new Map<string, {
+  sessionId: string;
+  isCurrent: () => boolean;
+  poll: Awaited<ReturnType<typeof requestUserAuthorization>>['poll'];
+}>();
+
+for (const action of ['auth-request', 'auth-status']) {
+  ipcRoute('POST', `/api/sessions/:sessionId/${action}`, async (req, res, params) => {
+    let body: Record<string, unknown>;
+    try { body = await readBoundedJsonBody(req, 16_384, 1_000); }
+    catch (err) {
+      if (err instanceof IpcBodyTooLargeError || err instanceof IpcBodyTimeoutError) {
+        closeUntrustedRequestAfterResponse(req, res);
+      }
+      return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
+    }
+    const ds = findActiveBySessionId(params.sessionId);
+    const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+    if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+    if (['callerOpenId', 'openId', 'larkAppId', 'chatId'].some(key => key in body)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
+    }
+    const origin = ds?.managedTurnOrigin;
+    if (!ds || ds.session.status !== 'active' || sessionTransportDisabled(ds)
+      || ds.session.vcMeetingReceiver || !ds.worker || ds.worker.killed
+      || !origin?.callerOpenId || !origin.turnId || !origin.capability) {
+      return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+    }
+    // Two proof modes for "this request belongs to the current turn":
+    //  · Isolated pane (sandbox / read isolation): presents the rotating
+    //    capability tuple in the body, cross-checked against managedTurnOrigin.
+    //  · Managed host (no relay/channel injected): sends no tuple and instead
+    //    proves lineage the way `/api/current-actor` does — the daemon maps the
+    //    loopback socket to the client pid and walks it to the live CLI. Never
+    //    let a partial/stale tuple fall through to the host path.
+    const presentsOriginTuple = 'originCapability' in body || 'originTurnId' in body
+      || 'originDispatchAttempt' in body;
+    if (presentsOriginTuple) {
+      if (body.originCapability !== origin.capability || body.originTurnId !== origin.turnId
+        || body.originDispatchAttempt !== origin.dispatchAttempt) {
+        return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+      }
+    } else {
+      const peer = resolveLoopbackPeerProcesses({
+        remoteAddress: req.socket.remoteAddress,
+        remotePort: req.socket.remotePort,
+        localPort: req.socket.localPort,
+      });
+      if (!peer.ok || !attestCurrentTurnLoopbackPeer({
+        sessionId: params.sessionId, peer: peer.peer, findSession: findActiveBySessionId,
+      })) {
+        return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+      }
+    }
+    const callerOpenId = origin.callerOpenId;
+    const turnId = origin.turnId;
+    const capability = origin.capability;
+    const attempt = origin.dispatchAttempt;
+    const worker = ds.worker;
+    const generation = ds.workerGeneration;
+    const isCurrent = () => findActiveBySessionId(params.sessionId) === ds
+      && ds.session.status === 'active' && ds.worker === worker && !worker.killed
+      && ds.workerGeneration === generation && ds.managedTurnOrigin?.callerOpenId === callerOpenId
+      && ds.managedTurnOrigin?.turnId === turnId && ds.managedTurnOrigin?.capability === capability
+      && ds.managedTurnOrigin?.dispatchAttempt === attempt;
+    const cfg = getBot(ds.larkAppId).config;
+    if (!triggerUserAuthApplies(cfg.triggerUserAuth, 'lark-cli')) {
+      return jsonRes(res, 409, { ok: false, error: 'lark_user_auth_disabled' });
+    }
+
+    if (action === 'auth-status') {
+      const request = typeof body.requestId === 'string' ? sessionAuthRequests.get(body.requestId) : undefined;
+      if (!request || request.sessionId !== params.sessionId || !request.isCurrent()) {
+        return jsonRes(res, 409, { ok: false, error: 'auth_request_expired' });
+      }
+      const result = await request.poll();
+      if (!isCurrent() || !request.isCurrent()) {
+        return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+      }
+      if (result.status === 'pending') return jsonRes(res, 200, { ok: true, status: 'pending' });
+      if (result.status === 'failed') {
+        return jsonRes(res, 400, { ok: false, status: 'failed', error: result.error });
+      }
+      if (!refreshSessionIdentity(config.session.dataDir, params.sessionId, {
+        tool: 'lark-cli', appId: cfg.larkAppId, userAccessToken: result.token, turnId,
+      })) {
+        return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+      }
+      return jsonRes(res, 200, { ok: true, status: 'ready' });
+    }
+
+    if (!Array.isArray(body.scopes) || body.scopes.length > 100
+      || body.scopes.some(scope => typeof scope !== 'string' || !scope || scope.length > 256)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
+    }
+    const scopes = [...new Set(body.scopes as string[])];
+    const unknownScopes = scopes.filter(scope => !isKnownLarkUserScope(scope));
+    if (unknownScopes.length) return jsonRes(res, 400, { ok: false, error: 'unknown_scopes', scopes: unknownScopes });
+    const cached = getIdentity(ds.larkAppId, callerOpenId);
+    const identity = cached?.type === 'user' && ['sender', 'message_api', 'contact_api'].includes(cached.source)
+      ? cached
+      : await resolveVerifiedUserIdentity(ds.larkAppId, callerOpenId);
+    if (!identity || identity.type !== 'user' || identity.openId !== callerOpenId || !isCurrent()) {
+      return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+    }
+    let authorization: Awaited<ReturnType<typeof requestUserAuthorization>>;
+    try {
+      authorization = await requestUserAuthorization(
+        cfg.larkAppId, cfg.larkAppSecret, normalizeBrand(cfg.brand), scopes, callerOpenId, isCurrent,
+      );
+    } catch {
+      return jsonRes(res, 502, { ok: false, error: 'authorization_request_failed' });
+    }
+    if (!isCurrent()) return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+    const requestId = randomBytes(32).toString('hex');
+    sessionAuthRequests.set(requestId, { sessionId: params.sessionId, isCurrent, poll: authorization.poll });
+    setTimeout(() => sessionAuthRequests.delete(requestId), authorization.expiresIn * 1_000).unref();
+    return jsonRes(res, 200, {
+      ok: true, authUrl: authorization.authUrl, requestId,
+      scopes: authorization.scopes, expiresIn: authorization.expiresIn, autoCallback: true,
+    });
+  });
+}
+
 /** 向本会话 CLI 注入一条 allowlist 内的原生斜杠命令（idle 后生效）。
  *  鉴权双路径（见 sessionCliIpcAuth）：trusted-host 签名或本会话 rotating
  *  capability；命令面由 allowlist（默认空=全拒）承担。 */
@@ -2660,6 +2858,7 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
       errorCode: memResult.errorCode,
       terminalErrorCode: memResult.terminalErrorCode,
       usage: memResult.usage,
+      interruptedAt: memResult.interruptedAt,
     } : undefined,
     memTriggerId: memResult ? memTriggerId : undefined,
     persisted,
@@ -2898,6 +3097,48 @@ function findHeadlessRecordForThisDaemon(idOrSessionId: string): HeadlessSession
   if (!record || record.larkAppId !== cachedLarkAppId) return null;
   return record;
 }
+
+// Uses the same signed host-CLI IPC boundary and bot admission gate as headless.
+ipcRoute('GET', '/api/headless/invocations/capabilities', async (req, res) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const { invocationCapabilityForBot } = await import('../services/constrained-invocation/daemon.js');
+  return jsonRes(res, 200, { ok: true, capability: invocationCapabilityForBot(cachedLarkAppId) });
+});
+ipcRoute('POST', '/api/headless/invocations', async (req, res) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  const { invocationServiceForBot } = await import('../services/constrained-invocation/daemon.js');
+  return withBotTurnAdmission(cachedLarkAppId, async () => {
+    try {
+      const result = invocationServiceForBot(cachedLarkAppId!, true).start(body);
+      return jsonRes(res, result.state === 'running' ? 202 : 200, { ok: true, result });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'invalid_invocation';
+      return jsonRes(res, message === 'idempotency_conflict' ? 409 : 400, { ok: false, error: message });
+    }
+  });
+});
+ipcRoute('GET', '/api/headless/invocations/:requestId', async (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const { invocationServiceForBot } = await import('../services/constrained-invocation/daemon.js');
+  try {
+    const result = invocationServiceForBot(cachedLarkAppId).get(params.requestId);
+    return jsonRes(res, result ? 200 : 404, { ok: !!result, result });
+  } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_invocation' }); }
+});
+ipcRoute('POST', '/api/headless/invocations/:requestId/cancel', async (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const { invocationServiceForBot } = await import('../services/constrained-invocation/daemon.js');
+  try {
+    const result = await invocationServiceForBot(cachedLarkAppId).cancel(params.requestId);
+    return jsonRes(res, result ? 200 : 404, { ok: !!result, result });
+  } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_invocation' }); }
+});
 
 ipcRoute('GET', '/api/headless/sessions', (_req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
@@ -4889,6 +5130,16 @@ ipcRoute('PUT', '/api/chat-group-grant', async (req, res) => {
 
 // ─── Groups (Phase B) ──────────────────────────────────────────────────────
 
+ipcRoute('PUT', '/api/group-serial-input/:chatId', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  if (!/^oc_[a-zA-Z0-9_-]+$/.test(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  let enabled: boolean;
+  try { enabled = parseGroupSerialInput(await readJsonBody(req)); }
+  catch (e) { return jsonRes(res, 400, { ok: false, error: e instanceof Error ? e.message : 'bad_json' }); }
+  const result = await setGroupSerialInput(cachedLarkAppId, p.chatId, enabled);
+  return jsonRes(res, result.ok ? 200 : 500, result);
+});
+
 ipcRoute('PUT', '/api/group-default-models/:chatId', async (req, res, p) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
   if (!/^oc_[a-zA-Z0-9_-]+$/.test(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
@@ -4905,6 +5156,7 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
     const chats = await groupsStore.listChats(cachedLarkAppId);
     let agentDefaults: { agentCliId?: string; agentModel?: string; agentReasoningEffort?: string } = {};
     let groupDefaultModels: Record<string, import('./group-default-models.js').GroupDefaultModels> = {};
+    let groupSerialInput: Record<string, boolean> = {};
     let pinStreamingCardMasterEnabled = false;
     let noPinStreamingCardChats = new Set<string>();
     let effectiveMessageListenerForChat: ((chatId: string) => boolean) | undefined;
@@ -4913,6 +5165,7 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
       const botConfig = botState.config;
       agentDefaults = { agentCliId: botConfig.cliId, agentModel: botConfig.model, agentReasoningEffort: botConfig.reasoningEffort };
       groupDefaultModels = botConfig.groupDefaultModels ?? {};
+      groupSerialInput = botConfig.groupSerialInput ?? {};
       pinStreamingCardMasterEnabled = botConfig.pinStreamingCard === true;
       noPinStreamingCardChats = new Set(botConfig.noPinStreamingCardChats ?? []);
       effectiveMessageListenerForChat = (chatId) => resolveEffectiveMessageListener(botState, chatId)?.enabled === true;
@@ -4940,6 +5193,7 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
         ...c,
         oncallChat: oncall ?? null,
         ...agentDefaults,
+        serialInput: groupSerialInput[c.chatId] === true,
         ...(groupDefaultModels[c.chatId] ? { defaultModels: groupDefaultModels[c.chatId] } : {}),
         firstSeenAt: seenMap.get(c.chatId) ?? null,
         hasRole,
@@ -5731,9 +5985,8 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   } catch { /* default chat */ }
   let envelopeInjection: 'auto' | 'off' = 'off';
   try { if (getBot(cachedLarkAppId).config.envelopeInjection === 'auto') envelopeInjection = 'auto'; } catch { /* default off */ }
-  // 最终回复投递方式：给 dashboard 的是**生效值**（显式配置 → 否则按 CLI 缺省，
-  // claude-code 缺省 transcript）+ 该 CLI 的缺省值 + 当前 CLI 是否支持 transcript
-  // （dashboard 据此禁用开关并说明）。
+  // 最终回复投递方式：给 dashboard 的是**生效值**（显式配置 → 否则缺省 send）
+  // + 该 CLI 的缺省值 + 当前 CLI 是否支持 transcript（dashboard 据此禁用开关并说明）。
   let replyDelivery: 'send' | 'transcript' = 'send';
   let replyDeliveryDefault: 'send' | 'transcript' = 'send';
   let replyDeliverySupported = false;
@@ -5771,6 +6024,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   let cliRuntime: CliRuntimeConfig | null = null;
   let cliPathOverride: string | null = null;
   let wrapperCli: string | null = null;
+  let cliLaunchMode: BotConfig['cliLaunchMode'] | null = null;
   let model: string | null = null;
   let modelBackendVariant: 'standard' | 'max' | null = null;
   let reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | null = null;
@@ -5794,6 +6048,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
       ? cfg.cliPathOverride
       : null;
     wrapperCli = typeof cfg.wrapperCli === 'string' && cfg.wrapperCli.trim() ? cfg.wrapperCli : null;
+    cliLaunchMode = cfg.cliLaunchMode ?? null;
     model = typeof cfg.model === 'string' && cfg.model.trim() ? cfg.model : null;
     modelBackendVariant = isBackendVariantCliId(cfg.cliId)
       && (cfg.modelBackendVariant === 'standard' || cfg.modelBackendVariant === 'max')
@@ -5809,7 +6064,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
       ? cfg.turnTimeoutMs
       : null;
     dshRuntime = cfg.dshRuntime === 'tui' ? 'tui' : null;
-    agentSelectionKey = selectionKeyForBot(cliId, wrapperCli ?? undefined);
+    agentSelectionKey = selectionKeyForBot(cliId, wrapperCli ?? undefined, cliLaunchMode ?? undefined);
   } catch { /* no registered bot */ }
   let maxLiveWorkers: number | null = null;
   let sessionOwnerReminder = DEFAULT_SESSION_OWNER_REMINDER;
@@ -5885,6 +6140,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     cliRuntime,
     cliPathOverride,
     wrapperCli,
+    cliLaunchMode,
     model,
     modelBackendVariant,
     reasoningEffort,
@@ -6592,7 +6848,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     nextDshRuntime = body.dshRuntime;
   }
   const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
-  const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli);
+  const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli, currentBotConfig.cliLaunchMode);
   const selectionChanged = key !== currentSelectionKey;
   let nextRuntime: CliRuntimeConfig | undefined;
   let nextLegacyPath: string | undefined;
@@ -6601,8 +6857,8 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       if (selected.cliId !== 'codex') {
         return jsonRes(res, 400, { ok: false, error: 'runtime_requires_codex' });
       }
-      if (selected.wrapperCli) {
-        return jsonRes(res, 400, { ok: false, error: 'runtime_wrapper_conflict' });
+      if (selected.wrapperCli || selected.cliLaunchMode) {
+        return jsonRes(res, 400, { ok: false, error: selected.wrapperCli ? 'runtime_wrapper_conflict' : 'runtime_launch_mode_conflict' });
       }
       try {
         nextRuntime = normalizeCliRuntimeConfig(body.cliRuntime, 'cliRuntime');
@@ -6627,6 +6883,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     cliId: selected.cliId,
     wrapperCli: selected.wrapperCli,
     cliPathOverride: effectivePath,
+    cliLaunchMode: selected.cliLaunchMode,
   });
   // dsh-tui mode spawns the dsh-tui binary instead of the dsh runner. Check it
   // separately so a missing dsh-tui install surfaces as a save-time warning
@@ -6695,106 +6952,118 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // is the other way a bot could end up configured-but-unenforceable.)
     let readIsolationCleared = false;
     const r = await rmwBotEntry<{
-      error?: 'reasoning_effort_not_supported_by_model';
+      error?: 'reasoning_effort_not_supported_by_model' | 'launch_mode_sandbox_conflict';
       nextReasoningEffort?: typeof reasoningEffort;
       nextModelBackendVariant?: 'standard' | 'max';
       nextNativeSubagentRuntimeState?: NativeSubagentRuntimeConfigState;
     }>(larkAppId, (entry) => {
-    const storedModelBackendVariant = entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max'
-      ? entry.modelBackendVariant
-      : undefined;
-    const entryUsesBackendVariantCli = isBackendVariantCliId(entry.cliId);
-    const nextModelBackendVariant = supportsModelBackendVariant
-      ? (modelBackendVariantFieldPresent
-        ? modelBackendVariant
-        : entryUsesBackendVariantCli ? storedModelBackendVariant : undefined)
-      : undefined;
-    const nextReasoningEffort = supportsReasoningEffort
-      ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : entry.reasoningEffort)
-      : undefined;
-    if (nextReasoningEffort && !cliModelSupportsReasoningEffort(selected.cliId, model || undefined, nextReasoningEffort)) {
-      return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' } };
-    }
-    entry.cliId = selected.cliId;
-    if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
-    else delete entry.wrapperCli;
-    if (nextRuntime) {
-      entry.cliRuntime = nextRuntime;
-      // Downgrade shadow: older BotMux versions ignore cliRuntime but retain
-      // cliPathOverride, so a rollback still launches this distribution.
-      entry.cliPathOverride = nextRuntime.executable;
-    } else if (nextLegacyPath) {
-      entry.cliPathOverride = nextLegacyPath;
-      delete entry.cliRuntime;
-    } else {
-      delete entry.cliRuntime;
-      delete entry.cliPathOverride;
-    }
-    if (model) entry.model = model;
-    else delete entry.model;
-    if (!supportsModelBackendVariant) delete entry.modelBackendVariant;
-    else if (modelBackendVariantFieldPresent) {
-      if (modelBackendVariant) entry.modelBackendVariant = modelBackendVariant;
-      else delete entry.modelBackendVariant;
-    } else if (!entryUsesBackendVariantCli) {
-      delete entry.modelBackendVariant;
-    }
-    if (!supportsReasoningEffort) delete entry.reasoningEffort;
-    else if (reasoningEffortFieldPresent) {
-      if (reasoningEffort) entry.reasoningEffort = reasoningEffort;
-      else delete entry.reasoningEffort;
-    }
-    let nextNativeSubagentRuntimeState: NativeSubagentRuntimeConfigState;
-    if (selected.cliId !== 'traex') {
-      delete entry.nativeSubagentRuntime;
-      nextNativeSubagentRuntimeState = { status: 'absent' };
-    } else if (nativeSubagentRuntimeFieldPresent) {
-      if (requestedNativeSubagentRuntime) entry.nativeSubagentRuntime = requestedNativeSubagentRuntime;
-      else delete entry.nativeSubagentRuntime;
-      nextNativeSubagentRuntimeState = requestedNativeSubagentRuntime
-        ? { status: 'valid', policy: requestedNativeSubagentRuntime }
-        : { status: 'absent' };
-    } else {
-      const normalized = normalizeNativeSubagentRuntimePolicy(entry.nativeSubagentRuntime);
-      nextNativeSubagentRuntimeState = !normalized.ok
-        ? { status: 'invalid' }
-        : normalized.value
-          ? { status: 'valid', policy: normalized.value }
+      if (selected.cliLaunchMode && (entry.sandbox === true || entry.readIsolation === true)) {
+        return { write: false, result: { error: 'launch_mode_sandbox_conflict' } };
+      }
+      const storedModelBackendVariant = entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max'
+        ? entry.modelBackendVariant
+        : undefined;
+      const entryUsesBackendVariantCli = isBackendVariantCliId(entry.cliId);
+      const nextModelBackendVariant = supportsModelBackendVariant
+        ? (modelBackendVariantFieldPresent
+          ? modelBackendVariant
+          : entryUsesBackendVariantCli ? storedModelBackendVariant : undefined)
+        : undefined;
+      const nextReasoningEffort = supportsReasoningEffort
+        ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : entry.reasoningEffort)
+        : undefined;
+      if (nextReasoningEffort && !cliModelSupportsReasoningEffort(selected.cliId, model || undefined, nextReasoningEffort)) {
+        return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' } };
+      }
+      entry.cliId = selected.cliId;
+      if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
+      else delete entry.wrapperCli;
+      if (selected.cliLaunchMode) entry.cliLaunchMode = selected.cliLaunchMode;
+      else delete entry.cliLaunchMode;
+      if (nextRuntime) {
+        entry.cliRuntime = nextRuntime;
+        // Downgrade shadow: older BotMux versions ignore cliRuntime but retain
+        // cliPathOverride, so a rollback still launches this distribution.
+        entry.cliPathOverride = nextRuntime.executable;
+      } else if (nextLegacyPath) {
+        entry.cliPathOverride = nextLegacyPath;
+        delete entry.cliRuntime;
+      } else {
+        delete entry.cliRuntime;
+        delete entry.cliPathOverride;
+      }
+      if (model) entry.model = model;
+      else delete entry.model;
+      if (!supportsModelBackendVariant) delete entry.modelBackendVariant;
+      else if (modelBackendVariantFieldPresent) {
+        if (modelBackendVariant) entry.modelBackendVariant = modelBackendVariant;
+        else delete entry.modelBackendVariant;
+      } else if (!entryUsesBackendVariantCli) {
+        delete entry.modelBackendVariant;
+      }
+      if (!supportsReasoningEffort) delete entry.reasoningEffort;
+      else if (reasoningEffortFieldPresent) {
+        if (reasoningEffort) entry.reasoningEffort = reasoningEffort;
+        else delete entry.reasoningEffort;
+      }
+      let nextNativeSubagentRuntimeState: NativeSubagentRuntimeConfigState;
+      if (selected.cliId !== 'traex') {
+        delete entry.nativeSubagentRuntime;
+        nextNativeSubagentRuntimeState = { status: 'absent' };
+      } else if (nativeSubagentRuntimeFieldPresent) {
+        if (requestedNativeSubagentRuntime) entry.nativeSubagentRuntime = requestedNativeSubagentRuntime;
+        else delete entry.nativeSubagentRuntime;
+        nextNativeSubagentRuntimeState = requestedNativeSubagentRuntime
+          ? { status: 'valid', policy: requestedNativeSubagentRuntime }
           : { status: 'absent' };
-    }
-    // dsh-only turn timeout: non-dsh always drops it; on dsh, an explicit
-    // field value writes/clears it, absence preserves the current value.
-    if (!supportsTurnTimeout) delete entry.turnTimeoutMs;
-    else if (turnTimeoutFieldPresent) {
-      if (nextTurnTimeoutMs !== undefined) entry.turnTimeoutMs = nextTurnTimeoutMs;
-      else delete entry.turnTimeoutMs;
-    }
-    // dsh-only runtime variant: same present/absent semantics as turnTimeoutMs.
-    if (!supportsDshRuntime) delete entry.dshRuntime;
-    else if (dshRuntimeFieldPresent) {
-      if (nextDshRuntime !== undefined) entry.dshRuntime = nextDshRuntime;
-      else delete entry.dshRuntime;
-    }
-    if (entry.readIsolation === true &&
-        !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli })) {
-      delete entry.readIsolation;
-      readIsolationCleared = true;
-    }
-    // 远端 CLI（riff / mojo）→ backendType 自动设为同名后端（否则 spawn 走 pty 后端，
-    // 而它们的 resolvedBin 是空串）。mojo 加入后这里必须按「是否远端」判断，不能再
-    // 硬编码 riff。
-    if (isRemoteCliId(selected.cliId)) {
-      entry.backendType = selected.cliId as typeof entry.backendType;
-    } else if (entry.backendType && isRemoteBackendType(entry.backendType)) {
-      // 从远端 CLI 切回其它 CLI：清掉这个自动配对的 backend override，回落 daemon
-      // 默认后端——否则新 CLI 会跑在远端 Backend 上（PTY 分块输入被当成一串远端
-      // turn）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不是远端后端）。
-      delete entry.backendType;
-    }
-    return { write: true, result: { nextReasoningEffort, nextModelBackendVariant, nextNativeSubagentRuntimeState } };
+      } else {
+        const normalized = normalizeNativeSubagentRuntimePolicy(entry.nativeSubagentRuntime);
+        nextNativeSubagentRuntimeState = !normalized.ok
+          ? { status: 'invalid' }
+          : normalized.value
+            ? { status: 'valid', policy: normalized.value }
+            : { status: 'absent' };
+      }
+      // dsh-only turn timeout: non-dsh always drops it; on dsh, an explicit
+      // field value writes/clears it, absence preserves the current value.
+      if (!supportsTurnTimeout) delete entry.turnTimeoutMs;
+      else if (turnTimeoutFieldPresent) {
+        if (nextTurnTimeoutMs !== undefined) entry.turnTimeoutMs = nextTurnTimeoutMs;
+        else delete entry.turnTimeoutMs;
+      }
+      // dsh-only runtime variant: same present/absent semantics as turnTimeoutMs.
+      if (!supportsDshRuntime) delete entry.dshRuntime;
+      else if (dshRuntimeFieldPresent) {
+        if (nextDshRuntime !== undefined) entry.dshRuntime = nextDshRuntime;
+        else delete entry.dshRuntime;
+      }
+      if (entry.readIsolation === true &&
+          !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli, cliLaunchMode: selected.cliLaunchMode })) {
+        delete entry.readIsolation;
+        readIsolationCleared = true;
+      }
+      // 远端 CLI（riff / mojo）→ backendType 自动设为同名后端（否则 spawn 走 pty 后端，
+      // 而它们的 resolvedBin 是空串）。mojo 加入后这里必须按「是否远端」判断，不能再
+      // 硬编码 riff。
+      if (isRemoteCliId(selected.cliId)) {
+        entry.backendType = selected.cliId as typeof entry.backendType;
+      } else if (entry.backendType && isRemoteBackendType(entry.backendType)) {
+        // 从远端 CLI 切回其它 CLI：清掉这个自动配对的 backend override，回落 daemon
+        // 默认后端——否则新 CLI 会跑在远端 Backend 上（PTY 分块输入被当成一串远端
+        // turn）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不是远端后端）。
+        delete entry.backendType;
+      }
+      return { write: true, result: { nextReasoningEffort, nextModelBackendVariant, nextNativeSubagentRuntimeState } };
     });
     if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
     if (r.result.error) {
+      if (r.result.error === 'launch_mode_sandbox_conflict') {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: r.result.error,
+          message: 'Forge x TraeX 暂不支持文件沙盒，请先关闭 sandbox 后再切换。',
+        });
+      }
       return jsonRes(res, 400, {
         ok: false,
         error: r.result.error,
@@ -6808,6 +7077,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     bot.config.cliPathOverride = nextRuntime?.executable ?? nextLegacyPath;
     if (selected.wrapperCli) bot.config.wrapperCli = selected.wrapperCli;
     else bot.config.wrapperCli = undefined;
+    bot.config.cliLaunchMode = selected.cliLaunchMode;
     bot.config.model = model || undefined;
     bot.config.modelBackendVariant = supportsModelBackendVariant
       ? r.result.nextModelBackendVariant
@@ -6836,13 +7106,14 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // 消息 lazy resume 复活，要等下次 daemon 重启才被 restore 守卫清理。
     const closedMismatchedSessions = await closeCliMismatchedSessionsForBot(larkAppId);
 
-    const selectionKey = selectionKeyForBot(selected.cliId, selected.wrapperCli);
+    const selectionKey = selectionKeyForBot(selected.cliId, selected.wrapperCli, selected.cliLaunchMode);
     jsonRes(res, 200, {
       ok: true,
       cliId: selected.cliId,
       cliRuntime: nextRuntime ?? null,
       cliPathOverride: nextRuntime ? null : nextLegacyPath ?? null,
       wrapperCli: selected.wrapperCli ?? null,
+      cliLaunchMode: selected.cliLaunchMode ?? null,
       model: model || null,
       modelBackendVariant: supportsModelBackendVariant ? bot.config.modelBackendVariant ?? null : null,
       reasoningEffort: supportsReasoningEffort ? bot.config.reasoningEffort ?? null : null,
@@ -7034,8 +7305,8 @@ ipcRoute('PUT', '/api/bot-envelope-injection', async (req, res) => {
 //   • 'transcript' → daemon 从 CLI 转写自动取本轮最后的 assistant 文本发最终回复卡，
 //     模型不再被要求 botmux send；仅 claude-code 与结构化转写白名单 CLI 支持，其它
 //     CLI 由 store 拒绝（400 reply_delivery_unsupported）。落盘 'transcript'
-//   • 'send' → 模型必须自己 botmux send。落盘 'send'（claude-code 退回旧行为的唯一方式）
-//   • ''/其它 → 删 key，回到该 CLI 的缺省（claude-code=transcript，其它=send）
+//   • 'send' → 模型必须自己 botmux send。落盘 'send'
+//   • ''/其它 → 删 key，回到缺省 send
 // 走 applyConfigField（与 /botconfig 同一写盘 + 热更新路径）：逐轮信封下一轮生效，
 // 系统提示部分要 /restart 才换新值。响应里的 replyDelivery 是写入后的**生效值**。
 ipcRoute('PUT', '/api/bot-reply-delivery', async (req, res) => {
@@ -7512,6 +7783,17 @@ ipcRoute('PUT', '/api/bot-sandbox', async (req, res) => {
   let body: { enabled?: unknown };
   try { body = await readJsonBody<{ enabled?: unknown }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (body.enabled === true) {
+    try {
+      if (getBot(cachedLarkAppId).config.cliLaunchMode === 'forge-traex') {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'launch_mode_sandbox_conflict',
+          message: 'Forge x TraeX 暂不支持文件沙盒。',
+        });
+      }
+    } catch { /* Let the store return the canonical config error below. */ }
+  }
   // File-sandbox policy is frozen onto each Session at creation and reused on
   // restore; this toggle is intentionally next-session-only and cannot mutate
   // a live pane's profile.

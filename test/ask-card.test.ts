@@ -68,6 +68,19 @@ function makePending(overrides: Partial<PendingAsk> = {}): PendingAsk {
 }
 
 describe('buildAskCard', () => {
+  it.each(['ou_proposer_123', 'ou_proposer-123', '"ou_proposer-123"', "'ou_proposer-123'"])('preserves a host question mention with ID %s', (id) => {
+    const tag = `<at id=${id}></at>`;
+    const ask = makePending({ questions: [{
+      prompt: `${tag} choose _one_`, multiSelect: false,
+      options: [{ key: 'independent', label: 'independent' }, { key: 'suggestion', label: 'suggestion' }],
+    }] });
+    const card = JSON.parse(buildAskCard(ask));
+    const question = card.elements.find((item: any) => item.text?.content?.includes('choose'));
+    expect(question.text.content).toContain(tag);
+    expect(question.text.content).toContain('\\_one\\_');
+    expect(question.text.content).not.toContain('ou\\_');
+  });
+
   it('多问卡片：每问一个分区 + option buttons + 一个 submit', () => {
     const ask = makePending({
       questions: [

@@ -953,6 +953,18 @@ describe('buildStreamingCard', () => {
     });
 
     // transcript 模式：最终回复卡已投递 → idle 卡头「已完成」。颜色沿用 idle 的绿色。
+    it("idle + 'failed' label renders 「执行失败」 instead of 「等待输入」", () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, 'failed',
+      ));
+      expect(card.header.template).toBe('green');
+      expect(card.header.title.content).toContain('执行失败');
+      expect(card.header.title.content).not.toContain('等待输入');
+      expect(card.header.title.content).not.toContain('已处理 · 判定无需回复');
+    });
+
     it("idle + 'completed' label renders 「已完成」 instead of 「等待输入」", () => {
       const card = parse(buildStreamingCard(
         SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',

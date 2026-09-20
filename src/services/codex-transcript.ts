@@ -354,6 +354,7 @@ export function codexCotEntriesFromResponseItem(p: any): CodexCotEntry[] {
 }
 
 export const CODEX_RATE_LIMIT_ERROR_CODE = 'codex_rate_limited';
+export const CODEX_QUOTA_ERROR_CODE = 'codex_quota_exceeded';
 export const CODEX_AUTH_ERROR_CODE = 'codex_auth_failed';
 export const CODEX_INVALID_REQUEST_ERROR_CODE = 'codex_invalid_request';
 export const CODEX_CONNECTION_ERROR_CODE = 'codex_connection_failed';
@@ -536,6 +537,8 @@ export function codexTaskFailureCode(error: unknown): string {
   let serialized = '';
   try { serialized = JSON.stringify(error); } catch { serialized = String(error ?? ''); }
   const normalized = serialized.toLowerCase();
+  // Gateway quota counters may use HTTP 403; this is not a login failure.
+  if (/insufficient[_ -]?quota|quota.{0,24}(?:exceed|exhaust)|(?:达到|超过).{0,12}上限|额度.{0,8}(?:耗尽|不足)/.test(normalized)) return CODEX_QUOTA_ERROR_CODE;
   if (/\b429\b|too many requests|rate[_ -]?limit/.test(normalized)) return CODEX_RATE_LIMIT_ERROR_CODE;
   if (/\b401\b|\b403\b|unauthorized|forbidden|authentication|invalid[_ -]?(?:api[_ -]?)?key/.test(normalized)) {
     return CODEX_AUTH_ERROR_CODE;

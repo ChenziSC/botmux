@@ -1159,3 +1159,17 @@ describe('codexCotEntriesFromResponseItem (CoT thinking timeline)', () => {
     expect(codexCotEntriesFromResponseItem(undefined)).toEqual([]);
   });
 });
+
+ describe('gateway quota classification', () => {
+  it.each([
+    'unexpected status 403 Forbidden: 该业务方请求o系列模型触发azure安全拦截报错数达到上限：1000',
+    '403 Forbidden: insufficient_quota',
+    'quota exhausted',
+  ])('does not confuse a quota counter with login failure: %s', error => {
+    expect(codexTaskFailureCode(error)).toBe('codex_quota_exceeded');
+  });
+  it('preserves actual authentication and transient rate-limit classes', () => {
+    expect(codexTaskFailureCode('401 Unauthorized')).toBe(CODEX_AUTH_ERROR_CODE);
+    expect(codexTaskFailureCode('429 Too Many Requests')).toBe(CODEX_RATE_LIMIT_ERROR_CODE);
+  });
+});

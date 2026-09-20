@@ -291,7 +291,12 @@ describe('TmuxBackend.capturePaneViewport', () => {
   });
 
   it('fails open when the pane disappears during capture', () => {
-    mockedExecFileSync.mockImplementation(() => { throw new Error('pane missing'); });
+    mockedExecFileSync.mockImplementation((_command, args) => {
+      if (Array.isArray(args) && args[0] === 'capture-pane') {
+        throw new Error('pane missing');
+      }
+      return '' as any;
+    });
     expect(createBackend().capturePaneViewport()).toBe('');
   });
 });

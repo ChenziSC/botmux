@@ -275,6 +275,27 @@ describe('TmuxBackend.sendSpecialKeys', () => {
   });
 });
 
+describe('TmuxBackend.capturePaneViewport', () => {
+  beforeEach(() => mockedExecFileSync.mockReset());
+
+  it('captures the authoritative visible pane with ANSI preserved', () => {
+    mockedExecFileSync.mockReturnValue('› 1. Update now\n  2. Skip\n' as any);
+    const be = createBackend('bmx-update');
+
+    expect(be.capturePaneViewport()).toContain('2. Skip');
+    expect(mockedExecFileSync).toHaveBeenCalledWith(
+      'tmux',
+      ['capture-pane', '-p', '-e', '-J', '-t', 'bmx-update'],
+      expect.objectContaining({ encoding: 'utf-8' }),
+    );
+  });
+
+  it('fails open when the pane disappears during capture', () => {
+    mockedExecFileSync.mockImplementation(() => { throw new Error('pane missing'); });
+    expect(createBackend().capturePaneViewport()).toBe('');
+  });
+});
+
 describe('TmuxBackend.pasteText', () => {
   beforeEach(() => mockedExecFileSync.mockReset());
 

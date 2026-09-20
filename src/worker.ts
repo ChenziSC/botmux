@@ -95,7 +95,7 @@ import {
   READ_ONLY_REMOTE_SCROLL_WINDOW_MS,
   ReadOnlyRemoteScrollLimiter,
 } from './utils/web-terminal-scroll.js';
-import { CodexUpdateDialogGuard } from './utils/codex-update-dialog.js';
+import { CodexUpdateDialogGuard, codexUpdateDialogSafeKeys } from './utils/codex-update-dialog.js';
 import { EffortConfirmDialogGuard, isEffortLevelCommand } from './utils/effort-confirm-dialog.js';
 import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
 import { resolveDarwinCodexCaBundle } from './utils/darwin-ca-bundle.js';
@@ -9818,6 +9818,11 @@ async function driveCocoPicker(navKeys: string[], needsReviewSubmit: boolean, co
 const TRUST_DIALOG_PATTERN = /Yes, I trust this folder|Yes, continue/;
 let trustHandled = false;
 const codexUpdateDialogGuard = new CodexUpdateDialogGuard();
+const AIDEN_CODEX_UPDATE_RETRY_MS = 1_000;
+const AIDEN_CODEX_UPDATE_MAX_ATTEMPTS = 3;
+let aidenCodexUpdateLastActionAt = 0;
+let aidenCodexUpdateAttempts = 0;
+let aidenCodexUpdateLimitNotified = false;
 // Auto-confirm Claude Code's mid-session "Change effort level?" Yes/No dialog.
 // Armed only by botmux's own `/effort <level>` passthrough (see deliverRawInput)
 // and disarmed on match, timeout, or CLI respawn — never inspects idle screens.
@@ -9854,7 +9859,7 @@ function armEffortConfirm(): void {
  * cjadk and ttadk launches never need this path because they accept the
  * config override. Adopted panes are user-owned and must not be driven.
  */
-function dismissAidenCodexUpdateDialog(data: string): boolean {
+function dismissAidenCodexUpdateDialog(data: string, source: 'stream' | 'screen' = 'stream'): boolean {
   if (
     lastInitConfig?.cliId !== 'codex'
     || lastInitConfig.adoptMode
@@ -9871,15 +9876,63 @@ function dismissAidenCodexUpdateDialog(data: string): boolean {
   // Cancel any ready match from an earlier partial menu redraw before it can
   // flush the first queued Lark message into the picker.
   idleDetector?.reset();
-  if (action === 'suppress') return true;
-
-  log('Codex startup update dialog detected behind Aiden, selecting the non-upgrade option...');
-  if (backend && 'sendSpecialKeys' in backend) {
-    (backend as any).sendSpecialKeys('Down', 'Enter');
-  } else {
-    backend?.write('\x1b[B\r');
+  if (aidenCodexUpdateAttempts >= AIDEN_CODEX_UPDATE_MAX_ATTEMPTS) {
+    if (source === 'screen' && !aidenCodexUpdateLimitNotified) {
+      aidenCodexUpdateLimitNotified = true;
+      log(`Codex startup update dialog remained after ${aidenCodexUpdateAttempts} Aiden auto-dismiss attempts`);
+      send({
+        type: 'user_notify',
+        message: `Codex 升级菜单自动跳过 ${aidenCodexUpdateAttempts} 次后仍未继续。已停止自动操作，请打开网页终端选择「2. Skip」。`,
+        turnId: currentBotmuxTurnId,
+      });
+    }
+    return true;
   }
+
+  const keys = codexUpdateDialogSafeKeys(data);
+  if (!keys || Date.now() - aidenCodexUpdateLastActionAt < AIDEN_CODEX_UPDATE_RETRY_MS) return true;
+
+  aidenCodexUpdateLastActionAt = Date.now();
+  let delivered = false;
+  try {
+    if (backend && 'sendSpecialKeys' in backend) {
+      (backend as any).sendSpecialKeys(...keys);
+      delivered = true;
+    } else {
+      const input = keys.map(key => key === 'Down' ? '\x1b[B' : key === 'Up' ? '\x1b[A' : '\r').join('');
+      delivered = backend?.write(input) === true;
+    }
+  } catch (error) {
+    log(`Codex startup update dialog navigation failed; will retry: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!delivered) {
+    aidenCodexUpdateLastActionAt = 0;
+    return true;
+  }
+  aidenCodexUpdateAttempts += 1;
+  log(`Codex startup update dialog detected behind Aiden, selecting the non-upgrade option (${keys.join('+')}, attempt ${aidenCodexUpdateAttempts}/${AIDEN_CODEX_UPDATE_MAX_ATTEMPTS})...`);
   return true;
+}
+
+/** Aiden can finish drawing the picker before the PTY listener is attached.
+ * Re-check the rendered viewport while startup is held so a menu that only
+ * exists in the authoritative screen cannot strand the queued first turn. */
+function inspectAidenCodexUpdateDialogOnScreen(): boolean {
+  if (
+    lastInitConfig?.cliId !== 'codex'
+    || lastInitConfig.adoptMode
+    || !lastInitConfig.wrapperCli
+    || parseWrapperCli(lastInitConfig.wrapperCli)[0] !== 'aiden'
+    || !awaitingFirstPrompt
+  ) return false;
+
+  let screen = '';
+  try {
+    screen = backend instanceof TmuxBackend
+      ? backend.capturePaneViewport()
+      : (renderer?.rawSnapshot({ preserveFormatting: true }) ?? '');
+  } catch { return false; }
+  return screen.length > 0 && dismissAidenCodexUpdateDialog(screen, 'screen');
 }
 
 /**
@@ -13013,6 +13066,7 @@ function startScreenUpdates(): void {
   let lastSnapshotPtyActivity = -1;
   screenUpdateTimer = setInterval(() => {
     if (awaitingFirstPrompt) {
+      inspectAidenCodexUpdateDialogOnScreen();
       // First-turn 「工作中」 publisher. The async sampler below is fully gated
       // until the first turn ends (markPromptReady flips awaitingFirstPrompt) or
       // the 15s soft timeout, so an argv-baked first prompt (Pi/Grok/…, delivered
@@ -17831,6 +17885,9 @@ function killCli(opts: {
   altBufferActive = false;
   trustHandled = false;
   codexUpdateDialogGuard.reset();
+  aidenCodexUpdateLastActionAt = 0;
+  aidenCodexUpdateAttempts = 0;
+  aidenCodexUpdateLimitNotified = false;
   disarmEffortConfirm();
   appRunnerControlDecoder.reset();
 }

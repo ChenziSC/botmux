@@ -279,6 +279,7 @@ export function recordSteerParked(
 export type SupersedePendingTriggerOutcome =
   | 'superseded'
   | 'already_superseded'
+  | 'predecessor_steer_parked'
   | 'predecessor_not_pending'
   | 'successor_not_completed';
 
@@ -314,6 +315,10 @@ export function supersedePendingTriggerByCompletedSuccessorStrict(
       && predecessor.reason === 'turn_terminal'
       && predecessor.terminalErrorCode === `superseded_by_completed_successor:${successorTriggerId}`) {
       return 'already_superseded';
+    }
+    // Steer owns the parked member's final result, including after a restart.
+    if (predecessor?.status === 'pending' && predecessor.steerParkedBy) {
+      return 'predecessor_steer_parked';
     }
     const replaceableAmbiguousFailure = predecessor?.status === 'failed'
       && predecessor.reason === 'dispatch_unknown';

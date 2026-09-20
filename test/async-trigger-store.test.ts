@@ -121,6 +121,32 @@ describe('recordCompleted', () => {
 });
 
 describe('supersedePendingTriggerByCompletedSuccessorStrict', () => {
+  it('preserves parked steer members and their restart chain while ordinary pending triggers supersede', () => {
+    recordPending('sess1', 'parked', 1000, 'cli_test');
+    recordPending('sess1', 'ordinary', 1100, 'cli_test');
+    recordSteerParked('sess1', 'parked', 'successor', 1200, 'cli_test');
+    recordCompleted('sess1', 'successor', 'merged answer', 2000, 'cli_test');
+    const filePath = join(tempDir, 'async-triggers', 'sess1.json');
+    const before = readFileSync(filePath, 'utf8');
+
+    expect(supersedePendingTriggerByCompletedSuccessorStrict(
+      'sess1', 'parked', 'successor', 3000, 'cli_test',
+    )).toBe('predecessor_steer_parked');
+    expect(readFileSync(filePath, 'utf8')).toBe(before);
+    expect(lookup('sess1', 'parked')?.result).toMatchObject({
+      status: 'pending', steerParkedBy: 'successor', createdAt: 1000,
+    });
+    expect(followSteerParkedChain('sess1', 'parked')?.result).toMatchObject({
+      status: 'completed', content: 'merged answer', completedAt: 2000,
+    });
+    expect(supersedePendingTriggerByCompletedSuccessorStrict(
+      'sess1', 'ordinary', 'successor', 3000, 'cli_test',
+    )).toBe('superseded');
+    expect(supersedePendingTriggerByCompletedSuccessorStrict(
+      'sess1', 'ordinary', 'successor', 4000, 'cli_test',
+    )).toBe('already_superseded');
+  });
+
   it('terminalizes only an explicitly named pending predecessor', () => {
     recordPending('sess1', 'trg_old', 1000, 'cli_test');
     recordPending('sess1', 'trg_unrelated', 1500, 'cli_test');

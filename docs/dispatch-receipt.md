@@ -52,6 +52,7 @@
 
 成功返回 `200`、`state=superseded`；重复提交返回 `alreadyTerminal=true`。
 后继未完成或前驱不可替换返回 `409`。后续查询前驱会得到 `failed`，不会误报为业务成功。
+带 `steerParkedBy` 的 pending 前驱返回 `409 / predecessor_steer_parked`，原记录与指针保持不变，最终结果由 steer 链解析；重启后仍可获取合并完成结果。
 后来的真实 worker 完成或终止证据仍可按原有规则覆盖该标记。端点不在 core-only 的免认证列表中。
 
 工具子进程显式收到 `BOTMUX_SESSION_ID`、`BOTMUX_CHAT_ID`、`BOTMUX_LARK_APP_ID` 和

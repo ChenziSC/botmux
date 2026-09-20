@@ -13,6 +13,35 @@ import { discoverRolloutSessions } from '../../services/resumable-session-discov
 import { delay, scaleMs } from '../../utils/timing.js';
 
 const CODEX_ACTIVE_BUSY_PATTERN = /Working[^\r\n]{0,160}esc to interrupt/i;
+const CODEX_STARTUP_READY_PATTERN = /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/;
+
+/** ZMX resume can replace the entire banner with restored history; warm worker
+ * reattach can leave the original loaded banner far above the viewport. Either
+ * native header plus a bottom empty composer + explicit Ready footer proves
+ * initialization without guessing the PTY's current viewport geometry.
+ * Do not use a prompt/footer found in the middle of scrollback as evidence. */
+function restoredCodexHistoryReady(history: string): boolean {
+  const restored = /^\s*Earlier messages are available\s*—\s*press ctrl \+ t to view the full transcript[ \t]*(?:\r?\n|$)/.test(history);
+  const banner = history.match(/^\s*╭[^\r\n]*╮\r?\n[\s\S]*?╰[^\r\n]*╯/)?.[0];
+  const initialized = !!banner && banner.includes('>_ OpenAI Codex') && CODEX_STARTUP_READY_PATTERN.test(banner);
+  const lines = history.trimEnd().split(/\r?\n/);
+  const fromBottom = [...lines].reverse().findIndex(line => /^\s*›(?:\s|$)/.test(line));
+  if (fromBottom < 0) return false;
+  const prompt = lines.length - 1 - fromBottom;
+  if (!/^\s*›\s*(?:Ask Codex to do anything)?\s*$/.test(lines[prompt])) return false;
+  const footer = lines.slice(prompt + 1).filter(line => line.trim());
+  if (footer.length !== 1) return false;
+  const restoredReady = (restored || initialized)
+    && /^\s*\S[^\r\n]* · (?:\/|~)\S* · Ready(?: · [^\r\n]*)?$/.test(footer[0]!);
+  // Codex 0.154 can resume straight into the composer without repainting the
+  // banner or restoration marker. Its bottom Context footer is the positive
+  // initialization evidence in that layout; the loading skeleton never has it.
+  const contextReady = /^\s*\S[^\r\n]* · Context \d+% (?:left|used)(?: · [^\r\n]*)?$/.test(footer[0]!);
+  if (!restoredReady && !contextReady) return false;
+  // History has no viewport bounds: never guess how far above the composer a
+  // loading/status row can be. Conflicting evidence remains conservatively held.
+  return !/(?:model|directory):\s*loading\b|Resuming session|esc to interrupt|Queued for capacity/i.test(history);
+}
 
 /** Global submit log — Codex appends one JSON line here on every successful
  *  user submit across all sessions. Far better than the per-session rollout
@@ -449,12 +478,8 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // models/paths. The footer can already show a model during loading. Match
     // cell boundaries, not literal newlines: PTY redraws also move the cursor.
     startupPendingPattern: /│[ \t]+(?:model|directory):[ \t]+loading\b/,
-    // Fresh starts render the initialized model/directory banner. A resumed
-    // Codex 0.154 session may instead replace the loading skeleton directly
-    // with the composer plus its Context footer, without redrawing that banner.
-    // Require both anchors for the resume form: a prompt alone is also present
-    // in the loading skeleton and is not sufficient readiness evidence.
-    startupReadyPattern: /(?:│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│)|(?:›(?![ \t]*\d+\.)[\s\S]{0,512}?\bContext[ \t]+\d+%[ \t]+(?:left|used)\b)/,
+    startupReadyPattern: CODEX_STARTUP_READY_PATTERN,
+    startupReadyFromHistory: restoredCodexHistoryReady,
     // Codex cold starts can exceed the worker's 15s soft first-prompt timeout.
     // Wait for the real composer marker so the bare-shell guard does not treat
     // a still-loading zsh wrapper as a failed launch.

@@ -207,10 +207,9 @@ function planSurface(
   background: string,
   marker: string,
   items: string[],
-  emptyText: string,
 ): Record<string, unknown> {
   const visible = items.slice(0, 4);
-  const more = items.length > visible.length ? `\n<font color='grey'>另有 ${items.length - visible.length} 项，见下方子任务表</font>` : '';
+  const more = items.length > visible.length ? `\n<font color='grey'>另有 ${items.length - visible.length} 项</font>` : '';
   return {
     tag: 'interactive_container', behaviors: [], width: 'fill', height: 'auto', corner_radius: '8px',
     has_border: false, disabled: false, background_style: background, padding: '10px 12px 10px 12px',
@@ -218,7 +217,7 @@ function planSurface(
     horizontal_align: 'left', vertical_align: 'top', margin: '6px 0px 0px 0px',
     elements: [{
       tag: 'markdown',
-      content: `<font color='${color}'>**${label} · ${items.length}**</font>\n${visible.length > 0 ? visible.map(item => `${marker} ${item}`).join('\n') : `<font color='grey'>${emptyText}</font>`}${more}`,
+      content: `<font color='${color}'>**${label} · ${items.length}**</font>\n${visible.map(item => `${marker} ${item}`).join('\n')}${more}`,
       text_align: 'left', text_size: 'normal', margin: '0px 0px 0px 0px',
     }],
   };
@@ -243,13 +242,13 @@ function planElements(project: ProjectGroupState, brand: Brand): Array<Record<st
       text_align: 'left', text_size: 'normal', margin: '10px 0px 0px 0px',
     },
     ...(doing.length > 0
-      ? [planSurface('进行中', 'blue', 'blue-50', '<font color=\'blue\'>●</font>', doing, '当前没有进行中事项')]
+      ? [planSurface('进行中', 'blue', 'blue-50', '<font color=\'blue\'>●</font>', doing)]
       : []),
     ...(todo.length > 0
-      ? [planSurface('待办计划', 'purple', 'grey-50', '<font color=\'purple\'>○</font>', todo, '当前没有待办事项')]
+      ? [planSurface('待办计划', 'purple', 'grey-50', '<font color=\'purple\'>○</font>', todo)]
       : []),
     ...(done.length > 0
-      ? [planSurface('完成记录', 'green', 'green-50', '<font color=\'green\'>✓</font>', done, '尚无已完成事项')]
+      ? [planSurface('完成记录', 'green', 'green-50', '<font color=\'green\'>✓</font>', done)]
       : []),
   ];
 }

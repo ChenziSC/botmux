@@ -20,6 +20,7 @@ import { scanProjects, scanMultipleProjects, describeProjectDir } from '../servi
 import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeFor, removeRepoWorktree, withWorktreeTargetLock, worktreeRootFor, worktreeSafetyStatus } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { isRemoteBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
+import { isRemoteCliId } from './remote-cli-ids.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { handleProjectGroupRoles } from './dashboard-command/groups.js';
@@ -35,7 +36,7 @@ import { logger } from '../utils/logger.js';
 import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring, sendWorkerInput, type WorkerSessionReplyOptions } from './worker-pool.js';
+import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -178,7 +179,7 @@ export function formatSlashGroupName(name: string, prefix = ''): string {
  * worker:null session just to handle it, polluting the dashboard. (Same class
  * of fix as the `/card` / `/term` special cases in daemon.ts.)
  */
-export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/rename', '/fork', '/forklist', '/quote']);
+export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/stop', '/rename', '/fork', '/forklist', '/quote']);
 
 function cliSelectionSnapshot(cliId: CliId): SessionCliLaunchSnapshotV1 {
   const runtime = snapshotCliRuntime(resolveCliRuntime({
@@ -193,6 +194,7 @@ function cliSelectionSnapshot(cliId: CliId): SessionCliLaunchSnapshotV1 {
     cliRuntime: runtime ?? null,
     cliPathOverride: runtime?.source === 'configured' || runtime?.source === 'legacy-path' ? runtime.executable : null,
     wrapperCli: null,
+    cliLaunchMode: null,
     model: null,
     reasoningEffort: null,
     modelBackendVariant: null,
@@ -1076,10 +1078,11 @@ async function handleScheduleCommand(
     const { executionPosition: requestedPosition, silent, prompt: schedPrompt } = scheduler.extractScheduleModifiers(parsed.prompt);
     // Default to group top-level: a schedule created inside a topic (including
     // an adopted one) must not pin its results to that topic. NL 路径的
-    // extractScheduleModifiers 只有 top-level/new-topic 关键词，没有 topic
-    // 修饰符；topic 执行只能经 CLI --topic 或 Dashboard 表单显式指定。
+    // extractScheduleModifiers 只有 top-level/new-topic/task（独立话题/专属
+    // 话题）关键词，没有 topic 修饰符；topic 执行只能经 CLI --topic 或
+    // Dashboard 表单显式指定。
     const executionPosition = (requestedPosition ?? 'top-level') as ScheduleExecutionPosition;
-    const taskScope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
+    const taskScope: 'thread' | 'chat' = executionPosition === 'topic' || executionPosition === 'task' ? 'thread' : 'chat';
     const schedName = schedPrompt !== parsed.prompt
       ? (schedPrompt.length > 20 ? schedPrompt.slice(0, 20) + '...' : schedPrompt)
       : parsed.name;
@@ -1125,9 +1128,11 @@ async function handleScheduleCommand(
     const positionNote = '\n' + t(
       executionPosition === 'new-topic'
         ? 'schedule.deliver_new_topic'
-        : executionPosition === 'top-level'
-          ? 'schedule.position_top_level'
-          : 'schedule.position_topic',
+        : executionPosition === 'task'
+          ? 'schedulePos.positionNote'
+          : executionPosition === 'top-level'
+            ? 'schedule.position_top_level'
+            : 'schedule.position_topic',
       undefined,
       loc,
     );
@@ -2348,6 +2353,30 @@ export async function handleCommand(
         } else {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
         }
+        break;
+      }
+
+      case '/stop': {
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        if (isSessionTransferring(ds)) {
+          await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
+          break;
+        }
+        const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+        if (ds.initConfig?.codexRpcInput === true || effectiveCliId === 'codex-app' || isRemoteCliId(effectiveCliId) || isRemoteBackendSession(ds)) {
+          await sessionReply(rootId, t('cmd.stop.unsupported', undefined, loc));
+          break;
+        }
+        if (!ds.worker || ds.worker.killed) {
+          await sessionReply(rootId, t('cmd.stop.no_worker', undefined, loc));
+          break;
+        }
+        sendWorkerSessionInput(ds, { type: 'term_action', key: 'ctrlc' });
+        logger.info(`[${logTag}] /stop: ^C sent (session kept alive)`);
+        await sessionReply(rootId, t('cmd.stop.sent', { cliName: sessionCliDisplayName(ds) }, loc));
         break;
       }
 
@@ -5346,6 +5375,7 @@ export async function handleCommand(
           t('help.heading_session', undefined, loc),
           t('help.close', { cliName }, loc),
           t('help.cleanup_wt', undefined, loc),
+          t('help.stop', { cliName }, loc),
           t('help.restart', { cliName }, loc),
           t('help.topic', undefined, loc),
           t('help.cd', { cliName }, loc),
@@ -5615,6 +5645,7 @@ export async function startCodexAppThreadSession(
       delete current.session.cliRuntime;
       delete current.session.cliPathOverride;
       delete current.session.wrapperCli;
+      delete current.session.cliLaunchMode;
       delete current.session.model;
       delete current.session.reasoningEffort;
       delete current.session.agentFrozen;

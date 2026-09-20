@@ -1,5 +1,7 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { CodexUpdateDialogGuard } from '../src/utils/codex-update-dialog.js';
+import { CodexUpdateDialogGuard, codexUpdateDialogSafeKeys } from '../src/utils/codex-update-dialog.js';
 
 describe('CodexUpdateDialogGuard', () => {
   it('detects the numbered Update now / Skip picker through ANSI', () => {
@@ -8,6 +10,33 @@ describe('CodexUpdateDialogGuard', () => {
 
     expect(guard.inspect(menu)).toBe('dismiss');
     expect(guard.inspect(menu)).toBe('suppress');
+  });
+
+  it('detects the Codex 0.154 to 0.155 three-choice picker', () => {
+    const guard = new CodexUpdateDialogGuard();
+    const menu = [
+      '✨ Update available! 0.154.0 -> 0.155.1',
+      '1. Update now (runs `npm install -g @openai/codex`)',
+      '2. Skip',
+      '3. Skip until next version',
+      'Press enter to continue',
+    ].join('\n');
+
+    expect(guard.inspect(menu)).toBe('dismiss');
+    expect(codexUpdateDialogSafeKeys(menu.replace('1. Update now', '› 1. Update now')))
+      .toEqual(['Down', 'Enter']);
+  });
+
+  it.each([
+    ['› 1. Update now\n  2. Skip\n  3. Skip until next version', ['Down', 'Enter']],
+    ['  1. Update now\n› 2. Skip\n  3. Skip until next version', ['Enter']],
+    ['  1. Update now\n  2. Skip\n› 3. Skip until next version', ['Enter']],
+  ] as const)('keeps retries on a non-upgrade selection: %s', (screen, keys) => {
+    expect(codexUpdateDialogSafeKeys(screen)).toEqual(keys);
+  });
+
+  it('waits for a rendered selection cursor instead of guessing', () => {
+    expect(codexUpdateDialogSafeKeys('1. Update now\n2. Skip')).toBeUndefined();
   });
 
   it('detects the newer Remind me later wording across PTY chunks', () => {
@@ -30,5 +59,31 @@ describe('CodexUpdateDialogGuard', () => {
     expect(guard.inspect(menu)).toBe('dismiss');
     guard.reset();
     expect(guard.inspect(menu)).toBe('dismiss');
+  });
+});
+
+describe('Aiden Codex update dialog worker wiring', () => {
+  const workerSource = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+
+  it('checks the rendered screen while the first prompt is held', () => {
+    const start = workerSource.indexOf('function startScreenUpdates()');
+    const end = workerSource.indexOf('function stopScreenUpdates()', start);
+    const screenUpdates = workerSource.slice(start, end);
+
+    expect(screenUpdates).toContain('if (awaitingFirstPrompt)');
+    expect(screenUpdates).toContain('inspectAidenCodexUpdateDialogOnScreen();');
+    expect(workerSource).toContain('backend.capturePaneViewport()');
+  });
+
+  it('limits automatic retries and only warns from an authoritative screen check', () => {
+    const start = workerSource.indexOf('function dismissAidenCodexUpdateDialog(');
+    const end = workerSource.indexOf('function inspectAidenCodexUpdateDialogOnScreen()', start);
+    const dismiss = workerSource.slice(start, end);
+
+    expect(dismiss).toContain('codexUpdateDialogSafeKeys(data)');
+    expect(dismiss).toContain('AIDEN_CODEX_UPDATE_RETRY_MS');
+    expect(workerSource).toContain('const AIDEN_CODEX_UPDATE_MAX_ATTEMPTS = 3;');
+    expect(dismiss).toContain("source === 'screen'");
+    expect(dismiss).toContain("type: 'user_notify'");
   });
 });

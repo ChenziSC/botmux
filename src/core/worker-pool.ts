@@ -12035,9 +12035,12 @@ function setupWorkerHandlers(
   const managedFinalOutputSuppressed = (
     turnId?: string,
     dispatchAttempt?: number,
+    terminalDiagnostic = false,
   ): boolean => {
     if (isSilentScheduledTurn(ds, turnId)) return true;
-    if (isTriggerFinalSuppressed(ds, turnId)) return true;
+    // Loud triggers suppress model replies, not a redacted runtime failure.
+    // Scheduled silence and managed/attempt ownership remain authoritative.
+    if (!terminalDiagnostic && isTriggerFinalSuppressed(ds, turnId)) return true;
     // Only a genuinely meeting-driven turn is subject to the durable meeting-send
     // policy; a plain user turn on this session posts through the ordinary path
     // (see isMeetingDrivenTurn).
@@ -15099,10 +15102,18 @@ function setupWorkerHandlers(
         if (!msg.content || !msg.content.trim()) break;
         if (shouldDropMismatchedFinalOutput(ds, msg, t)) break;
         if (shouldDropMismatchedHermesFinalOutput(ds, msg, t)) break;
-        if (managedFinalOutputSuppressed(msg.turnId, msg.dispatchAttempt)) {
+        const triggerFailureNotice = msg.turnFailed === true
+          && isTriggerFinalSuppressed(ds, msg.turnId)
+          ? msg.turnFailureNotice?.trim()
+          : undefined;
+        if (managedFinalOutputSuppressed(msg.turnId, msg.dispatchAttempt, Boolean(triggerFailureNotice))
+          || (triggerFailureNotice && managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt))) {
           logger.debug(`[${t}] final_output captured/discarded for silent turn ${msg.turnId.substring(0, 8)}`);
           break;
         }
+        // Keep suppressed partial answers and machine receipts out of chat.
+        // Older workers lacking a separate diagnostic retain fail-closed silence.
+        const finalOutput = triggerFailureNotice ? { ...msg, content: triggerFailureNotice } : msg;
         if (!msg.sessionId) {
           logger.warn(`[${t}] final_output missing sessionId; accepting for compatibility (session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`);
         }
@@ -15129,7 +15140,7 @@ function setupWorkerHandlers(
         }
         deliverFinalOutput(
           ds,
-          msg,
+          finalOutput,
           t,
           0,
           undefined,

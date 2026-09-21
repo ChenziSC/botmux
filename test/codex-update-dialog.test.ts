@@ -1,3 +1,6 @@
+import { selectSessionBackend } from '../src/adapters/backend/session-backend-selector.js';
+import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
+import { isObserveBackend } from '../src/adapters/backend/types.js';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -72,7 +75,10 @@ describe('Aiden Codex update dialog worker wiring', () => {
 
     expect(screenUpdates).toContain('if (awaitingFirstPrompt)');
     expect(screenUpdates).toContain('inspectAidenCodexUpdateDialogOnScreen();');
-    expect(workerSource).toContain('backend.capturePaneViewport()');
+    const s = workerSource.indexOf('function inspectAidenCodexUpdateDialogOnScreen(');
+    const e = workerSource.indexOf('function handleVisibleStartupInteraction(', s);
+    const code = workerSource.slice(s, e).replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+    expect(code).toMatch(/\bcaptureBackendScreen\s*\(|\bcaptureViewport\s*(?:\?\.)?\s*\(|\bcaptureCurrentScreen\s*(?:\?\.)?\s*\(/);
   });
 
   it('limits automatic retries and only warns from an authoritative screen check', () => {
@@ -87,3 +93,18 @@ describe('Aiden Codex update dialog worker wiring', () => {
     expect(dismiss).toContain("type: 'user_notify'");
   });
 });
+
+it('uses an observer backend in the production tmux selector', () => {
+  const { backend } = selectSessionBackend({ sessionId: 'abcdef1234567890', backendType: 'tmux' });
+  expect(backend instanceof TmuxBackend).toBe(false);
+  expect(isObserveBackend(backend)).toBe(true);
+  expect('capturePaneViewport' in backend).toBe(false);
+});
+it.each([false, true, undefined])('does not count refused special keys (%s)', result => {
+  const start = workerSourceForDelivery.indexOf('  let delivered = false;', workerSourceForDelivery.indexOf('function dismissAidenCodexUpdateDialog('));
+  const end = workerSourceForDelivery.indexOf('  aidenCodexUpdateAttempts += 1;', start);
+  const code = workerSourceForDelivery.slice(start, end).replace('(backend as any)', 'backend');
+  const run = new Function('backend', 'keys', 'log', 'aidenCodexUpdateLastActionAt', code + 'return false;');
+  expect(run({ sendSpecialKeys: () => result }, ['Enter'], () => {}, 1)).toBe(result === false);
+});
+const workerSourceForDelivery = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');

@@ -1,3 +1,4 @@
+import { handoffCardClosed, applyHandoffCardEvent, type HandoffCardEvent } from './handoff-card-lifecycle.js';
 import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTriggerStreamingCard } from './trigger-streaming-card.js';
 /**
  * Worker pool — manages forking, killing, and lifecycle of worker processes.
@@ -1021,7 +1022,7 @@ export function isDisposableCommandScratch(ds: DaemonSession): boolean {
 // takes effect without a daemon restart. The `/card` command can override it
 // per-session via `ds.streamingCardForced` (manually summon a live card).
 function streamingCardDisabled(ds: DaemonSession, turnId?: string): boolean {
-  if (isDocNativeSession(ds)) return true;
+  if (isDocNativeSession(ds) || handoffCardClosed(ds, turnId)) return true;
   if (ds.streamingCardForced) return false;
   try {
     const cfg = getBot(ds.larkAppId).config;
@@ -3628,6 +3629,28 @@ function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefin
   scheduleCardPatch(ds, cardJson, turnId);
 }
 
+/** Business-stage projection; never dispatches input or moves a card. */
+export async function updateHandoffLiveCard(ds: DaemonSession, event: HandoffCardEvent): Promise<void> {
+  await applyHandoffCardEvent(ds, event, {
+    persist: () => sessionStore.updateSession(ds.session),
+    patch: () => {
+      bumpStreamCardStatusRevision(ds);
+      persistStreamCardState(ds);
+      reconcilePostedStartingCard(ds, event.turnId, -1);
+    },
+    remove: async (messageId) => {
+      if (!await deleteMessage(ds.larkAppId, messageId)) throw new Error('live_stage_recall_failed');
+      if (ds.frozenCards) {
+        for (const [nonce, card] of ds.frozenCards) {
+          if (card.messageId === messageId) ds.frozenCards.delete(nonce);
+        }
+        saveFrozenCards(ds.session.sessionId, ds.frozenCards);
+      }
+    },
+    clear: () => { clearUsageRefreshTimer(ds); persistStreamCardState(ds); },
+  });
+}
+
 /**
  * Post the current turn's starting card as soon as the daemon accepts the
  * inbound message. Terminal redraw is deliberately not part of this trigger:
@@ -3730,7 +3753,7 @@ async function postTurnStartingStatusCard(
     && ds.streamCardNonce === nonce
     && activeSessionsRegistry?.get(registryKeyAtPost) === ds;
   const stillOwnsPost = (): boolean =>
-    ownsPostIdentity() && remoteRetirementAdmissionPhase(ds) === null;
+    ownsPostIdentity() && remoteRetirementAdmissionPhase(ds) === null && !handoffCardClosed(ds, turnId);
   const restorePrePostIdentityForRetirement = (): boolean => {
     if (remoteRetirementAdmissionPhase(ds) === null || !ownsPostIdentity()) return false;
     ds.streamCardId = previousCardId;

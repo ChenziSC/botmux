@@ -28,6 +28,7 @@ export function commitTriggerStreamingCard(
   if (title === undefined) return false;
   discardTriggerStreamingCard(ds, turnId);
   if (ds.session.status !== 'active') return false;
+  ds.session.handoffLiveCard = { turnId, sequence: 0, title };
   start(ds, title, turnId);
   return true;
 }

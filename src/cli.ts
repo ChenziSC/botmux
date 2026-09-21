@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { assertSendTopicsAvailable } from './cli/topic-send-guard.js';
 /**
  * CLI entry point for botmux.
  *
@@ -9300,7 +9301,9 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Re-challenge immediately before observable provider effects so lengthy
   // local parsing/card preparation cannot carry an old capability across a
   // worker restart, turn rotation, or Codex ledger settlement.
+  let checkSendTopics: (() => Promise<void>) | undefined;
   const revalidateIsolatedOriginBeforeEffect = async (): Promise<ManagedOriginAttestation | undefined> => {
+    await checkSendTopics?.();
     if (!isolatedAttestationContext || !isolatedManagedOriginCtx) return undefined;
     const fresh = await attestManagedOrigin({
       context: isolatedAttestationContext,
@@ -9544,6 +9547,28 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   const appId = s.larkAppId!;
   const dataDir = resolveDataDir();
+  const { getMessageDetail: getTopicMessageDetail } = await import('./im/lark/client.js');
+  // Source routing deliberately ignores explicit destination overrides.
+  const sourceTopicTarget = frozenTurnReplyTarget ?? resolveSendTarget({
+    topLevel: false, chatScope: s.scope === 'chat', chatId: s.chatId,
+    rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId,
+    replyTargetTurnId: turnReplyTarget?.turnId,
+    replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId,
+  });
+  checkSendTopics = async () => {
+    const scheduledRoot = reusableDeferredTopicRoot({
+      session: s as SessionData & { larkAppId: string },
+      binding: readDeferredTopicBinding(dataDir, s.sessionId),
+      explicitTopLevel: false,
+    });
+    await assertSendTopicsAvailable(appId, [
+      scheduledRoot,
+      !s.deferredScheduleRun && sourceTopicTarget.mode === 'thread'
+        ? sourceTopicTarget.rootMessageId : undefined,
+      sendInto,
+    ], getTopicMessageDetail);
+  };
+  await checkSendTopics();
   // Resolve sender-scoped bot identities before the early voice return. Voice
   // used to skip the text path's XPI gate entirely, so an explicitly addressed
   // bot received an unclassified bot message that the receiver then dropped.

@@ -147,6 +147,7 @@ import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js'
 import type { CliTurnPayload, CrossPrincipalInterruption, CrossPrincipalInterruptionDeliveryAudit, CrossPrincipalInterruptionMessage, Session, TrustedCaller, VcMeetingImTurnOrigin, TurnParticipant, LarkMention } from './types.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
+import { runHostOperationalEffect } from './core/installation-maintenance.js';
 import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
@@ -4535,7 +4536,8 @@ function notifyAllowedUsersResolveFailure(
   // WS listener starts) would stall the bot coming online during the very
   // contact/network partition that triggered this notice. Bound each attempt
   // with a deadline and detach.
-  void (async () => {
+  runHostOperationalEffect(() => {
+    void (async () => {
     for (const openId of unique.slice(0, 5)) {
       try {
         await sendUserMessage(
@@ -4552,7 +4554,8 @@ function notifyAllowedUsersResolveFailure(
         );
       }
     }
-  })();
+    })();
+  });
 }
 
 function scheduleAllowedUsersResolveRetry(larkAppId: string, attempt = 1): void {
@@ -27131,6 +27134,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // global botmux install and a detached `botmux restart` would tear down the
   // real fleet. Core-only manages only its own single process.
   if (idx === 0 && !coreOnly) {
+    runHostOperationalEffect(() => {
     startMaintenance();
     startCliRuntimeUpdateMonitor({
       dataDir: config.session.dataDir,
@@ -27154,6 +27158,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         log: (m) => logger.info(`[restart-report] ${m}`),
       });
     }, 5_000).unref?.();
+    });
   }
 
   // Host-overload watcher. Machine-level: enabled via the GLOBAL config
@@ -27168,6 +27173,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // host-overload-alert.ts) keep a load near the line from spamming. Set
   // BOTMUX_OVERLOAD_ALERT=0 to force the whole feature off regardless of config.
   if (process.env.BOTMUX_OVERLOAD_ALERT !== '0') {
+    runHostOperationalEffect(() => {
     let overloadState: OverloadState = INITIAL_OVERLOAD_STATE;
     const overloadTimer = setInterval(() => {
       void (async () => {
@@ -27243,6 +27249,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       })();
     }, 30_000);
     overloadTimer.unref?.();
+    });
   }
 
   // Graceful shutdown. Remote owners first run a three-phase non-cancelling

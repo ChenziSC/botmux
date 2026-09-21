@@ -1,0 +1,31 @@
+#!/usr/bin/env node
+import { spawn } from 'node:child_process';
+
+const realBin = process.env.BOTMUX_AIDEN_CODEX_REAL_BIN;
+const effort = process.env.BOTMUX_AIDEN_CODEX_REASONING_EFFORT;
+
+if (!realBin || !['low', 'medium', 'high', 'xhigh'].includes(effort ?? '')) {
+  process.stderr.write('botmux aiden-codex shim: missing launch configuration\n');
+  process.exit(1);
+}
+
+const env = { ...process.env };
+delete env.BOTMUX_AIDEN_CODEX_REAL_BIN;
+delete env.BOTMUX_AIDEN_CODEX_REASONING_EFFORT;
+
+const child = spawn(realBin, [
+  '-c', `model_reasoning_effort=${JSON.stringify(effort)}`,
+  ...process.argv.slice(2),
+], { stdio: 'inherit', env });
+
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(signal, () => child.kill(signal));
+}
+child.on('error', (error) => {
+  process.stderr.write(`botmux aiden-codex shim: ${error.message}\n`);
+  process.exit(1);
+});
+child.on('exit', (code, signal) => {
+  if (signal) process.kill(process.pid, signal);
+  else process.exit(code ?? 1);
+});

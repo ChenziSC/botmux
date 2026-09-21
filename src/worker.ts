@@ -9827,6 +9827,12 @@ async function driveCocoPicker(navKeys: string[], needsReviewSubmit: boolean, co
 const TRUST_DIALOG_PATTERN = /Yes, I trust this folder|Yes, continue/;
 let trustHandled = false;
 const codexUpdateDialogGuard = new CodexUpdateDialogGuard();
+const AIDEN_CODEX_UPDATE_RETRY_MS = 1_000;
+const AIDEN_CODEX_UPDATE_MAX_ATTEMPTS = 3;
+let aidenCodexUpdateLastActionAt = 0;
+let aidenCodexUpdateAttempts = 0;
+let aidenCodexUpdateLimitNotified = false;
+let aidenCodexUpdateRecovering = false;
 // Auto-confirm Claude Code's mid-session "Change effort level?" Yes/No dialog.
 // Armed only by botmux's own `/effort <level>` passthrough (see deliverRawInput)
 // and disarmed on match, timeout, or CLI respawn — never inspects idle screens.
@@ -9863,7 +9869,7 @@ function armEffortConfirm(): void {
  * cjadk and ttadk launches never need this path because they accept the
  * config override. Adopted panes are user-owned and must not be driven.
  */
-function dismissAidenCodexUpdateDialog(data: string): boolean {
+function dismissAidenCodexUpdateDialog(data: string, source: 'stream' | 'screen' = 'stream'): boolean {
   if (
     lastInitConfig?.cliId !== 'codex'
     || lastInitConfig.adoptMode
@@ -9880,24 +9886,61 @@ function dismissAidenCodexUpdateDialog(data: string): boolean {
   // Cancel any ready match from an earlier partial menu redraw before it can
   // flush the first queued Lark message into the picker.
   idleDetector?.reset();
-  if (action === 'suppress') return true;
-
-  log('Codex startup update dialog detected behind Aiden, confirming the non-upgrade selection...');
+  if (aidenCodexUpdateRecovering) return true;
+  if (aidenCodexUpdateAttempts >= AIDEN_CODEX_UPDATE_MAX_ATTEMPTS) {
+    if (source === 'screen' && !aidenCodexUpdateLimitNotified) {
+      aidenCodexUpdateLimitNotified = true;
+      log(`Codex startup update dialog remained after ${aidenCodexUpdateAttempts} Aiden auto-dismiss attempts`);
+      send({
+        type: 'user_notify',
+        message: `Codex 升级菜单自动跳过 ${aidenCodexUpdateAttempts} 次后仍未继续。已停止自动操作，请打开网页终端选择「2. Skip」。`,
+        turnId: currentBotmuxTurnId,
+      });
+    }
+    return true;
+  }
+  if (Date.now() - aidenCodexUpdateLastActionAt < AIDEN_CODEX_UPDATE_RETRY_MS) return true;
   const target = backend;
   const generation = cliSpawnGeneration;
   if (!target) return true;
-  // A PTY redraw can precede the CLI's input handler. Defer, then confirm each
-  // selected row from a fresh viewport before submitting; do not batch Down+Enter.
+  aidenCodexUpdateRecovering = true;
+  aidenCodexUpdateAttempts += 1;
+  aidenCodexUpdateLastActionAt = Date.now();
+  // Retain fresh-viewport confirmation: never batch navigation and Enter.
   void dismissCodexUpdatePicker({
     isCurrent: () => backend === target && cliSpawnGeneration === generation && awaitingFirstPrompt,
-    capture: () => captureBackendScreen(target),
+    capture: () => target instanceof TmuxBackend ? target.capturePaneViewport() : captureBackendScreen(target),
     send: key => {
       if ('sendSpecialKeys' in target) return (target as any).sendSpecialKeys(key);
-      target.write(key === 'Down' ? '\x1b[B' : '\r');
+      return target.write(key === 'Down' ? '\x1b[B' : '\r');
     },
   }).then(result => log(`Codex startup update dialog recovery: ${result}`))
-    .catch(error => log(`Codex startup update dialog recovery failed: ${error instanceof Error ? error.message : String(error)}`));
+    .catch(error => log(`Codex startup update dialog recovery failed: ${error instanceof Error ? error.message : String(error)}`))
+    .finally(() => {
+      if (backend === target && cliSpawnGeneration === generation) aidenCodexUpdateRecovering = false;
+    });
   return true;
+}
+
+/** Aiden can finish drawing the picker before the PTY listener is attached.
+ * Re-check the rendered viewport while startup is held so a menu that only
+ * exists in the authoritative screen cannot strand the queued first turn. */
+function inspectAidenCodexUpdateDialogOnScreen(): boolean {
+  if (
+    lastInitConfig?.cliId !== 'codex'
+    || lastInitConfig.adoptMode
+    || !lastInitConfig.wrapperCli
+    || parseWrapperCli(lastInitConfig.wrapperCli)[0] !== 'aiden'
+    || !awaitingFirstPrompt
+  ) return false;
+
+  let screen = '';
+  try {
+    screen = backend instanceof TmuxBackend
+      ? backend.capturePaneViewport()
+      : (renderer?.rawSnapshot({ preserveFormatting: true }) ?? '');
+  } catch { return false; }
+  return screen.length > 0 && dismissAidenCodexUpdateDialog(screen, 'screen');
 }
 
 /**
@@ -13031,6 +13074,7 @@ function startScreenUpdates(): void {
   let lastSnapshotPtyActivity = -1;
   screenUpdateTimer = setInterval(() => {
     if (awaitingFirstPrompt) {
+      inspectAidenCodexUpdateDialogOnScreen();
       // First-turn 「工作中」 publisher. The async sampler below is fully gated
       // until the first turn ends (markPromptReady flips awaitingFirstPrompt) or
       // the 15s soft timeout, so an argv-baked first prompt (Pi/Grok/…, delivered
@@ -17867,6 +17911,10 @@ function killCli(opts: {
   altBufferActive = false;
   trustHandled = false;
   codexUpdateDialogGuard.reset();
+  aidenCodexUpdateLastActionAt = 0;
+  aidenCodexUpdateAttempts = 0;
+  aidenCodexUpdateLimitNotified = false;
+  aidenCodexUpdateRecovering = false;
   disarmEffortConfirm();
   appRunnerControlDecoder.reset();
 }

@@ -462,6 +462,23 @@ export class TmuxBackend implements SessionBackend {
     });
   }
 
+  /** Capture the authoritative visible pane for startup-dialog recovery.
+   * Unlike the attach PTY stream, this also sees output painted before the
+   * worker registered its onData callback. */
+  capturePaneViewport(): string {
+    try {
+      return execFileSync('tmux', ['capture-pane', '-p', '-e', '-J', '-t', this.cmdTarget], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 2000,
+        maxBuffer: 4 * 1024 * 1024,
+        env: tmuxEnv(),
+      });
+    } catch {
+      return '';
+    }
+  }
+
   /**
    * Enter copy-mode on the pane (`-e` makes it auto-exit when scrolled back to
    * the bottom). Lets us use tmux's own scrollback even when the running app

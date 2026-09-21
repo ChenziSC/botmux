@@ -9896,8 +9896,7 @@ function dismissAidenCodexUpdateDialog(data: string, source: 'stream' | 'screen'
   let delivered = false;
   try {
     if (backend && 'sendSpecialKeys' in backend) {
-      (backend as any).sendSpecialKeys(...keys);
-      delivered = true;
+      delivered = (backend as any).sendSpecialKeys(...keys) !== false;
     } else {
       const input = keys.map(key => key === 'Down' ? '\x1b[B' : key === 'Up' ? '\x1b[A' : '\r').join('');
       delivered = backend?.write(input) === true;
@@ -9928,8 +9927,8 @@ function inspectAidenCodexUpdateDialogOnScreen(): boolean {
 
   let screen = '';
   try {
-    screen = backend instanceof TmuxBackend
-      ? backend.capturePaneViewport()
+    screen = backend
+      ? captureBackendScreen(backend)
       : (renderer?.rawSnapshot({ preserveFormatting: true }) ?? '');
   } catch { return false; }
   return screen.length > 0 && dismissAidenCodexUpdateDialog(screen, 'screen');

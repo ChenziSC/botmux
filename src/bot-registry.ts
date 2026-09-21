@@ -2094,7 +2094,8 @@ export interface BotConfig {
    * 进群自动拉 owner。Default (undefined) = ON：本 bot 被加进任何群时，自动把
    * 自己的 owner（resolvedAllowedUsers 首个 ou_ 用户）拉进群——bot 应始终处于
    *  owner 可见的群里（不打黑工）。显式 false 关闭（如告警/oncall 类 bot 被
-   * 平台批量拉进大量事件群、不想打扰 owner 的场景）。仅 bots.json 文件配置。
+   * 平台批量拉进大量事件群、不想打扰 owner 的场景）。可在 Dashboard Bot
+   * Defaults 或飞书 /botconfig 配置；仅作用于被动入群，团队建群/federation 不读此开关。
    */
   autoInviteOwnerOnGroupAdd?: boolean;
   /**

@@ -177,6 +177,8 @@ export type BotDefaultsRow = {
   launchShell?: string;
   env?: string;
   riff?: Record<string, unknown> | null;
+  /** 被动入群时自动把 owner 拉进群。缺省 ON —— 只有显式 false 表示关闭。 */
+  autoInviteOwnerOnGroupAdd?: boolean;
   autoStartOnGroupJoin?: boolean;
   autoStartOnGroupJoinPrompt?: string;
   autoStartOnGroupJoinSeed?: string;

@@ -1,3 +1,6 @@
+import { selectSessionBackend } from '../src/adapters/backend/session-backend-selector.js';
+import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
+import { isObserveBackend } from '../src/adapters/backend/types.js';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -143,7 +146,10 @@ describe('Aiden Codex update dialog worker wiring', () => {
 
     expect(screenUpdates).toContain('if (awaitingFirstPrompt)');
     expect(screenUpdates).toContain('inspectAidenCodexUpdateDialogOnScreen();');
-    expect(workerSource).toContain('backend.capturePaneViewport()');
+    const s = workerSource.indexOf('function inspectAidenCodexUpdateDialogOnScreen(');
+    const e = workerSource.indexOf('function handleVisibleStartupInteraction(', s);
+    const code = workerSource.slice(s, e).replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+    expect(code).toMatch(/\bcaptureBackendScreen\s*\(|\bcaptureViewport\s*(?:\?\.)?\s*\(|\bcaptureCurrentScreen\s*(?:\?\.)?\s*\(/);
   });
 
   it('limits automatic retries and only warns from an authoritative screen check', () => {
@@ -158,4 +164,19 @@ describe('Aiden Codex update dialog worker wiring', () => {
     expect(dismiss).toContain("source === 'screen'");
     expect(dismiss).toContain("type: 'user_notify'");
   });
+});
+
+it('uses an observer backend in the production tmux selector', () => {
+  const { backend } = selectSessionBackend({ sessionId: 'abcdef1234567890', backendType: 'tmux' });
+  expect(backend instanceof TmuxBackend).toBe(false);
+  expect(isObserveBackend(backend)).toBe(true);
+  expect('capturePaneViewport' in backend).toBe(false);
+});
+it.each([false, true, undefined])('counts only a recovery with accepted input (%s)', result => {
+  const worker = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+  const start = worker.indexOf("      const accepted = 'sendSpecialKeys' in target", worker.indexOf('function dismissAidenCodexUpdateDialog('));
+  const end = worker.indexOf('      return accepted;', start);
+  const code = worker.slice(start, end).replace('(target as any)', 'target');
+  const run = new Function('target', 'key', 'let delivered = false; let aidenCodexUpdateAttempts = 0; ' + code + 'return aidenCodexUpdateAttempts;');
+  expect(run({ sendSpecialKeys: () => result }, 'Enter')).toBe(result === false ? 0 : 1);
 });

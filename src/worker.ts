@@ -9904,15 +9904,21 @@ function dismissAidenCodexUpdateDialog(data: string, source: 'stream' | 'screen'
   const generation = cliSpawnGeneration;
   if (!target) return true;
   aidenCodexUpdateRecovering = true;
-  aidenCodexUpdateAttempts += 1;
+  let delivered = false;
   aidenCodexUpdateLastActionAt = Date.now();
   // Retain fresh-viewport confirmation: never batch navigation and Enter.
   void dismissCodexUpdatePicker({
     isCurrent: () => backend === target && cliSpawnGeneration === generation && awaitingFirstPrompt,
-    capture: () => target instanceof TmuxBackend ? target.capturePaneViewport() : captureBackendScreen(target),
+    capture: () => captureBackendScreen(target),
     send: key => {
-      if ('sendSpecialKeys' in target) return (target as any).sendSpecialKeys(key);
-      return target.write(key === 'Down' ? '\x1b[B' : '\r');
+      const accepted = 'sendSpecialKeys' in target
+        ? (target as any).sendSpecialKeys(key) !== false
+        : target.write(key === 'Down' ? '\x1b[B' : '\r') === true;
+      if (accepted && !delivered) {
+        delivered = true;
+        aidenCodexUpdateAttempts += 1;
+      }
+      return accepted;
     },
   }).then(result => log(`Codex startup update dialog recovery: ${result}`))
     .catch(error => log(`Codex startup update dialog recovery failed: ${error instanceof Error ? error.message : String(error)}`))
@@ -9936,8 +9942,8 @@ function inspectAidenCodexUpdateDialogOnScreen(): boolean {
 
   let screen = '';
   try {
-    screen = backend instanceof TmuxBackend
-      ? backend.capturePaneViewport()
+    screen = backend
+      ? captureBackendScreen(backend)
       : (renderer?.rawSnapshot({ preserveFormatting: true }) ?? '');
   } catch { return false; }
   return screen.length > 0 && dismissAidenCodexUpdateDialog(screen, 'screen');

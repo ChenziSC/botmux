@@ -561,6 +561,8 @@ scrubClaudeSessionMarkerEnv(process.env);
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
+const AIDEN_CODEX_SHIM_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'aiden-codex-shim');
+
 let cliAdapter: CliAdapter | null = null;
 let backend: SessionBackend | null = null;
 let backendScreenRevision = 0;
@@ -16505,10 +16507,15 @@ async function spawnCli(
       });
       const launch = buildWrappedLaunch(cfg.wrapperCli, spawnArgs, (b) => locateOnEffectiveChildPath(b, effectiveChildEnv) ?? b, {
         ttadkModel: cfg.model,
+        childPath: effectiveChildEnv.PATH,
+        aidenCodexRealBin: cliAdapter.resolvedBin,
+        aidenCodexShimDir: AIDEN_CODEX_SHIM_DIR,
+        pathDelimiter: delimiter,
       });
       if (launch.bin) {
         spawnBin = launch.bin;
         spawnArgs = launch.args;
+        if (launch.env) Object.assign(childEnv as Record<string, string>, launch.env);
         log(`Launch prefix: spawning ${spawnBin} ${spawnArgs.slice(0, 2).join(' ')} … (cliId=${cfg.cliId})`);
         // ttadk runs its launched agent through a gateway that pops an interactive
         // model-picker unless `-m <model>` is given. buildWrappedLaunch injects

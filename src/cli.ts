@@ -9564,6 +9564,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId,
   });
   checkSendTopics = async () => {
+    if (getBot(appId).config.topicUnavailablePolicy !== 'stop') return;
     const scheduledRoot = reusableDeferredTopicRoot({
       session: s as SessionData & { larkAppId: string },
       binding: readDeferredTopicBinding(dataDir, s.sessionId),
@@ -9574,7 +9575,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       !s.deferredScheduleRun && sourceTopicTarget.mode === 'thread'
         ? sourceTopicTarget.rootMessageId : undefined,
       sendInto,
-    ], getTopicMessageDetail);
+    ], getTopicMessageDetail, 'stop');
   };
   await checkSendTopics();
   // Resolve sender-scoped bot identities before the early voice return. Voice
@@ -10414,6 +10415,9 @@ async function cmdSend(rest: string[]): Promise<void> {
           ? undefined
           : fenceIsolatedOriginBeforeEffect,
         beforeQuoteFallback: async () => {
+          if (getBot(appId).config.topicUnavailablePolicy === 'stop') {
+            throw new Error('TOPIC_SEND_BLOCKED: 引用目标已撤回，按机器人配置停止发送，不改发其他位置。');
+          }
           revalidateVcMeetingManagedSend();
           await revalidateIsolatedOriginBeforeEffect();
         },

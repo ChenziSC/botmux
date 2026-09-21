@@ -2,9 +2,14 @@ import { readFileSync } from 'node:fs';
 import { describe, it, expect, vi } from 'vitest';
 import { assertSendTopicsAvailable } from '../src/cli/topic-send-guard.js';
 describe('topic send guard', () => {
+  it.each([undefined, 'legacy'] as const)('preserves legacy behavior without extra queries for %s', async policy => {
+    const get = vi.fn(async () => { throw new Error('network'); });
+    await assertSendTopicsAvailable('app', ['root'], get, policy);
+    expect(get).not.toHaveBeenCalled();
+  });
   it('allows a live topic and deduplicates source/target', async () => {
     const get = vi.fn(async () => ({items: [{message_id: 'root', deleted: false}]}));
-    await assertSendTopicsAvailable('app', ['root', 'root'], get);
+    await assertSendTopicsAvailable('app', ['root', 'root'], get, 'stop');
     expect(get).toHaveBeenCalledTimes(1);
   });
   it.each([
@@ -15,7 +20,7 @@ describe('topic send guard', () => {
   ])('blocks unavailable roots before any send', async detail => {
     const send = vi.fn();
     await expect((async () => {
-      await assertSendTopicsAvailable('app', ['root'], async () => detail);
+      await assertSendTopicsAvailable('app', ['root'], async () => detail, 'stop');
       send();
     })()).rejects.toThrow(detail.items[0]?.deleted === true ? 'TOPIC_SEND_BLOCKED' : 'TOPIC_SEND_CHECK_FAILED');
     expect(send).not.toHaveBeenCalled();
@@ -23,7 +28,7 @@ describe('topic send guard', () => {
   it('fails closed on API errors', async () => {
     await expect(assertSendTopicsAvailable('app', ['root'], async () => {
       throw new Error('Bot not registered: app');
-    })).rejects.toMatchObject({
+    }, 'stop')).rejects.toMatchObject({
       message: expect.stringContaining('TOPIC_SEND_CHECK_FAILED'),
       cause: expect.objectContaining({ message: 'Bot not registered: app' }),
     });
@@ -40,7 +45,7 @@ describe('topic send guard', () => {
   });
   it('leaves unthreaded broadcasts alone', async () => {
     const get = vi.fn();
-    await assertSendTopicsAvailable('app', [undefined, null], get);
+    await assertSendTopicsAvailable('app', [undefined, null], get, 'stop');
     expect(get).not.toHaveBeenCalled();
   });
 });

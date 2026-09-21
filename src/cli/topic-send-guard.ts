@@ -1,9 +1,11 @@
-/** A deleted source topic cannot be escaped with --top-level or --chat-id. */
+/** Opt-in protection: legacy skips lookup; stop forbids escaping an unavailable source topic. */
 export async function assertSendTopicsAvailable(
   appId: string,
   roots: readonly (string | undefined | null)[],
   getMessage: (appId: string, messageId: string) => Promise<{ items?: { message_id?: string; deleted?: boolean }[] }>,
+  policy: 'legacy' | 'stop' = 'legacy',
 ): Promise<void> {
+  if (policy !== 'stop') return;
   for (const root of new Set(roots.filter((id): id is string => !!id))) {
     let detail;
     try {

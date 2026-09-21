@@ -9547,6 +9547,14 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   const appId = s.larkAppId!;
   const dataDir = resolveDataDir();
+  // Register bots so the downstream Lark client works. registerBot is
+  // idempotent, so all send paths reuse these same clients.
+  // envPinnedRiffBot is re-registered LAST so a remote env credential is never
+  // clobbered by a stale bots.json entry for the same app.
+  const { registerBot, loadBotConfigs, findOncallChatForAnyBot, getBot } = await import('./bot-registry.js');
+  try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
+  if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
+
   const { getMessageDetail: getTopicMessageDetail } = await import('./im/lark/client.js');
   // Source routing deliberately ignores explicit destination overrides.
   const sourceTopicTarget = frozenTurnReplyTarget ?? resolveSendTarget({
@@ -9884,14 +9892,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   });
   if (!mentionGate.ok) { console.error(mentionGate.error); process.exit(2); }
 
-  // Register bots so the downstream Lark client works. registerBot is
-  // idempotent, so all send paths reuse these same clients.
-  // envPinnedRiffBot is re-registered LAST so a remote env credential is never
-  // clobbered by a stale bots.json entry for the same app.
-  const { registerBot, loadBotConfigs, findOncallChatForAnyBot, getBot } = await import('./bot-registry.js');
   const { resolveRegularGroupMode } = await import('./services/chat-reply-mode-store.js');
-  try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
-  if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
 
   // ── --mention resolution + group-membership gate ──────────────────────────
   // Turn each raw --mention identifier into a { open_id, name } entry.

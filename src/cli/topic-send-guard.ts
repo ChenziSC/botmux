@@ -8,12 +8,15 @@ export async function assertSendTopicsAvailable(
     let detail;
     try {
       detail = await getMessage(appId, root);
-    } catch {
-      throw new Error(`TOPIC_SEND_BLOCKED: 无法确认原话题 ${root} 仍存在，停止发送。不要改发顶层、跨群或新建话题。`);
+    } catch (cause) {
+      throw new Error(`TOPIC_SEND_CHECK_FAILED: 查询原话题 ${root} 失败，暂停发送。这不代表话题已失效；可重试原话题查询，不要改发顶层、跨群或新建话题。`, { cause });
     }
     const message = detail?.items?.find(item => item.message_id === root);
+    if (message?.deleted === true) {
+      throw new Error(`TOPIC_SEND_BLOCKED: 原话题 ${root} 已撤回，停止发送。不要重试或改发顶层、跨群、新话题。`);
+    }
     if (!message || message.deleted !== false) {
-      throw new Error(`TOPIC_SEND_BLOCKED: 原话题 ${root} 已撤回、不存在或状态不可确认，停止发送。不要重试或改发顶层、跨群、新话题。`);
+      throw new Error(`TOPIC_SEND_CHECK_FAILED: 原话题 ${root} 的状态无法确认，暂停发送。这不代表话题已失效；可重试原话题查询，不要改发顶层、跨群或新建话题。`);
     }
   }
 }

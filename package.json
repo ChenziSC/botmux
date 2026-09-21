@@ -6,6 +6,7 @@
   "files": [
     "scripts/postinstall-bin.mjs",
     "scripts/install-path-entry.mjs",
+    "scripts/aiden-codex-shim/codex",
     "README.md",
     "README.en.md",
     "LICENSE"

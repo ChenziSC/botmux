@@ -273,6 +273,7 @@ import {
   dshRuntimeForSession,
   recordTurnExplicitMention,
   pruneSteerFanoutState,
+  ensureAutomaticTaskContinuationLease,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler } from './core/dashboard-ipc-server.js';
@@ -6633,6 +6634,7 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
           if (!hasAllowlist) return true;
           return getDashboardAdminOpenIds(larkAppId).includes(ownerOpenId);
         },
+        isScheduledTurnLive: turnId => ds?.scheduledTurnCallers?.has(turnId) === true,
       });
       if (!decision.ok) {
         return jsonRes(res, decision.status, {
@@ -17647,6 +17649,7 @@ function setActiveInteractiveTurn(
     ...(userPrompt?.trim() ? { userPrompt } : {}),
     ...(controller ? { controller } : {}),
   };
+  ensureAutomaticTaskContinuationLease(ds);
 }
 
 type XpiSharedCwdTurnAdmission =

@@ -1054,6 +1054,8 @@ async function handleManagedOriginAttestation(
         channelId: origin.originChannelId,
         sessionId,
         turnId: liveTurnId,
+        ...(origin.callerOpenId ? { callerOpenId: origin.callerOpenId } : {}),
+        larkAppId: ds.larkAppId,
         ...(origin.dispatchAttempt !== undefined
           ? { dispatchAttempt: origin.dispatchAttempt }
           : {}),
@@ -1093,7 +1095,7 @@ ipcRoute('POST', MANAGED_ORIGIN_ATTEST_ROUTE, async (req, res) => {
 });
 
 ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
-  let body: { sessionId?: unknown };
+  let body: { sessionId?: unknown; expectedScheduledTurnId?: unknown };
   try {
     body = await readBoundedJsonBody(req, 1_024, 1_000);
   } catch (err) {
@@ -1109,6 +1111,10 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
   const sessionId = typeof body.sessionId === 'string' && body.sessionId.length <= 256
     ? body.sessionId
     : '';
+  const expectedScheduledTurnId = typeof body.expectedScheduledTurnId === 'string'
+    && body.expectedScheduledTurnId.length <= 256
+    ? body.expectedScheduledTurnId
+    : undefined;
   const peer = resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress,
     remotePort: req.socket.remotePort,
@@ -1125,6 +1131,7 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
     sessionId,
     peer: peer.peer,
     findSession: findActiveBySessionId,
+    ...(expectedScheduledTurnId ? { expectedScheduledTurnId } : {}),
   });
   return result.ok
     ? jsonRes(res, 200, result.document)
@@ -1630,18 +1637,6 @@ ipcRoute('POST', '/api/sessions/:sessionId/native-subagent-runtime', async (req,
     };
   }
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-  const readonlyOrigin = ds.readonlyContinuationTurnOrigin;
-  if (readonlyOrigin
-    && readonlyOrigin.workerGeneration === ds.workerGeneration
-    && ds.managedTurnOrigin?.turnId === readonlyOrigin.turnId
-    && ds.managedTurnOrigin.dispatchAttempt === readonlyOrigin.dispatchAttempt) {
-    return nativeSubagentRuntimeJsonRes({
-      req, res, sessionId: params.sessionId, status: 200,
-      body: { ok: true, deny: true, reason: 'read-only continuation forbids subagents' },
-      ...responseAuth,
-    });
-  }
-
   let runtimeState;
   try { runtimeState = getBot(ds.larkAppId).nativeSubagentRuntimeState; }
   catch { return jsonRes(res, 404, { ok: false, error: 'bot_not_found' }); }
@@ -2484,13 +2479,13 @@ ipcRoute('POST', '/api/project-groups/:chatId/refresh-card', async (_req, res, p
   }
 });
 
-/** Explicit control plane for one read-only long-running task lease. The
+/** Explicit control plane for one authorization-inheriting long-running task lease. The
  * rotating current-turn capability binds every action to the calling session
  * and turn; the daemon owns all persisted state and timers. */
 ipcRoute('POST', '/api/sessions/:sessionId/continuation', async (req, res, params) => {
   type ContinuationRequestBody = {
     action?: unknown;
-    readonly?: unknown;
+    readonly?: unknown; // accepted as a deprecated compatibility hint
     ttlMs?: unknown;
     maxContinuations?: unknown;
   } & Record<string, unknown>;
@@ -2505,14 +2500,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/continuation', async (req, res, param
     return jsonRes(res, 409, { ok: false, error: 'active_turn_required' });
   }
   if (!ensureReadonlyTaskContinuationAttached(ds)) {
-    return jsonRes(res, 409, { ok: false, error: 'readonly_continuation_unavailable' });
+    return jsonRes(res, 409, { ok: false, error: 'continuation_unavailable' });
   }
   try {
     let state;
     if (body.action === 'start') {
-      if (body.readonly !== true) {
-        return jsonRes(res, 400, { ok: false, error: 'readonly_required' });
-      }
       if (!turnId.startsWith('om_') || ds.managedTurnOrigin?.dispatchAttempt !== undefined) {
         return jsonRes(res, 409, { ok: false, error: 'ordinary_user_turn_required' });
       }
@@ -2527,17 +2519,29 @@ ipcRoute('POST', '/api/sessions/:sessionId/continuation', async (req, res, param
         return jsonRes(res, 400, { ok: false, error: 'invalid_max_continuations' });
       }
       const generation = ds.workerGeneration;
-      const proof = ds.readonlyContinuationRpcProof;
+      const proof = ds.taskContinuationRpcProof;
+      const inheritedAuthority = ds.activeInteractiveTurn;
+      if (!inheritedAuthority || inheritedAuthority.turnId !== turnId
+        || inheritedAuthority.caller.requestLarkAppId !== ds.larkAppId
+        || inheritedAuthority.caller.senderType !== 'user') {
+        return jsonRes(res, 409, { ok: false, error: 'continuation_authority_required' });
+      }
       if (!ds.worker || ds.worker.killed || ds.worker.connected === false
         || ds.workerReady !== true
         || !Number.isSafeInteger(generation) || (generation ?? 0) <= 0
         || ds.session.workerGeneration !== generation
         || proof?.workerGeneration !== generation) {
-        return jsonRes(res, 409, { ok: false, error: 'readonly_rpc_proof_required' });
+        return jsonRes(res, 409, { ok: false, error: 'continuation_rpc_required' });
       }
       state = startReadonlyTaskContinuation(ds.session, {
         turnId,
         workerGeneration: generation!,
+        authorizationMode: 'inherited',
+        startMode: 'explicit',
+        trustedCaller: inheritedAuthority.caller,
+        ...(inheritedAuthority.controller
+          ? { trustedController: inheritedAuthority.controller }
+          : {}),
         ...(typeof body.ttlMs === 'number' ? { ttlMs: body.ttlMs } : {}),
         ...(typeof body.maxContinuations === 'number'
           ? { maxContinuations: body.maxContinuations }
@@ -4231,7 +4235,7 @@ export interface ScheduleRow {
   createdAt: string;
   lastRunAt?: string;
   nextRunAt?: string;
-  lastStatus?: 'ok' | 'error' | 'skipped';
+  lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
   lastError?: string;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
@@ -4705,6 +4709,19 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
   // a clear lastError, which is the pre-existing behavior for CLI-created
   // tasks. Adding a flaky gate here would block valid creates.
   try {
+    const ownerOpenId = getOwnerOpenId(cachedLarkAppId);
+    let ownerUnionId: string | undefined;
+    if (ownerOpenId) {
+      const deploymentOwnerUnionId = getDeploymentIdentity(config.session.dataDir).ownerUnionId;
+      const bot = getBot(cachedLarkAppId);
+      // The deployment identity is tenant-stable, but it is authoritative for
+      // this app only after the live allowlist resolution maps that exact
+      // union_id back to the same open_id selected as owner.
+      if (deploymentOwnerUnionId
+        && bot.rawAllowedUserResolution.get(deploymentOwnerUnionId) === ownerOpenId) {
+        ownerUnionId = deploymentOwnerUnionId;
+      }
+    }
     const task = createTaskWithOptionalPrecondition({
       name,
       schedule,
@@ -4724,7 +4741,8 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       // Stamp the bot owner as creator: dashboard is local + token-protected,
       // and the daemon re-checks the owner is still allowed at every run
       // mutation (scheduled-turn-provenance).
-      ownerOpenId: getOwnerOpenId(cachedLarkAppId),
+      ownerOpenId,
+      ownerUnionId,
       deliver,
       silent,
       followActive: followActive || undefined,

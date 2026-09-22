@@ -6,6 +6,14 @@ import { join, resolve } from 'node:path';
 import { expect, it } from 'vitest';
 import { spawnTsScript } from './helpers/ts-runner.js';
 
+async function waitForFile(path: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${path}`);
+    await new Promise(resolveDelay => setTimeout(resolveDelay, 25));
+  }
+}
+
 it.skipIf(spawnSync('tmux', ['-V']).status !== 0)('Kimi effort reaches its pane without leaking into the next session', async () => {
   const root = mkdtempSync(join(tmpdir(), 'botmux-kimi-env-'));
   const data = join(root, 'data');
@@ -38,7 +46,7 @@ it.skipIf(spawnSync('tmux', ['-V']).status !== 0)('Kimi effort reaches its pane 
           workingDir: data, cliId: 'kimi', cliPathOverride: fixture, backendType: 'tmux', prompt: '',
           launchShell: '/bin/bash', model: 'kimi-code/k3-256k', reasoningEffort, env: botEnv,
           larkAppId: 'test', larkAppSecret: 'test', apiOnly: true });
-        await expect.poll(() => existsSync(output), { timeout: 15000 }).toBe(true)
+        await waitForFile(output, 15_000)
           .catch(error => { throw new Error(`${error}\n${logs}`); });
         expect(readFileSync(output, 'utf8'), logs).toBe(expected);
       } finally {

@@ -28,6 +28,8 @@ vi.mock('../src/utils/logger.js', () => ({
 import {
   __testOnly_runPendingSuspendIfSettled as runPendingSuspendIfSettled,
   suspendWorker,
+  setSessionReasoningEffort,
+  sessionReasoningControl,
 } from '../src/core/worker-pool.js';
 import { logger } from '../src/utils/logger.js';
 
@@ -263,5 +265,65 @@ describe('queued suspend claim lifecycle', () => {
 
     expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
     expect(ds.pendingSuspendReason).toBeUndefined();
+  });
+});
+
+
+describe('session reasoning effort changes', () => {
+  function session(status = 'idle') {
+    const pair = busySession(status, { pending: undefined });
+    Object.assign(pair.ds.session, { cliId: 'codex', cliSessionId: 'native-original', reasoningEffort: 'ultra' });
+    Object.assign(pair.ds.initConfig, { cliId: 'codex', wrapperCli: 'aiden x codex', model: 'gpt-5.6-sol' });
+    Object.assign(pair.ds, { workerReady: true, activeReasoningEffort: 'ultra' });
+    return pair;
+  }
+
+  it('saves high, suspends once and preserves the native conversation for the next message', () => {
+    const { ds, worker } = session();
+    expect(setSessionReasoningEffort(ds, 'high')).toBe('saved');
+    expect(worker.send.mock.calls).toEqual([[{ type: 'suspend' }]]);
+    expect(ds.session).toMatchObject({ reasoningEffort: 'high', cliSessionId: 'native-original', status: 'active', suspendedColdResume: true });
+    expect(ds.activeReasoningEffort).toBe('ultra'); // no false claim of execution
+    expect(sessionReasoningControl(ds)).toMatchObject({ selected: 'high', pending: true });
+    expect(setSessionReasoningEffort(ds, 'high')).toBe('saved');
+    expect(worker.send).toHaveBeenCalledTimes(1);
+    expect(setSessionReasoningEffort(ds, 'low')).toBe('saved');
+    expect(ds.session.reasoningEffort).toBe('low');
+    expect(worker.send).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['working', 'analyzing', 'starting', 'limited', 'waiting_input'])('does not change or interrupt %s', status => {
+    const { ds, worker } = session(status);
+    expect(setSessionReasoningEffort(ds, 'high')).toBe('busy');
+    expect(ds.session.reasoningEffort).toBe('ultra');
+    expect(worker.send).not.toHaveBeenCalled();
+  });
+
+  it.each(['adoptedFrom', 'codexRpcInput', 'backendType', 'wrapperCli', 'sandbox', 'readIsolation'])('refuses an unsupported %s path', field => {
+    const { ds, worker } = session();
+    if (field === 'adoptedFrom') ds.session.adoptedFrom = { pane: 'external' };
+    else ds.initConfig[field] = { codexRpcInput: true, backendType: 'riff', wrapperCli: 'other codex', sandbox: true, readIsolation: true }[field];
+    expect(setSessionReasoningEffort(ds, 'high')).toBe('unsupported');
+    expect(worker.send).not.toHaveBeenCalled();
+    expect(ds.session.reasoningEffort).toBe('ultra');
+  });
+
+  it('rejects unsupported effort and protects queued work even with an idle screen', () => {
+    const { ds, worker } = session();
+    expect(setSessionReasoningEffort(ds, 'typo')).toBe('invalid');
+    ds.initConfig.model = 'gpt-5.5';
+    expect(setSessionReasoningEffort(ds, 'ultra')).toBe('invalid');
+    ds.session.queued = true;
+    expect(setSessionReasoningEffort(ds, 'high')).toBe('busy');
+    expect(worker.send).not.toHaveBeenCalled();
+  });
+
+  it('does not retire a worker if saving the new selection fails', async () => {
+    const { updateSession } = await import('../src/services/session-store.js');
+    const { ds, worker } = session();
+    vi.mocked(updateSession).mockImplementationOnce(() => { throw new Error('disk full'); });
+    expect(() => setSessionReasoningEffort(ds, 'high')).toThrow('disk full');
+    expect(ds.session.reasoningEffort).toBe('ultra');
+    expect(worker.send).not.toHaveBeenCalled();
   });
 });

@@ -41,7 +41,7 @@ import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, s
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName, type IdleCardLabel } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
-import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
+import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, reasoningEffortsForCliModel } from '../services/codex-reasoning-effort.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
@@ -438,6 +438,7 @@ export function getDaemonStreamingCardUsageSnapshot(
   // usage metric — it rides the snapshot (every buildStreamingCard call site
   // already forwards one) but must survive the 'off'/'footer' early return.
   const modelFallback = ds.modelFallback;
+  const reasoningControl = sessionReasoningControl(ds);
   try {
     if (resolveUsageDisplay(ds.larkAppId) !== 'streaming') {
       return {
@@ -447,6 +448,7 @@ export function getDaemonStreamingCardUsageSnapshot(
         ...(reasoningEffort ? { reasoningEffort } : {}),
         ...(modelBackendVariant ? { modelBackendVariant } : {}),
         ...(modelFallback ? { modelFallback } : {}),
+        ...(reasoningControl ? { reasoningControl } : {}),
       };
     }
   } catch {
@@ -470,6 +472,7 @@ export function getDaemonStreamingCardUsageSnapshot(
     ...(reasoningEffort ? { reasoningEffort } : grokReasoningEffort ? { reasoningEffort: grokReasoningEffort } : {}),
     ...(modelBackendVariant ? { modelBackendVariant } : {}),
     ...(modelFallback ? { modelFallback } : {}),
+    ...(reasoningControl ? { reasoningControl } : {}),
   };
 }
 
@@ -6607,6 +6610,53 @@ function clearPendingSuspendClaim(ds: DaemonSession, why: string): void {
   ds.pendingSuspendReason = undefined;
   ds.pendingSuspendGeneration = undefined;
   logger.debug(`[${tag(ds)}] Cleared queued suspend claim (${reason ?? 'none'}): ${why}`);
+}
+
+/** Only managed local Codex TUI sessions have a verified cold-resume effort path. */
+export function sessionReasoningControl(ds: DaemonSession): CardUsageSnapshot['reasoningControl'] {
+  const cfg = ds.initConfig ?? ds.session;
+  const wrapper = cfg.wrapperCli?.trim();
+  if ((cfg.cliId ?? ds.session.cliId) !== 'codex'
+    || (wrapper && wrapper !== 'aiden x codex')
+    || cfg.backendType !== 'tmux' || ds.initConfig?.codexRpcInput
+    || ds.session.sandbox || ds.initConfig?.sandbox || ds.initConfig?.readIsolation || sandboxEnabled()
+    || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode) return undefined;
+  return {
+    choices: reasoningEffortsForCliModel('codex', ds.activeModel ?? cfg.model),
+    selected: ds.session.reasoningEffort,
+    pending: !!ds.session.suspendedColdResume,
+  };
+}
+
+/** Caller holds the bot mutation gate. Never interrupt or replay a business turn. */
+export function setSessionReasoningEffort(ds: DaemonSession, effort: unknown): 'saved' | 'busy' | 'unsupported' | 'invalid' {
+  const control = sessionReasoningControl(ds);
+  if (!control) return 'unsupported';
+  const selected = control.choices.find(candidate => candidate === effort);
+  if (!selected) return 'invalid';
+  if (ds.session.status !== 'active' || isSessionTransferring(ds)
+    || hasProtectedSessionMutationOwnership(ds) || ds.pendingRawInput || ds.pendingFollowUpInput
+    || [...pendingOrdinaryImDeliveries.values()].some(delivery => delivery.ds === ds)) return 'busy';
+  const live = ds.worker && !ds.worker.killed;
+  if (live && (ds.lastScreenStatus !== 'idle' || !ds.workerReady)) return 'busy';
+  if (!live && !ds.session.suspendedColdResume) return 'busy';
+  if (ds.session.reasoningEffort === selected
+    && (!live || ds.activeReasoningEffort === selected)) return 'saved';
+  const previous = ds.session.reasoningEffort;
+  ds.session.reasoningEffort = selected;
+  try {
+    // Persist before retiring the CLI; a failed write must leave it running.
+    sessionStore.updateSession(ds.session);
+  } catch (error) {
+    ds.session.reasoningEffort = previous;
+    throw error;
+  }
+  if (live && !suspendWorker(ds, 'reasoning_effort_changed')) {
+    ds.session.reasoningEffort = previous;
+    sessionStore.updateSession(ds.session);
+    return 'busy';
+  }
+  return 'saved';
 }
 
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {

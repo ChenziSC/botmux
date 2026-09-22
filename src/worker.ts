@@ -19,6 +19,7 @@ import { join, basename, dirname, delimiter, relative } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { sessionIdentityBinDir, installIdentityWrapper, findRealToolBinary, ensureSessionIdentityPlaceholders, installGitAskpass, identityWrapperInstalled, gitIdentityConfigEnv, publishActiveTurn, installLoginShellPathShim, GIT_ASKPASS_BASENAME } from './core/cli-identity.js';
 import { tokenStoreProtection } from './services/trigger-user-auth.js';
+import { installAidenCodexShim } from './services/aiden-codex-shim.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -562,8 +563,6 @@ scrubSessionCliHomeEnv(process.env);
 scrubClaudeSessionMarkerEnv(process.env);
 
 // ─── State ───────────────────────────────────────────────────────────────────
-
-const AIDEN_CODEX_SHIM_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'aiden-codex-shim');
 
 let cliAdapter: CliAdapter | null = null;
 let backend: SessionBackend | null = null;
@@ -16539,11 +16538,23 @@ async function spawnCli(
           ? (riffBackendConfig as EffectiveMojoConfig | undefined)?.env
           : undefined,
       });
+      let aidenCodexShimDir: string | undefined;
+      if (parseWrapperCli(cfg.wrapperCli).slice(0, 3).join(' ') === 'aiden x codex') {
+        try {
+          accessSync(cliAdapter.resolvedBin, fsConstants.X_OK);
+          if (!process.env.SESSION_DATA_DIR) throw new Error('SESSION_DATA_DIR is unavailable');
+          aidenCodexShimDir = installAidenCodexShim(
+            join(sessionIdentityBinDir(process.env.SESSION_DATA_DIR, cfg.sessionId), 'aiden-codex'),
+          );
+        } catch (e) {
+          log(`[aiden-codex] WARN reasoning shim unavailable; using Aiden default effort: ${(e as Error).message}`);
+        }
+      }
       const launch = buildWrappedLaunch(cfg.wrapperCli, spawnArgs, (b) => locateOnEffectiveChildPath(b, effectiveChildEnv) ?? b, {
         ttadkModel: cfg.model,
         childPath: effectiveChildEnv.PATH,
         aidenCodexRealBin: cliAdapter.resolvedBin,
-        aidenCodexShimDir: AIDEN_CODEX_SHIM_DIR,
+        aidenCodexShimDir,
         pathDelimiter: delimiter,
       });
       if (launch.bin) {

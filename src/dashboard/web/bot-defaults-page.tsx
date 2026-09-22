@@ -775,6 +775,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     summaryMemory: body.summaryMemory,
     summaryMemoryPath: body.summaryMemoryPath,
     botToBotSameDir: body.botToBotSameDir,
+    autoInviteOwnerOnGroupAdd: body.autoInviteOwnerOnGroupAdd,
     autoStartOnGroupJoin: body.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: body.autoStartOnGroupJoinPrompt,
     autoStartOnGroupJoinSeed: body.autoStartOnGroupJoinSeed,
@@ -3462,6 +3463,7 @@ function workingDirState(bot: BotDefaultsRow): { mode: 'off' | 'default' | 'onca
 export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const { bot, putCardPref } = props;
+  const [inviteOwner, setInviteOwner] = useState(bot.autoInviteOwnerOnGroupAdd !== false);
   const [onJoin, setOnJoin] = useState(bot.autoStartOnGroupJoin === true);
   const [onTopic, setOnTopic] = useState(bot.autoStartOnNewTopic === true);
   const [prompt, setPrompt] = useState(typeof bot.autoStartOnGroupJoinPrompt === 'string' ? bot.autoStartOnGroupJoinPrompt : '');
@@ -3475,6 +3477,7 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
   const [busy, setBusy] = useState<string | null>(null);
 
   useEffect(() => {
+    setInviteOwner(bot.autoInviteOwnerOnGroupAdd !== false);
     setOnJoin(bot.autoStartOnGroupJoin === true);
     setOnTopic(bot.autoStartOnNewTopic === true);
     setPrompt(typeof bot.autoStartOnGroupJoinPrompt === 'string' ? bot.autoStartOnGroupJoinPrompt : '');
@@ -3483,6 +3486,7 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
     setJoinCmd(typeof bot.groupJoinCommand === 'string' ? bot.groupJoinCommand : '');
   }, [
     bot.larkAppId,
+    bot.autoInviteOwnerOnGroupAdd,
     bot.autoStartOnGroupJoin,
     bot.autoStartOnGroupJoinPrompt,
     bot.autoStartOnGroupJoinSeed,
@@ -3509,6 +3513,17 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
   return (
     <div className="bd-subsection">
       <h4 className="bd-subsection-title">{tr('botDefaults.sectionAutoStart')}</h4>
+      <ToggleRow
+        checked={inviteOwner}
+        disabled={busy === 'inviteOwner'}
+        dataAction="toggle-invite-owner"
+        title={tr('botDefaults.autoInviteOwnerOnGroupAdd')}
+        help={tr('botDefaults.autoInviteOwnerOnGroupAddHelp')}
+        onChange={checked => {
+          setInviteOwner(checked);
+          void savePatch({ autoInviteOwnerOnGroupAdd: checked }, 'inviteOwner');
+        }}
+      />
       <ToggleRow
         checked={onJoin}
         disabled={busy === 'join'}

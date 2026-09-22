@@ -1963,6 +1963,91 @@ describe('PUT /api/bot-card-prefs — Codex browser bridge', () => {
   });
 });
 
+describe('PUT /api/bot-card-prefs — autoInviteOwnerOnGroupAdd', () => {
+  it('is default-on, persists explicit false, and rejects non-boolean values fail-closed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-invite-owner-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-invite-owner-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial.autoInviteOwnerOnGroupAdd).toBe(true);
+
+      const off = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ autoInviteOwnerOnGroupAdd: false }),
+      });
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, autoInviteOwnerOnGroupAdd: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].autoInviteOwnerOnGroupAdd).toBe(false);
+      expect(getBot(appId).config.autoInviteOwnerOnGroupAdd).toBe(false);
+
+      const on = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ autoInviteOwnerOnGroupAdd: true }),
+      });
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, autoInviteOwnerOnGroupAdd: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].autoInviteOwnerOnGroupAdd).toBeUndefined();
+
+      // Whitelist is fail-closed: a non-boolean value is dropped silently, while
+      // a valid sibling field in the same body still persists.
+      const mixed = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ autoInviteOwnerOnGroupAdd: 'yes', autoStartOnNewTopic: true }),
+      });
+      expect(mixed.status).toBe(200);
+      const mixedJson = await mixed.json();
+      const mixedEntry = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(Object.prototype.hasOwnProperty.call(mixedEntry, 'autoInviteOwnerOnGroupAdd')).toBe(false);
+      expect(mixedEntry.autoStartOnNewTopic).toBe(true);
+      expect(mixedJson.autoInviteOwnerOnGroupAdd).toBe(true);
+
+      // Restore the sibling field (default false → key cleared); must not touch
+      // the invite-owner default.
+      const restore = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ autoStartOnNewTopic: false }),
+      });
+      expect(restore.status).toBe(200);
+
+      // A body containing only the invalid non-boolean value has no valid fields.
+      const invalidOnly = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ autoInviteOwnerOnGroupAdd: 1 }),
+      });
+      expect(invalidOnly.status).toBe(400);
+      expect(await invalidOnly.json()).toMatchObject({ ok: false, error: 'no_valid_fields' });
+      expect(Object.prototype.hasOwnProperty.call(
+        JSON.parse(readFileSync(configPath, 'utf-8'))[0],
+        'autoInviteOwnerOnGroupAdd',
+      )).toBe(false);
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-card-prefs — two reply modes', () => {
   it('accepts default and unified modes and rejects the retired final-only option', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-reply-modes-'));

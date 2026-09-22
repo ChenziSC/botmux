@@ -13,6 +13,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 
+const topicDetailMock = vi.fn(async () => ({ items: [{ message_id: 'om_root', deleted: true }] }));
 const updateMessageMock = vi.fn(async () => {});
 const addReactionMock = vi.fn(async () => 'reaction_id');
 const replyToDocCommentMock = vi.fn(async () => {});
@@ -24,6 +25,7 @@ const resolveAllowedUsersWithMapMock = vi.fn(async (_appId: string, entries: str
   entryStatus: new Map(entries.map(entry => [entry, 'resolved' as const])),
 }));
 vi.mock('../src/im/lark/client.js', () => ({
+  getMessageDetail: (...args: any[]) => topicDetailMock(...args),
   updateMessage: (...args: any[]) => updateMessageMock(...args),
   addReaction: (...args: any[]) => addReactionMock(...args),
   resolveAllowedUsersWithMap: (...args: any[]) => resolveAllowedUsersWithMapMock(...args),
@@ -482,6 +484,20 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
     expect(sessionReply.mock.calls[0][4]).toBe('turn-1');
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('strict topic policy blocks automatic final output before publishing', async () => {
+    const current = getBot('app_test');
+    vi.mocked(getBot).mockReturnValue({ ...current, config: { ...current.config, topicUnavailablePolicy: 'stop' } } as any);
+    const sessionReply = vi.fn(async () => 'om_sent');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0, undefined, undefined, { mode: 'thread', rootMessageId: 'om_root' });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(topicDetailMock).toHaveBeenCalledWith('app_test', 'om_root');
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
   });
 
   it('turnFailed final_output on a session WITHOUT a human recipient @mentions the bot admin', async () => {
@@ -3275,6 +3291,32 @@ describe('Worker turn_terminal routing', () => {
     await Promise.resolve();
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(sessionReply.mock.calls[0][1]).toBe('ordinary notice');
+  });
+
+  it('keeps an internal receipt private after human interruption while preserving progress and later replies', async () => {
+    const ds = makeDs();
+    ds.suppressedTriggerFinalTurns = new Map([['trg_deployment', Date.now()]]);
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const emit = (msg: WorkerToDaemon) => (ds.worker as any).emit('message', msg);
+
+    emit({ type: 'active_turn_envelope_changed', previousTurnId: 'trg_deployment', turnId: 'om_human_update' });
+    emit({ type: 'active_turn_envelope_changed', previousTurnId: 'om_human_update', turnId: 'om_second_update' });
+    const receipt = 'IP_HANDOFF_RECEIPT {"status":"deployment_succeeded_validation_queued"}';
+    emit({ type: 'final_output', sessionId: ds.session.sessionId,
+      content: receipt, lastUuid: 'private-receipt', turnId: 'om_second_update' });
+    await Promise.resolve();
+    expect(sessionReply).not.toHaveBeenCalled();
+
+    emit({ type: 'user_notify', message: 'Deployment succeeded', turnId: 'om_second_update' });
+    await Promise.resolve();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    emit({ type: 'final_output', sessionId: ds.session.sessionId,
+      content: 'Answer to a later question', lastUuid: 'later-answer', turnId: 'om_later_question' });
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(2));
+    expect(sessionReply.mock.calls[1][1]).toContain('Answer to a later question');
+    expect(sessionReply.mock.calls.some(call => String(call[1]).includes('IP_HANDOFF_RECEIPT'))).toBe(false);
   });
 
   it('drops only the final_output of a suppressed trigger turn while other turns and its aux UI stay loud', async () => {

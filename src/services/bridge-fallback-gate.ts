@@ -42,9 +42,12 @@
  *     normalized length of the explicit `botmux send` body. A marker tagged
  *     responseKind/replyCardResponseKind 'final' is an explicit final-answer
  *     delivery, so it suppresses the fallback UNCONDITIONALLY (regardless of
- *     length) — that comparison only ever runs for progress/kind-less sends.
- *     When the transcript final is available, only emit fallback if that final
- *     is materially longer than any single explicit send in the same window.
+ *     length) under EVERY replyDelivery, including when the marker carries no
+ *     body length at all (image-only / voice sends) — see the note on
+ *     markerSetDuplicatesFinal. That comparison only ever runs for
+ *     progress/kind-less sends. When the transcript final is available, only
+ *     emit fallback if that final is materially longer than any single
+ *     explicit send in the same window.
  *     This lets short progress updates surface a later substantive final
  *     answer, while same-size rewrites and short acknowledgements stay
  *     suppressed. Boundary handling intentionally also considers
@@ -315,8 +318,13 @@ function previewMatchesFinal(previewText: string, finalNormalized: string): bool
  *
  * Markers with no `contentLength` (`botmux send --images` with no body, and the
  * `--voice` path, whose marker is hand-assembled) cannot establish equality at
- * all, so they never suppress — a duplicate message is a far cheaper failure
- * than a silently swallowed answer.
+ * all, so they never suppress HERE — a duplicate message is a far cheaper
+ * failure than a silently swallowed answer. This leniency applies only to
+ * progress/kind-less markers: an explicit responseKind='final' marker, body or
+ * no body, is already an unconditional return-true in shouldSuppressBridgeEmit
+ * before this function is reached, under every replyDelivery (an image-only or
+ * voice `--response-kind final` IS the declared final delivery; letting the
+ * transcript final through would double-post).
  */
 function markerSetDuplicatesFinal(markers: readonly BridgeSendMarker[], finalText: string | undefined): boolean {
   const finalNormalized = normaliseForFingerprint(finalText ?? '');

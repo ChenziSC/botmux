@@ -212,6 +212,7 @@ import { stagePendingRepoSetup, persistPendingRepoCardMessageId } from './core/p
 import { hasPendingSessionTurns, runSessionTurn } from './core/session-turn-queue.js';
 import { buildTerminalUrl, setTerminalProxyPort, setTerminalExternalPort } from './core/terminal-url.js';
 import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-proxy.js';
+import { authorizeTerminalStatusPage } from './core/terminal-write-auth.js';
 import type { CliId } from './adapters/cli/types.js';
 import { runtimeInstallationKey } from './adapters/cli/runtime.js';
 import * as scheduler from './core/scheduler.js';
@@ -26329,7 +26330,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // host networking for model egress and can also dial 127.0.0.1. Require the
   // host-only shared secret on every daemon IPC route except the tiny
   // capability-gated receiver/readiness apertures in dashboard-ipc-server.
-  loadOrCreateDashboardSecret(
+  const terminalCapabilitySecret = loadOrCreateDashboardSecret(
     join(homedir(), '.botmux', '.dashboard-secret'),
   );
   // Create the dispatch-binding key before any credential-only child spawns.
@@ -26464,6 +26465,38 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             }
           }
           return undefined;
+        });
+      },
+      resolveSessionState: (sessionId) => {
+        for (const ds of activeSessions.values()) {
+          if (ds.session.sessionId !== sessionId) continue;
+          return sessionSupportsWebTerminal(ds) ? 'starting' : 'unavailable';
+        }
+        const stored = sessionStore.getOwnedSession(sessionId);
+        if (!stored) return 'not-found';
+        return stored.status === 'closed' ? 'closed' : 'starting';
+      },
+      resolveStatusPageLocale: (sessionId) => {
+        for (const ds of activeSessions.values()) {
+          if (ds.session.sessionId === sessionId) return localeForBot(ds.larkAppId);
+        }
+        return localeForBot(sessionStore.getOwnedSession(sessionId)?.larkAppId);
+      },
+      authorizeStatusPage: (sessionId, capability) => {
+        let live: DaemonSession | undefined;
+        for (const ds of activeSessions.values()) {
+          if (ds.session.sessionId === sessionId) {
+            live = ds;
+            break;
+          }
+        }
+        const session = live?.session ?? sessionStore.getOwnedSession(sessionId);
+        return authorizeTerminalStatusPage({
+          secret: terminalCapabilitySecret,
+          sessionId,
+          session,
+          live,
+          capability,
         });
       },
     });
@@ -27577,6 +27610,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           ds.workerPort = null;
           ds.workerToken = null;
           ds.workerViewToken = null;
+          ds.workerCardViewToken = null;
           ds.managedTurnOrigin = undefined;
         } else {
           killWorker(ds);

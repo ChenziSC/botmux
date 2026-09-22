@@ -2,6 +2,12 @@ import { describe, expect, it } from 'vitest';
 import { botDefaultsPayload, botSummaryPayload, brandMapByAppId } from '../src/dashboard/bot-payload.js';
 
 describe('dashboard bot payload helpers', () => {
+  it('shows persisted legacy CoT preferences with explicit canonical values taking precedence', () => {
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { thinkingCard: false }).cotEnabled).toBe(false);
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { thinkingCard: false, cotEnabled: true }).cotEnabled).toBe(true);
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { thinkingCard: true, cotEnabled: false }).cotEnabled).toBe(false);
+  });
+
   it('maps retired final-only settings to a dynamic reply with the separate status card off', () => {
     expect(botDefaultsPayload({ larkAppId: 'app' }, { replyCardMode: 'final-only' }))
       .toMatchObject({ replyCardMode: 'unified', disableStreamingCard: true });
@@ -32,8 +38,8 @@ describe('dashboard bot payload helpers', () => {
       'sandbox', 'sandboxPaths', 'readIsolationSupported', 'backendType',
       'usageDisplay', 'usageSupported',
       'disableStreamingCard', 'hiddenStreamingCardButtons', 'pinStreamingCard', 'silentTurnReactions',
-      'codexAppCleanInput', 'writableTerminalLinkInCard', 'privateCard',
-      'thinkingCard', 'thinkingCardToolResult', 'senderTag', 'overloadAlert', 'botToBotSameDir', 'quotaFallbackBot',
+      'codexAppCleanInput', 'codexBrowser', 'writableTerminalLinkInCard', 'privateCard',
+      'cotEnabled', 'senderTag', 'overloadAlert', 'botToBotSameDir', 'autoInviteOwnerOnGroupAdd', 'quotaFallbackBot',
       'autoStartOnGroupJoin', 'autoStartOnGroupJoinPrompt', 'autoStartOnGroupJoinSeed', 'autoStartOnGroupJoinSeedDefault',
       'groupJoinCommandEnabled', 'groupJoinCommand',
       'autoStartOnNewTopic',

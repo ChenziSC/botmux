@@ -37,10 +37,8 @@
  * Strictly cosmetic: every network call catches its own errors and never
  * touches turn settlement.
  *
- * Per-bot master switch `thinkingCard` (default ON — only an explicit false
- * disables; per-chat opt-out via `/cot off`). `thinkingCardToolResult: false`
- * additionally drops the TOOL_CALL_RESULT code blocks, see
- * {@link cotToolResultEnabled}.
+ * Per-bot master switch `cotEnabled` (default ON — only an explicit false
+ * disables; per-chat opt-out via `/cot off`).
  */
 import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -233,7 +231,7 @@ function turnKeyOf(msg: { turnId: string; dispatchAttempt?: number }): string {
   return `${msg.turnId}|${msg.dispatchAttempt ?? ''}`;
 }
 
-/** Effective per-session gate: bot-level master switch (`thinkingCard`,
+/** Effective per-session gate: bot-level master switch (`cotEnabled`,
  *  default ON — only explicit false disables) AND the chat not opted out via
  *  `/cot off` (`noCotChats`). Read fresh from the in-memory registry so
  *  `/cot` toggles apply from the next update without a daemon restart.
@@ -244,7 +242,7 @@ export function cotEnabled(ds: DaemonSession): boolean {
     const cfg = getBot(ds.larkAppId).config;
     if (cfg.apiOnly === true) return false;
     if (ds.cotForced) return true;
-    return cfg.thinkingCard !== false
+    return cfg.cotEnabled !== false
       && !(ds.chatId && cfg.noCotChats?.includes(ds.chatId));
   } catch {
     return false;
@@ -397,7 +395,7 @@ function reasoningId(state: CotState, index: number): string {
  *  MCP-style names without a per-CLI table. */
 function toolMeta(name: string): { icon: string; labelKey: string } {
   const n = name.toLowerCase();
-  if (n.includes('bash') || n.includes('shell') || n.includes('command')) return { icon: 'bash', labelKey: 'cot.tool.bash' };
+  if (n.includes('bash') || n.includes('shell') || n.includes('command') || /(^|[^a-z])exec([^a-z]|$)/.test(n)) return { icon: 'bash', labelKey: 'cot.tool.bash' };
   if (n.includes('write') || n.includes('edit') || n.includes('patch')) return { icon: 'write', labelKey: 'cot.tool.write' };
   if (n.includes('read') || n.includes('notebook')) return { icon: 'read', labelKey: 'cot.tool.read' };
   if (n.includes('grep') || n.includes('glob') || n.includes('search') || n.includes('fetch')) return { icon: 'search', labelKey: 'cot.tool.search' };
@@ -531,9 +529,8 @@ function entryEvents(ds: DaemonSession, state: CotState, entry: CotEntry, index:
     // in hand, and remembered for the matching result. Detection uses the
     // UNTRUNCATED subject: a path longer than the title cap still ends in its
     // extension, which the display string has already lost to the ellipsis.
-    // 工具输出关闭时结果不会发出，语言也无需记。
     const lang = resultLanguage(entry.name, subject.full);
-    if (lang && cotToolResultEnabled(ds)) {
+    if (lang) {
       if (!state.resultLanguages) state.resultLanguages = new Map();
       state.resultLanguages.set(entry.id, lang);
     }
@@ -550,11 +547,8 @@ function entryEvents(ds: DaemonSession, state: CotState, entry: CotEntry, index:
       ev('TOOL_CALL_END', { toolCallId: entry.id }),
     ];
   }
-  // 工具节点在 TOOL_CALL_END 之后处于「执行中」状态（官方 COT 事件文档对 22 的定义），
-  // 只有 TOOL_CALL_RESULT 才让它落定。所以「关掉工具输出」不能简单地不发 RESULT——
-  // 那会让每个工具节点永远转圈；结果串本身为空时同理。两种情况都改发一条极简 text
-  // 结果收尾：气泡里只留「工具名 · 命令/路径」加一个完成标记，与 Claude Code 自身
-  // 界面一致，又不会留下未落定的节点。
+  // TOOL_CALL_RESULT settles the tool node. Empty results still need a compact
+  // completion marker so the Feishu renderer does not leave the node spinning.
   const omitResult = !cotToolResultEnabled(ds) || entry.result.length === 0;
   const language = omitResult ? undefined : state.resultLanguages?.get(entry.id);
   return [

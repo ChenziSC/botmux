@@ -1,6 +1,6 @@
 import { defaultSummaryRangePrefs, summaryRangeFromLegacyContentTriggers } from '../services/summary-range-store.js';
 import { selectionKeyForBot } from '../setup/cli-selection.js';
-import { normalizeUsageDisplay } from '../bot-registry.js';
+import { normalizeUsageDisplay, normalizeCotEnabled } from '../bot-registry.js';
 import { normalizeHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
 import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import type { CliLaunchMode } from '../core/cli-launch-mode.js';
@@ -143,14 +143,16 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     pinStreamingCard: j?.pinStreamingCard === true,
     silentTurnReactions: j?.silentTurnReactions === true,
     codexAppCleanInput: j?.codexAppCleanInput === true,
+    codexBrowser: j?.codexBrowser === true
+      || (typeof j?.codexBrowser === 'object' && j.codexBrowser?.enabled === true),
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
     privateCard: j?.privateCard === true,
-    thinkingCard: j?.thinkingCard !== false,
-    thinkingCardToolResult: j?.thinkingCardToolResult !== false,
+    cotEnabled: normalizeCotEnabled(j),
     senderTag: j?.senderTag !== false,
     overloadAlert: j?.overloadAlert === true,
     botToBotSameDir: j?.botToBotSameDir !== false,
     quotaFallbackBot: normalizeQuotaFallbackBotConfig(j?.quotaFallbackBot, bot.larkAppId).config ?? null,
+    autoInviteOwnerOnGroupAdd: j?.autoInviteOwnerOnGroupAdd !== false,
     autoStartOnGroupJoin: j?.autoStartOnGroupJoin === true,
     autoStartOnGroupJoinPrompt: typeof j?.autoStartOnGroupJoinPrompt === 'string' ? j.autoStartOnGroupJoinPrompt : '',
     autoStartOnGroupJoinSeed: typeof j?.autoStartOnGroupJoinSeed === 'string' ? j.autoStartOnGroupJoinSeed : '',

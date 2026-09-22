@@ -6209,13 +6209,14 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     pinStreamingCard: cardPrefs.pinStreamingCard,
     silentTurnReactions: cardPrefs.silentTurnReactions,
     codexAppCleanInput: cardPrefs.codexAppCleanInput,
+    codexBrowser: cardPrefs.codexBrowser,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     privateCard: cardPrefs.privateCard,
-    thinkingCard: cardPrefs.thinkingCard,
-    thinkingCardToolResult: cardPrefs.thinkingCardToolResult,
+    cotEnabled: cardPrefs.cotEnabled,
     senderTag: cardPrefs.senderTag,
     overloadAlert: cardPrefs.overloadAlert,
     botToBotSameDir: cardPrefs.botToBotSameDir,
+    autoInviteOwnerOnGroupAdd: cardPrefs.autoInviteOwnerOnGroupAdd,
     autoStartOnGroupJoin: cardPrefs.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: cardPrefs.autoStartOnGroupJoinPrompt,
     autoStartOnGroupJoinSeed: cardPrefs.autoStartOnGroupJoinSeed,
@@ -6344,10 +6345,9 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   let body: {
     usageDisplay?: unknown;
     replyCardMode?: unknown;
-    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; thinkingCard?: unknown;
-    thinkingCardToolResult?: unknown;
+    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; cotEnabled?: unknown; thinkingCard?: unknown; thinkingCardToolResult?: unknown;
     botToBotSameDir?: unknown;
-    autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown;
+    autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown; autoInviteOwnerOnGroupAdd?: unknown;
     groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
     overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
@@ -6359,10 +6359,9 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   const patch: {
     usageDisplay?: UsageDisplayMode;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
-    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; thinkingCard?: boolean;
-    thinkingCardToolResult?: boolean;
+    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; cotEnabled?: boolean; thinkingCardToolResult?: boolean;
     botToBotSameDir?: boolean;
-    autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean;
+    autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean; autoInviteOwnerOnGroupAdd?: boolean;
     groupJoinCommandEnabled?: boolean; groupJoinCommand?: string;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
@@ -6385,14 +6384,28 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (typeof body.botToBotSameDir === 'boolean') patch.botToBotSameDir = body.botToBotSameDir;
   if (typeof body.silentTurnReactions === 'boolean') patch.silentTurnReactions = body.silentTurnReactions;
   if (typeof body.codexAppCleanInput === 'boolean') patch.codexAppCleanInput = body.codexAppCleanInput;
+  if (typeof body.codexBrowser === 'boolean') {
+    if (body.codexBrowser) {
+      const config = getBot(cachedLarkAppId).config;
+      if (config.cliId !== 'codex-app') {
+        return jsonRes(res, 400, { ok: false, error: 'codex_browser_requires_codex_app' });
+      }
+      if (config.existingAppServer || config.sandbox === true || config.readIsolation === true) {
+        return jsonRes(res, 409, { ok: false, error: 'codex_browser_config_conflict' });
+      }
+    }
+    patch.codexBrowser = body.codexBrowser;
+  }
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
-  if (typeof body.thinkingCard === 'boolean') patch.thinkingCard = body.thinkingCard;
+  if (typeof body.cotEnabled === 'boolean') patch.cotEnabled = body.cotEnabled;
+  else if (typeof body.thinkingCard === 'boolean') patch.cotEnabled = body.thinkingCard;
   if (typeof body.thinkingCardToolResult === 'boolean') patch.thinkingCardToolResult = body.thinkingCardToolResult;
   if (typeof body.senderTag === 'boolean') patch.senderTag = body.senderTag;
   if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
   if (typeof body.summaryMemory === 'boolean') patch.summaryMemory = body.summaryMemory;
   if (typeof body.summaryMemoryPath === 'string') patch.summaryMemoryPath = body.summaryMemoryPath;
+  if (typeof body.autoInviteOwnerOnGroupAdd === 'boolean') patch.autoInviteOwnerOnGroupAdd = body.autoInviteOwnerOnGroupAdd;
   if (typeof body.autoStartOnGroupJoin === 'boolean') patch.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
   if (typeof body.autoStartOnGroupJoinPrompt === 'string') patch.autoStartOnGroupJoinPrompt = body.autoStartOnGroupJoinPrompt;
   if (typeof body.autoStartOnGroupJoinSeed === 'string') {
@@ -6440,7 +6453,11 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (Object.keys(patch).length === 0) return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
 
   const r = await cardPrefsStore.updateBotCardPrefs(cachedLarkAppId, patch);
-  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  if (!r.ok) {
+    const status = r.reason === 'codex_browser_config_conflict'
+      || r.reason === 'existing_app_server_sandbox_conflict' ? 409 : 400;
+    return jsonRes(res, status, { ok: false, error: r.reason });
+  }
   jsonRes(res, 200, { ok: true, ...r.prefs });
 });
 
@@ -6982,6 +6999,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // read-isolation toggle validates at enable time; changing the agent afterwards
     // is the other way a bot could end up configured-but-unenforceable.)
     let readIsolationCleared = false;
+    let codexBrowserCleared = false;
     const r = await rmwBotEntry<{
       error?: 'reasoning_effort_not_supported_by_model' | 'launch_mode_sandbox_conflict';
       nextReasoningEffort?: typeof reasoningEffort;
@@ -7007,6 +7025,10 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
         return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' } };
       }
       entry.cliId = selected.cliId;
+      if (selected.cliId !== 'codex-app' && entry.codexBrowser !== undefined) {
+        delete entry.codexBrowser;
+        codexBrowserCleared = true;
+      }
       if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
       else delete entry.wrapperCli;
       if (selected.cliLaunchMode) entry.cliLaunchMode = selected.cliLaunchMode;
@@ -7127,6 +7149,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     if (!supportsDshRuntime) bot.config.dshRuntime = undefined;
     else if (dshRuntimeFieldPresent) bot.config.dshRuntime = nextDshRuntime;
     if (readIsolationCleared) bot.config.readIsolation = false;
+    if (codexBrowserCleared) bot.config.codexBrowser = undefined;
     if (isRemoteCliId(selected.cliId)) {
       bot.config.backendType = selected.cliId as typeof bot.config.backendType;
     } else if (bot.config.backendType && isRemoteBackendType(bot.config.backendType)) {
@@ -7165,6 +7188,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       readIsolation: bot.config.readIsolation === true,
       readIsolationSupported: readIsolationEnforceableFor(bot.config),
       readIsolationCleared,
+      codexBrowserCleared,
       agentAvailable: availability.available,
       availabilityWarning,
       requiredCommand: availability.command,
@@ -7843,7 +7867,11 @@ ipcRoute('PUT', '/api/bot-sandbox', async (req, res) => {
   // restore; this toggle is intentionally next-session-only and cannot mutate
   // a live pane's profile.
   const r = await sandboxStore.updateBotSandbox(cachedLarkAppId, body.enabled === true);
-  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  if (!r.ok) {
+    const status = r.reason === 'codex_browser_config_conflict'
+      || r.reason === 'existing_app_server_sandbox_conflict' ? 409 : 400;
+    return jsonRes(res, status, { ok: false, error: r.reason });
+  }
   jsonRes(res, 200, { ok: true, sandbox: r.sandbox });
 });
 
@@ -7942,7 +7970,12 @@ ipcRoute('PUT', '/api/bot-read-isolation', async (req, res) => {
           backendType,
           session.sessionId,
         );
-        if (persistentBackend.probePersistentSession(backendType, backingName) !== 'missing') {
+        const probe = backendType === 'zmx'
+          ? persistentBackend.probePersistentBackendTarget(persistentBackend.resolvePersistentBackendTarget(
+            backendType, session.sessionId, session.persistentBackendTarget,
+          ))
+          : persistentBackend.probePersistentSession(backendType, backingName);
+        if (probe !== 'missing') {
           return jsonRes(res, 409, {
             ok: false,
             error: 'read_isolation_teardown_unverified',
@@ -7963,7 +7996,11 @@ ipcRoute('PUT', '/api/bot-read-isolation', async (req, res) => {
     // A crash at any point can only lead to a cold spawn under the old or new
     // durable policy; there is no owned pane to reattach.
     const r = await sandboxStore.updateBotReadIsolation(larkAppId, enable);
-    if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+    if (!r.ok) {
+      const status = r.reason === 'codex_browser_config_conflict'
+        || r.reason === 'existing_app_server_sandbox_conflict' ? 409 : 400;
+      return jsonRes(res, status, { ok: false, error: r.reason });
+    }
     jsonRes(res, 200, {
       ok: true,
       readIsolation: r.readIsolation,

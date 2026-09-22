@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { appendFileSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { prepareAidenCodexConfig } from '../src/services/aiden-codex-config.js';
+import { aidenCodexResumeNeedsRedraw, prepareAidenCodexConfig } from '../src/services/aiden-codex-config.js';
 
 const roots: string[] = [];
 function fixture(config = 'model = "same-model"\nmodel_reasoning_effort = "ultra"\n\n[mcp_servers.example]\ncommand = "same-command"\n') {
@@ -18,6 +18,16 @@ function fixture(config = 'model = "same-model"\nmodel_reasoning_effort = "ultra
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 describe('Aiden Codex reasoning config', () => {
+  it('requests a redraw only for an empty resumed composer with the configured runtime footer', () => {
+    const screen = 'Previous answer\n\n› Ask Codex to do anything\n\n  gpt-5.6-sol high · /tmp/project · Task title\n';
+    expect(aidenCodexResumeNeedsRedraw(screen)).toBe(true);
+    for (const prefix of ['│ model: loading │\n', 'Resuming session...\n', 'Working (esc to interrupt)\n', 'Queued for capacity\n']) {
+      expect(aidenCodexResumeNeedsRedraw(prefix + screen)).toBe(false);
+    }
+    expect(aidenCodexResumeNeedsRedraw(screen.replace('Ask Codex to do anything', 'unsent draft'))).toBe(false);
+    expect(aidenCodexResumeNeedsRedraw(screen + 'Press enter to continue')).toBe(false);
+    expect(aidenCodexResumeNeedsRedraw('› Ask Codex to do anything\n  ? for shortcuts')).toBe(false);
+  });
   it('changes only the session config and preserves native identity and shared history', () => {
     const { root, source, config } = fixture();
     const home = prepareAidenCodexConfig(source, join(root, 'session-a'), 'high');

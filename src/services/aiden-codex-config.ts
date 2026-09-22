@@ -2,6 +2,15 @@ import { lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, symlink
 import { join } from 'node:path';
 import { writeSecureHostFileSync } from '../platform/secure-host-file.js';
 
+/** A resumed Aiden TUI can omit the banner needed by the startup gate. Ask for
+ * one redraw only at its empty composer; this is not permission to send input. */
+export function aidenCodexResumeNeedsRedraw(screen: string): boolean {
+  if (/(?:model|directory):\s*loading\b|Resuming session|esc to interrupt|Queued for capacity/i.test(screen)) return false;
+  const lines = screen.trimEnd().split(/\r?\n/).filter(line => line.trim());
+  return /^\s*›\s*(?:Ask Codex to do anything)?\s*$/.test(lines.at(-2) ?? '')
+    && /^\s*\S+ (?:low|medium|high|xhigh|max|ultra) · (?:\/|~)\S*(?: · [^\r\n]+)?\s*$/.test(lines.at(-1) ?? '');
+}
+
 /** Aiden rejects Codex -c overrides. Give this session its own config while
  * retaining the existing login, native thread database and transcript paths.
  * This is configuration separation, not credential or filesystem isolation. */

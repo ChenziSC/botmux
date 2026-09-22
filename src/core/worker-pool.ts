@@ -9,7 +9,7 @@ import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTrig
 import { execSync, type ChildProcess } from 'node:child_process';
 import { join, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
-import { readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
+import { statSync, readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, ensureWorkflowSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
@@ -27,6 +27,7 @@ import { checkWorkerAdmission, formatMemoryBytes } from './worker-budget.js';
 import { createWorkerStderrRing, WORKER_ERROR_MARKER, type WorkerStderrRing } from './worker-stderr-ring.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
+import { drainCodexRollout, findCodexRolloutBySessionId } from '../services/codex-transcript.js';
 import {
   markMessageListenerRunPreviewFailed,
   markMessageListenerRunPreviewReplied,
@@ -6640,6 +6641,18 @@ export function setSessionReasoningEffort(ds: DaemonSession, effort: unknown): '
   const live = ds.worker && !ds.worker.killed;
   if (live && (ds.lastScreenStatus !== 'idle' || !ds.workerReady)) return 'busy';
   if (!live && !ds.session.suspendedColdResume) return 'busy';
+  if (live && ds.session.cliSessionId) {
+    // Reattach can briefly report an idle screen during a native tool call.
+    // Require a real turn boundary before retiring its CLI. Bound the read;
+    // missing/partial history is uncertainty, never permission to interrupt.
+    try {
+      const path = findCodexRolloutBySessionId(ds.session.cliSessionId);
+      if (!path) return 'busy';
+      const tail = drainCodexRollout(path, Math.max(0, statSync(path).size - 1024 * 1024));
+      const last = tail.events.filter(event => event.kind !== 'cot').at(-1);
+      if (tail.pendingTail || !last || !['assistant_final', 'turn_aborted'].includes(last.kind)) return 'busy';
+    } catch { return 'busy'; }
+  }
   if (ds.session.reasoningEffort === selected
     && (!live || ds.activeReasoningEffort === selected)) return 'saved';
   const previous = ds.session.reasoningEffort;

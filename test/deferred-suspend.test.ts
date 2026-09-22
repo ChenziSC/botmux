@@ -31,6 +31,12 @@ import {
   setSessionReasoningEffort,
   sessionReasoningControl,
 } from '../src/core/worker-pool.js';
+vi.mock('../src/services/codex-transcript.js', async orig => ({
+  ...await orig<typeof import('../src/services/codex-transcript.js')>(),
+  findCodexRolloutBySessionId: vi.fn(() => new URL('../package.json', import.meta.url).pathname),
+  drainCodexRollout: vi.fn(() => ({ events: [{ kind: 'assistant_final' }], newOffset: 1, pendingTail: '' })),
+}));
+import { drainCodexRollout } from '../src/services/codex-transcript.js';
 import { logger } from '../src/utils/logger.js';
 
 function fakeWorker() {
@@ -316,6 +322,14 @@ describe('session reasoning effort changes', () => {
     ds.session.queued = true;
     expect(setSessionReasoningEffort(ds, 'high')).toBe('busy');
     expect(worker.send).not.toHaveBeenCalled();
+  });
+
+  it('does not trust an idle screen while native history still has an unfinished turn', () => {
+    const { ds, worker } = session();
+    vi.mocked(drainCodexRollout).mockReturnValueOnce({ events: [{ kind: 'user', text: 'ongoing', uuid: 'u', timestampMs: 1 }], newOffset: 1, pendingTail: '' });
+    expect(setSessionReasoningEffort(ds, 'high')).toBe('busy');
+    expect(worker.send).not.toHaveBeenCalled();
+    expect(ds.session.reasoningEffort).toBe('ultra');
   });
 
   it('does not retire a worker if saving the new selection fails', async () => {

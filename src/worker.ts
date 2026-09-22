@@ -313,7 +313,7 @@ import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { HerdrBackend, type HerdrWebTerminalCursor } from './adapters/backend/herdr-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { applyCodexInstanceEnv, codexInstanceIdentity } from './services/codex-instance-pool.js';
-import { prepareAidenCodexConfig } from './services/aiden-codex-config.js';
+import { aidenCodexResumeNeedsRedraw, prepareAidenCodexConfig } from './services/aiden-codex-config.js';
 import { withFileLockSync } from './utils/file-lock.js';
 import { TmuxPipeBackend } from './adapters/backend/tmux-pipe-backend.js';
 import { ZellijBackend, ZELLIJ_CONFIG_KDL } from './adapters/backend/zellij-backend.js';
@@ -17673,6 +17673,7 @@ async function spawnCli(
   // markNewTurn() sets a clean baseline at the current cursor position so only
   // content written *after* this point appears in the card.
   const firstPromptBackend = backend;
+  let requestedAidenResumeRedraw = false;
   const releaseFirstPromptTimeout = (elapsedMs: number, forced: boolean): void => {
     if (!awaitingFirstPrompt || backend !== firstPromptBackend) return;
     // A timeout can recover missing prompt evidence, never contradict explicit
@@ -17690,6 +17691,13 @@ async function spawnCli(
       observeStartupBannerOnScreen();
     }
     if (idleDetector?.isStartupPending()) {
+      if (cfg.resume && aidenCodexConfigHome && !isPersistentBackendReattach
+        && !requestedAidenResumeRedraw && firstPromptBackend
+        && aidenCodexResumeNeedsRedraw(renderer?.rawSnapshot({ preserveFormatting: true }) ?? '')) {
+        requestedAidenResumeRedraw = true;
+        firstPromptBackend.write('\x0c');
+        log('Requested one Aiden Codex resume redraw; startup input remains gated');
+      }
       log(`First prompt timeout — ${cliName()} still initializing; keeping input queued`);
       const remainingMs = Math.max(0, FIRST_PROMPT_HARD_TIMEOUT_MS - elapsedMs);
       if (remainingMs > 0) {

@@ -39,9 +39,12 @@
  *   - Non-adopt + send observed in window: suppress. The window is
  *     [turn.markTimeMs, nextBoundaryMs). Legacy markers only carry time,
  *     so any marker in the window still suppresses. Newer markers carry the
- *     normalized length of the explicit `botmux send` body. When the
- *     transcript final is available, only emit fallback if that final is
- *     materially longer than any single explicit send in the same window.
+ *     normalized length of the explicit `botmux send` body. A marker tagged
+ *     responseKind/replyCardResponseKind 'final' is an explicit final-answer
+ *     delivery, so it suppresses the fallback UNCONDITIONALLY (regardless of
+ *     length) — that comparison only ever runs for progress/kind-less sends.
+ *     When the transcript final is available, only emit fallback if that final
+ *     is materially longer than any single explicit send in the same window.
  *     This lets short progress updates surface a later substantive final
  *     answer, while same-size rewrites and short acknowledgements stay
  *     suppressed. Boundary handling intentionally also considers
@@ -348,9 +351,20 @@ export function shouldSuppressBridgeEmit(
   if (turn.markTimeMs === undefined) return false;
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
-  const markersInWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper
-    && (m.replyCardResponseKind === undefined || m.replyCardResponseKind === 'final'));
-  if (markersInWindow.some(m => m.replyCardResponseKind === 'final')) return true;
+  const inWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper);
+  // An explicit `botmux send --response-kind final` already delivered this
+  // turn's final answer to Lark. The unified-reply path also writes
+  // replyCardResponseKind='final'; the plain (non-unified) path writes only
+  // responseKind='final' (replyCardResponseKind is absent). Suppress the
+  // terminal-transcription fallback in both cases, otherwise the same answer
+  // is double-posted (e.g. Chinese answer sent, then an English summary).
+  // Managed-card progress/auxiliary markers are not final deliveries.
+  if (inWindow.some(m => m.responseKind === 'final'
+      && (m.replyCardResponseKind === undefined || m.replyCardResponseKind === 'final'))) {
+    return true;
+  }
+  const markersInWindow = inWindow.filter(m => m.replyCardResponseKind === undefined
+    || m.replyCardResponseKind === 'final');
   // A trailing sentinel line is the model's explicit "I have nothing more to
   // send" signal. Split the two prose+sentinel cases by whether the model
   // ALREADY sent this turn:

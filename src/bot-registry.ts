@@ -1681,6 +1681,17 @@ export interface BotConfig {
    * sessions are never suspended. See core/idle-worker-sweeper.ts.
    */
   maxLiveWorkers?: number;
+  /**
+   * Per-bot idle session time-to-live, in MINUTES. A live session whose screen
+   * status has stayed continuously `idle` for this long is suspended
+   * automatically (worker + CLI killed to reclaim memory; the next message
+   * cold-resumes from transcript), independently of the {@link maxLiveWorkers}
+   * count cap. Unset / 0 / non-positive = TTL disabled (the default — idle
+   * sessions are never timed out, only the count cap can suspend them).
+   * Positive integer only. Adopted sessions and non-resumable backends
+   * (pty/riff/mojo) are never TTL-suspended. See core/idle-worker-sweeper.ts.
+   */
+  idleSuspendMinutes?: number;
   /** Periodically @ the persisted Session owner while selected actionable
    * runtime states remain unchanged. Missing means disabled. */
   sessionOwnerReminder?: SessionOwnerReminderConfig;
@@ -3717,6 +3728,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       maxLiveWorkers: typeof entry.maxLiveWorkers === 'number'
         && Number.isInteger(entry.maxLiveWorkers) && entry.maxLiveWorkers > 0
         ? entry.maxLiveWorkers
+        : undefined,
+      // Positive integer minutes only; 0 / negative / fractional / absent →
+      // undefined (= idle TTL disabled).
+      idleSuspendMinutes: typeof entry.idleSuspendMinutes === 'number'
+        && Number.isInteger(entry.idleSuspendMinutes) && entry.idleSuspendMinutes > 0
+        ? entry.idleSuspendMinutes
         : undefined,
       sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
       quotaFallbackBot: normalizedQuotaFallback.config,

@@ -6,6 +6,13 @@ import type { WorkerConfig } from '../global-config.js';
 export const DEFAULT_MIN_AVAILABLE_MEMORY_BYTES = 4 * 1024 ** 3;
 export const DEFAULT_MIN_AVAILABLE_MEMORY_FRACTION = 0.25;
 export const DEFAULT_MAX_MEMORY_FULL_AVG10 = 20;
+/**
+ * Edge-of-rejection band for worker admission: when available memory is below
+ * the reserve by at most this fraction, the fork may reclaim idle workers and
+ * retry once instead of being rejected immediately. PSI pressure never qualifies
+ * for the marginal band (its avg10 window is ~10s, a 2s retry is meaningless).
+ */
+export const MARGINAL_AVAILABLE_MEMORY_MARGIN = 0.1;
 
 export type MemoryMetricSource = 'host' | 'cgroup-v2' | 'unavailable';
 
@@ -455,6 +462,28 @@ export function checkWorkerAdmission(
     }, config);
   }
   return evaluateWorkerAdmission(readHostMemoryPressure(options), config);
+}
+
+/**
+ * Admission tiers for a (possibly rejected) decision:
+ *  - `allowed`: proceed with the fork.
+ *  - `marginal`: rejected ONLY by the available-memory dimension and the
+ *    shortfall is within {@link MARGINAL_AVAILABLE_MEMORY_MARGIN} of the reserve;
+ *    the caller may reclaim idle workers, wait briefly and re-check once.
+ *  - `hard`: PSI pressure is active (its 10s window makes a 2s retry pointless),
+ *    the memory shortfall exceeds the marginal band, or the rejection cannot be
+ *    attributed to a recoverable memory shortfall — reject immediately.
+ */
+export type WorkerAdmissionTier = 'allowed' | 'marginal' | 'hard';
+
+export function tierWorkerAdmission(decision: WorkerAdmissionDecision): WorkerAdmissionTier {
+  if (decision.allowed) return 'allowed';
+  // PSI hit (alone or together with the memory dimension) is always hard.
+  if (evaluatePsiReason(decision.pressure, decision.policy).length > 0) return 'hard';
+  if (evaluateAvailableReason(decision.pressure, decision.policy).length === 0) return 'hard';
+  const available = decision.pressure.availableMemoryBytes ?? 0;
+  const marginalFloor = decision.policy.minAvailableMemoryBytes * (1 - MARGINAL_AVAILABLE_MEMORY_MARGIN);
+  return available >= marginalFloor ? 'marginal' : 'hard';
 }
 
 export function formatMemoryBytes(bytes: number): string {

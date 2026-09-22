@@ -267,6 +267,7 @@ import {
   snapshotCodexAppFinalSettlements,
   codexAppFinalSettlementCount,
   type WorkerSessionReplyOptions,
+  type ForkWorkerOptions,
   migrateMojoSessionIdentities,
   mojoLivePatchForSession,
   idleCardLabel,
@@ -18154,23 +18155,28 @@ function forkXpiSharedCwdTurn(
     onWorkerGenerationReserved: (workerGeneration: number) => void;
   },
   forkAdopt: typeof forkAdoptWorker = forkAdoptWorker,
-): boolean {
+): { accepted: boolean; marginalReclaim: boolean } {
   if (ds.adoptedFrom) {
-    return forkAdopt(ds, {
-      prompt: args.cliInput.content,
-      turnId: args.turnId,
-      atMostOnce: true,
-      trustedCaller: args.caller,
-      onWorkerGenerationReserved: args.onWorkerGenerationReserved,
-    }) === 'accepted';
+    return {
+      accepted: forkAdopt(ds, {
+        prompt: args.cliInput.content,
+        turnId: args.turnId,
+        atMostOnce: true,
+        trustedCaller: args.caller,
+        onWorkerGenerationReserved: args.onWorkerGenerationReserved,
+      }) === 'accepted',
+      marginalReclaim: false,
+    };
   }
-  return forkWorker(ds, args.cliInput, {
+  const admissionOpts: ForkWorkerOptions = {};
+  const accepted = forkWorker(ds, args.cliInput, {
     resume: args.resume,
     turnId: args.turnId,
     atMostOnce: true,
     trustedCaller: args.caller,
     onWorkerGenerationReserved: args.onWorkerGenerationReserved,
-  });
+  }, admissionOpts);
+  return { accepted, marginalReclaim: admissionOpts.marginalReclaimScheduled === true };
 }
 
 async function driveNextXpiSharedCwdTurn(
@@ -18279,7 +18285,7 @@ async function driveNextXpiSharedCwdTurn(
         trustedCaller: next.record.caller,
       });
     } else {
-      accepted = forkXpiSharedCwdTurn(ds, {
+      const forkOutcome = forkXpiSharedCwdTurn(ds, {
         cliInput: next.record.cliInput,
         resume: next.record.resume,
         turnId: next.record.turnId,
@@ -18299,6 +18305,7 @@ async function driveNextXpiSharedCwdTurn(
           }
         },
       }, dependencies.forkAdoptWorker);
+      accepted = forkOutcome.accepted;
     }
     if (!accepted || admission.kind !== 'acquired') {
       rollbackXpiSharedCwdAdmission(ds, admission, next.record.turnId);
@@ -18337,6 +18344,7 @@ async function driveNextXpiSharedCwdTurn(
 }
 
 export const __testOnly_driveNextXpiSharedCwdTurn = driveNextXpiSharedCwdTurn;
+export const __testOnly_forkReservedInitialSession = forkReservedInitialSession;
 
 /** Fork an ordinary opening turn and release its route reservation. There is
  * deliberately no await between the final buffered-input snapshot, fork, and
@@ -18369,6 +18377,7 @@ function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableB
     }
   }
   let accepted = false;
+  const admissionOpts: ForkWorkerOptions = {};
   try {
     accepted = forkWorker(ds, input, turnId ? {
       turnId,
@@ -18393,13 +18402,38 @@ function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableB
             },
           }
         : {}),
-    } : false);
+    } : false, admissionOpts);
   } catch (error) {
     if (turnId) rollbackXpiSharedCwdAdmission(ds, admission, turnId);
     throw error;
   }
-  if (!accepted || (ds.session.xpiSharedCwdAdmissionGroupId && !xpiAdmissionAcquired)) {
+  if (!accepted) {
     if (turnId) rollbackXpiSharedCwdAdmission(ds, admission, turnId);
+    return false;
+  }
+  if (ds.session.xpiSharedCwdAdmissionGroupId && !xpiAdmissionAcquired) {
+    if (turnId) rollbackXpiSharedCwdAdmission(ds, admission, turnId);
+    // Non-marginal synchronous refusal (hard block/retirement/freeze/transfer)
+    // has no asynchronous re-entry: keep the opening buffers so the existing
+    // retry paths can fork again, matching the pre-marginal behaviour.
+    if (!admissionOpts.marginalReclaimScheduled) return false;
+    // Marginal admission deferred the fork synchronously; the group slot is
+    // claimed only on the asynchronous re-entry. Persist the opening like the
+    // busy path so the leased queue still dispatches it if the reserved
+    // session is superseded during the reclaim wait.
+    if (turnId && trustedCaller) {
+      queueXpiSharedCwdTurn({
+        ds,
+        turnId,
+        caller: trustedCaller,
+        userPrompt,
+        cliInput: input,
+        resume: false,
+      });
+    }
+    ds.pendingTurnId = undefined;
+    ds.initialStartPending = false;
+    clearInitialStartBuffers(ds);
     return false;
   }
   rememberLastCliInput(ds, userPrompt, input);
@@ -19149,6 +19183,7 @@ async function dispatchApprovedCrossPrincipalSuggestion(
     inThread: record.messages[0]?.inThread,
   });
   let accepted = false;
+  let marginalReclaim = false;
   let admission: XpiSharedCwdTurnAdmission = { kind: 'unmanaged' };
   if (ds.worker && !ds.worker.killed) {
     admission = admitLiveXpiSharedCwdTurn({
@@ -19182,7 +19217,7 @@ async function dispatchApprovedCrossPrincipalSuggestion(
       await notifyApprovedCrossPrincipalDispatch(ds, record, 'queued');
       return true;
     }
-    accepted = forkXpiSharedCwdTurn(ds, {
+    const forkOutcome = forkXpiSharedCwdTurn(ds, {
       cliInput,
       resume: ds.hasHistory,
       turnId,
@@ -19203,12 +19238,44 @@ async function dispatchApprovedCrossPrincipalSuggestion(
         }
       },
     });
+    accepted = forkOutcome.accepted;
+    marginalReclaim = forkOutcome.marginalReclaim;
   }
-  if (!accepted || (ds.session.xpiSharedCwdAdmissionGroupId && admission.kind !== 'acquired')) {
+  if (!accepted) {
     rollbackXpiSharedCwdAdmission(ds, admission, turnId);
     await notifyApprovedCrossPrincipalDispatch(ds, record, 'retrying');
     scheduleCrossPrincipalOwnerWait(ds, Date.now() + 5_000);
     return false;
+  }
+  if (ds.session.xpiSharedCwdAdmissionGroupId && admission.kind !== 'acquired') {
+    if (!marginalReclaim) {
+      // A synchronous refusal other than marginal deferral (hard memory block,
+      // retirement fence, device freeze/transfer gate): no asynchronous
+      // re-entry will claim the slot, so keep the record and the owner-wait
+      // retry. Queueing here would park the turn in a journal no release event
+      // drives, and the hard-block notice already asks the owner to resend.
+      rollbackXpiSharedCwdAdmission(ds, admission, turnId);
+      await notifyApprovedCrossPrincipalDispatch(ds, record, 'retrying');
+      scheduleCrossPrincipalOwnerWait(ds, Date.now() + 5_000);
+      return false;
+    }
+    // Marginal memory admission accepted the fork synchronously but the group
+    // slot is only claimed on the asynchronous re-entry (the reclaim callback
+    // routes around this closure). Enqueue like the busy path so the leased
+    // queue performs the single dispatch; keeping the record for the owner wait
+    // would re-enter on a live worker and execute this non-om_ turn twice
+    // (worker-side turn dedupe does not cover `<recordId>:approved`).
+    queueXpiSharedCwdTurn({
+      ds,
+      turnId,
+      caller: record.owner,
+      userPrompt: prompt,
+      cliInput,
+      resume: ds.hasHistory,
+    });
+    removeCrossPrincipalRecord(ds, record.id);
+    await notifyApprovedCrossPrincipalDispatch(ds, record, 'queued');
+    return true;
   }
   setActiveInteractiveTurn(ds, turnId, record.owner, ownerTask);
   beginNewTurn(ds, ownerTask, turnId);
@@ -25871,16 +25938,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     liveSessionCapSweepPending = true;
     void (async () => {
       try {
-        const maxLiveWorkers = getBot(cfg.larkAppId).config.maxLiveWorkers;
+        const liveBotConfig = getBot(cfg.larkAppId).config;
+        const maxLiveWorkers = liveBotConfig.maxLiveWorkers;
+        const idleTtlMs = typeof liveBotConfig.idleSuspendMinutes === 'number'
+          && liveBotConfig.idleSuspendMinutes > 0
+          ? liveBotConfig.idleSuspendMinutes * 60_000
+          : undefined;
         const suspended = await sweepIdleWorkersAfterTurnDrain(
           cfg.larkAppId,
           activeSessions,
-          { maxLiveWorkers },
+          { maxLiveWorkers, idleTtlMs },
         );
         if (suspended.length > 0) {
+          const ttlCount = suspended.filter(entry => entry.reason === 'idle_ttl').length;
           logger.info(
-            `[idle-worker-sweeper] suspended ${suspended.length} session(s) over per-bot cap `
-            + `${maxLiveWorkers ?? DEFAULT_MAX_LIVE_WORKERS} source=${source}`,
+            `[idle-worker-sweeper] suspended ${suspended.length} session(s) `
+            + `[idle_ttl=${ttlCount}, live_worker_cap=${suspended.length - ttlCount}; `
+            + `cap-limit=${maxLiveWorkers ?? DEFAULT_MAX_LIVE_WORKERS}] source=${source}`,
           );
         }
       } catch (err) {

@@ -10458,3 +10458,63 @@ describe('group serial input configuration', () => {
     }
   });
 });
+
+describe('PUT /api/bot-idle-suspend-minutes — 空闲会话自动休眠 TTL', () => {
+  it('is null by default, persists a positive integer, rejects non-positive values, and clears on null', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-idle-ttl-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-idle-ttl-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'claude-code',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial.idleSuspendMinutes).toBeNull();
+
+      const set = await fetch(`${base}/api/bot-idle-suspend-minutes`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ idleSuspendMinutes: 30 }),
+      });
+      expect(set.status).toBe(200);
+      expect(await set.json()).toMatchObject({ ok: true, idleSuspendMinutes: 30 });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].idleSuspendMinutes).toBe(30);
+      expect(getBot(appId).config.idleSuspendMinutes).toBe(30);
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).idleSuspendMinutes).toBe(30);
+
+      for (const bad of [0, -1, 1.5, 'abc']) {
+        const rejected = await fetch(`${base}/api/bot-idle-suspend-minutes`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ idleSuspendMinutes: bad }),
+        });
+        expect(rejected.status).toBe(400);
+        expect(await rejected.json()).toMatchObject({ error: 'invalid_number' });
+      }
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].idleSuspendMinutes).toBe(30);
+
+      const clear = await fetch(`${base}/api/bot-idle-suspend-minutes`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ idleSuspendMinutes: null }),
+      });
+      expect(clear.status).toBe(200);
+      expect(await clear.json()).toMatchObject({ ok: true, idleSuspendMinutes: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].idleSuspendMinutes).toBeUndefined();
+      expect(getBot(appId).config.idleSuspendMinutes).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

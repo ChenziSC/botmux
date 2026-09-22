@@ -352,6 +352,14 @@ export interface DaemonSession {
   currentImageKey?: string;
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
+  /**
+   * Timestamp (ms) since which the session has CONTINUOUSLY been `idle`
+   * (stamped on the non-idle → idle edge, cleared on any other status). Drives
+   * the per-bot `idleSuspendMinutes` TTL. In-memory only, never persisted: a
+   * session restored after a daemon restart has no stamp and is not TTL-suspended
+   * until its next real idle edge.
+   */
+  idleSinceAt?: number;
   /** turnIds whose triggering Lark message explicitly @-mentioned this bot.
    *  Only positives are stored (absent === not mentioned), so the bounded FIFO
    *  (see recordTurnExplicitMention) is spent entirely on turns that can still

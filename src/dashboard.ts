@@ -7644,6 +7644,25 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/idle-suspend-minutes — proxy to that bot's daemon.
+    // Body `{ idleSuspendMinutes: number | null }` (null = clear → idle TTL
+    // disabled; a positive integer sets the minutes threshold).
+    let mBotIdleTtl: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotIdleTtl = url.pathname.match(/^\/api\/bots\/([^/]+)\/idle-suspend-minutes$/))) {
+      const appId = decodeURIComponent(mBotIdleTtl[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-idle-suspend-minutes`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // Native Feishu/Lark conversation labels (feed groups). These APIs are
     // user-token-only, so the frontend pins subsequent create/assign calls to
     // the same app whose OAuth token produced this list.

@@ -685,6 +685,30 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.maxLiveWorkers).toBeUndefined();
   });
 
+  it('idleSuspendMinutes is an immediate clearable number field that round-trips', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('idleSuspendMinutes')!;
+    expect(spec).toMatchObject({ kind: 'number', effect: 'immediate', clearable: true });
+
+    // Coerce layer: positive integers only (0/negative/fraction/garbage rejected).
+    expect(store.coerceConfigValue(spec, 30)).toEqual({ ok: true, value: 30 });
+    expect(store.coerceConfigValue(spec, '45')).toEqual({ ok: true, value: 45 });
+    expect(store.coerceConfigValue(spec, 0)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, -1)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, 1.5)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, 'abc')).toEqual({ ok: false, reason: 'invalid_number' });
+
+    const set = await store.applyConfigField('app_default', spec, 20);
+    expect(set).toMatchObject({ ok: true, effect: 'immediate' });
+    expect(readConfig().idleSuspendMinutes).toBe(20);
+    expect(registry.getBot('app_default').config.idleSuspendMinutes).toBe(20);
+
+    const clear = await store.applyConfigField('app_default', spec, null);
+    expect(clear.ok).toBe(true);
+    expect(readConfig().idleSuspendMinutes).toBeUndefined();
+    expect(registry.getBot('app_default').config.idleSuspendMinutes).toBeUndefined();
+  });
+
   it('cardActionAckTimeoutMs enforces its range and hot-updates the registered Bot', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('cardActionAckTimeoutMs')!;

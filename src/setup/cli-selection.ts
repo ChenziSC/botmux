@@ -24,6 +24,7 @@
 import { CLI_ID_CHOICES, CLI_OPTIONS } from './bot-config-editor.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { CliLaunchMode } from '../core/cli-launch-mode.js';
+import { CODEX_REASONING_EFFORTS } from '../services/codex-reasoning-effort.js';
 
 /** 一个用户可选项；wrapperCli 不为空时表示它以该前缀启动（如 `aiden x claude`）。 */
 export interface CliSelectOption {
@@ -380,7 +381,9 @@ export function stripWrapperUnsafeArgs(args: ReadonlyArray<string>): string[] {
   return out;
 }
 
-const AIDEN_CODEX_REASONING_CONFIG = /^model_reasoning_effort="(low|medium|high|xhigh)"$/;
+const AIDEN_CODEX_REASONING_CONFIG = new RegExp(
+  `^model_reasoning_effort="(${CODEX_REASONING_EFFORTS.join('|')})"$`,
+);
 
 /**
  * Aiden owns the Codex provider configuration and rejects passthrough `-c`.

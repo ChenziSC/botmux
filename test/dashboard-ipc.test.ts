@@ -1854,6 +1854,115 @@ describe('PUT /api/bot-card-prefs — Codex App clean history', () => {
   });
 });
 
+describe('PUT /api/bot-card-prefs — Codex browser bridge', () => {
+  it('persists the default-off toggle and rejects incompatible sandbox config', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-codex-browser-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-codex-browser-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex-app',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial.codexBrowser).toBe(false);
+
+      const on = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ codexBrowser: true }),
+      });
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, codexBrowser: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].codexBrowser).toBe(true);
+
+      const off = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ codexBrowser: false }),
+      });
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, codexBrowser: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].codexBrowser).toBeUndefined();
+
+      getBot(appId).config.sandbox = true;
+      const conflict = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ codexBrowser: true }),
+      });
+      expect(conflict.status).toBe(409);
+      expect(await conflict.json()).toMatchObject({ ok: false, error: 'codex_browser_config_conflict' });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects reverse sandbox/read-isolation conflicts and clears browser config when switching Agent', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-codex-browser-reverse-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-codex-browser-reverse-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex-app',
+        codexBrowser: { enabled: true, family: 'edge', pluginRoot: '/tmp/codex-browser-plugin' },
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const sandbox = await fetch(`${base}/api/bot-sandbox`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: true }),
+      });
+      expect(sandbox.status).toBe(409);
+      expect(await sandbox.json()).toMatchObject({ error: 'codex_browser_config_conflict' });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).not.toHaveProperty('sandbox');
+
+      const readIsolation = await sandboxStore.persistBotReadIsolation(appId, true);
+      expect(readIsolation).toEqual({ ok: false, reason: 'codex_browser_config_conflict' });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).not.toHaveProperty('readIsolation');
+
+      const switchAgent = await fetch(`${base}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'claude-code', model: '' }),
+      });
+      expect(switchAgent.status).toBe(200);
+      expect(await switchAgent.json()).toMatchObject({ codexBrowserCleared: true });
+      const persisted = JSON.parse(readFileSync(configPath, 'utf8'))[0];
+      expect(persisted.cliId).toBe('claude-code');
+      expect(persisted).not.toHaveProperty('codexBrowser');
+      expect(getBot(appId).config.codexBrowser).toBeUndefined();
+      expect(() => loadBotConfigs()).not.toThrow();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-card-prefs — two reply modes', () => {
   it('accepts default and unified modes and rejects the retired final-only option', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-reply-modes-'));
@@ -2455,59 +2564,6 @@ describe('PUT /api/bot-card-prefs — senderTag (<sender> 注入开关)', () => 
       // Back to default ⇒ the key is REMOVED rather than stored as true, so
       // bots.json stays free of redundant defaults.
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].senderTag).toBeUndefined();
-    } finally {
-      if (handle) await handle.close();
-      handle = null;
-      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
-      else process.env.BOTS_CONFIG = prevBotsConfig;
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-});
-
-describe('PUT /api/bot-card-prefs — thinkingCardToolResult (思考气泡工具输出开关)', () => {
-  it('defaults ON, persists only an explicit false, and clears the key when turned back on', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-thinking-tool-result-'));
-    const configPath = join(dir, 'bots.json');
-    const appId = 'test-thinking-tool-result-app';
-    const prevBotsConfig = process.env.BOTS_CONFIG;
-    try {
-      process.env.BOTS_CONFIG = configPath;
-      writeFileSync(configPath, JSON.stringify([{
-        larkAppId: appId,
-        larkAppSecret: 'secret',
-        cliId: 'claude-code',
-      }], null, 2));
-      loadBotConfigs().forEach((c: any) => registerBot(c));
-      setLarkAppId(appId);
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-      const base = `http://127.0.0.1:${handle.port}`;
-
-      // 缺省 = 开：没碰过的 bot 照旧附带工具输出。
-      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
-        .toMatchObject({ thinkingCardToolResult: true });
-
-      const off = await fetch(`${base}/api/bot-card-prefs`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ thinkingCardToolResult: false }),
-      });
-      expect(off.status).toBe(200);
-      expect(await off.json()).toMatchObject({ ok: true, thinkingCardToolResult: false });
-      // 只有非默认态落盘。
-      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({ thinkingCardToolResult: false });
-      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
-        .toMatchObject({ thinkingCardToolResult: false });
-
-      const on = await fetch(`${base}/api/bot-card-prefs`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ thinkingCardToolResult: true }),
-      });
-      expect(on.status).toBe(200);
-      expect(await on.json()).toMatchObject({ ok: true, thinkingCardToolResult: true });
-      // 回到默认 ⇒ 键被删除而不是存 true。
-      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].thinkingCardToolResult).toBeUndefined();
     } finally {
       if (handle) await handle.close();
       handle = null;
@@ -6662,6 +6718,38 @@ describe('PUT /api/bot-substitute-mode', () => {
 });
 
 describe('PUT /api/bot-agent', () => {
+  it('persists, reloads and clears Kimi K3 effort, rejecting unsupported levels', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-kimi-effort-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-kimi-effort';
+    const previous = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'kimi', model: 'kimi-code/k3-256k' }]));
+      loadBotConfigs().forEach(c => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const save = (reasoningEffort: string) => fetch(`${base}/api/bot-agent`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'kimi', model: 'kimi-code/k3-256k', reasoningEffort }),
+      });
+      const response = await save('max');
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ reasoningEffort: 'max' });
+      expect(loadBotConfigs()[0]?.reasoningEffort).toBe('max');
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ reasoningEffort: 'max' });
+      expect((await save('medium')).status).toBe(400);
+      expect(loadBotConfigs()[0]?.reasoningEffort).toBe('max');
+      expect((await save('')).status).toBe(200);
+      expect(loadBotConfigs()[0]?.reasoningEffort).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('rejects switching a sandboxed bot to Forge x TraeX', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-forge-sandbox-conflict-'));
     const configPath = join(dir, 'bots.json');

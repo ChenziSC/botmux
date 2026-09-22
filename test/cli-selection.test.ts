@@ -327,6 +327,19 @@ describe('rewriteAidenCodexArgs', () => {
     });
   });
 
+  it.each(['max', 'ultra'] as const)('preserves the %s reasoning level for the shim', (effort) => {
+    expect(rewriteAidenCodexArgs(['-c', `model_reasoning_effort="${effort}"`, '--model', 'm']))
+      .toEqual({ reasoningEffort: effort, forwardedArgs: ['--model', 'm'] });
+  });
+
+  it('removes the Aiden-incompatible config even when no shim is available', () => {
+    const out = buildWrappedLaunch('aiden x codex', [
+      '-c', 'model_reasoning_effort="ultra"', '--model', 'm',
+    ]);
+    expect(out.args).toEqual(['x', 'codex', '--model', 'm']);
+    expect(out.env).toBeUndefined();
+  });
+
   it('does not rewrite arbitrary user config values', () => {
     expect(rewriteAidenCodexArgs(['-c', 'model_provider="custom"']))
       .toEqual({ reasoningEffort: undefined, forwardedArgs: ['-c', 'model_provider="custom"'] });

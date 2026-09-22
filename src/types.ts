@@ -659,6 +659,8 @@ export interface Session {
    *  (rather than a fresh POST) after daemon restart. */
   /** Connector-owned lifecycle, scoped to the exact committed handoff. */
   handoffLiveCard?: { turnId: string; sequence: number; title?: string; closed?: boolean; resultMessageId?: string };
+  /** Exact trigger turns with hidden thinking, persisted for restore and late transcript events. */
+  hiddenThinkingTurns?: string[];
   streamCardId?: string;
   streamCardNonce?: string;
   /** Stable visible destination of the persisted live streaming card. */

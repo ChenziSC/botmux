@@ -5,6 +5,9 @@ import { larkTransportEnabled } from './types.js';
 // Presentation follows the exact committed input, not an HTTP enqueue result,
 // group chatter, model output, or the lifetime of a reused CLI session.
 const pending = new WeakMap<DaemonSession, Map<string, string>>();
+export function triggerThinkingHidden(ds: DaemonSession, turnId: string): boolean {
+  return ds.session.hiddenThinkingTurns?.includes(turnId) === true;
+}
 export function armTriggerStreamingCard(ds: DaemonSession, req: TriggerRequest, turnId: string): void {
   if (req.presentation?.liveCard !== 'on-start' || ds.scope !== 'chat'
     || ds.chatType !== 'group' || !larkTransportEnabled({ chatId: ds.chatId })) return;

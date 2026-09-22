@@ -71,6 +71,8 @@ describe('handoff live card starts with committed input', () => {
   });
   it('validates the connector-owned presentation option', () => {
     expect(validateTriggerRequest(request()).ok).toBe(true);
+    expect(validateTriggerRequest({ ...request(), presentation: { thinking: 'hidden' } }).ok).toBe(true);
+    expect(validateTriggerRequest({ ...request(), presentation: { thinking: true } }).ok).toBe(false);
     expect(validateTriggerRequest({ ...request(), presentation: { liveCard: true } }).ok).toBe(false);
   });
 });

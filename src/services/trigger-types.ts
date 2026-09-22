@@ -43,6 +43,8 @@ export interface TriggerRequest {
     /** Connector-owned handoff UI: replace the native live card only when this
      * exact input is committed by the worker. Never driven by group messages. */
     liveCard?: 'on-start';
+    /** Hide only this trigger's thinking bubble; business notices and HTTP results remain available. */
+    thinking?: 'hidden';
   };
   options?: {
     dryRun?: boolean;
@@ -276,6 +278,9 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
     }
     if (raw.presentation.liveCard !== undefined && raw.presentation.liveCard !== 'on-start') {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.liveCard must be on-start' } };
+    }
+    if (raw.presentation.thinking !== undefined && raw.presentation.thinking !== 'hidden') {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.thinking must be hidden' } };
     }
     const topicMessage = raw.presentation.topicMessage;
     if (topicMessage !== undefined && topicMessage !== null && typeof topicMessage !== 'string') {

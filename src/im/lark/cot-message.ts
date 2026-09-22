@@ -48,6 +48,7 @@ import { getBot, getBotClient } from '../../bot-registry.js';
 import { boundSubjectForTitle, subjectFromArgsString, type ToolSubject } from '../../services/cot-subject.js';
 import { fallbackTurnId, frozenReplyContextForTurn } from '../../core/reply-target.js';
 import { isSilentScheduledTurn } from '../../core/silent-schedule-turns.js';
+import { triggerThinkingHidden } from '../../core/trigger-streaming-card.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 import { localeForBot, t } from '../../i18n/index.js';
@@ -648,7 +649,7 @@ export function handleCotThinkingUpdate(
 ): boolean {
   // Thinking bubbles are outbound messages too. Keep silent fires quiet even
   // when /cot show is armed, without suppressing another turn in this session.
-  if (isSilentScheduledTurn(ds, msg.turnId)) return false;
+  if (isSilentScheduledTurn(ds, msg.turnId) || triggerThinkingHidden(ds, msg.turnId)) return false;
   if (!cotEnabled(ds)) return false;
   const key = turnKeyOf(msg);
   let state = states.get(ds);

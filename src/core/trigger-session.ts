@@ -777,6 +777,14 @@ async function triggerSessionTurnAdmitted(
   // steerable is what later allows a follow-up to steer INTO its turn (codex
   // requires both root and head positively authorized).
   const steerRequested = req.options?.steer === true;
+  const preparePresentation = (target: DaemonSession): void => {
+    armTriggerStreamingCard(target, req, triggerId);
+    if (req.presentation?.thinking !== 'hidden') return;
+    target.session.hiddenThinkingTurns = [
+      ...(target.session.hiddenThinkingTurns ?? []).filter(id => id !== triggerId), triggerId,
+    ].slice(-256);
+    sessionStore.updateSession(target.session);
+  };
   /** Payload shape for fork/send sites: content + the frozen steer flag. The
    *  follow-up content is already a CliTurnPayload on some paths. */
   const withSteer = (content: string | CliTurnPayload): string | CliTurnPayload =>
@@ -786,7 +794,7 @@ async function triggerSessionTurnAdmitted(
         ? { content, codexAppSteerable: true }
         : { ...content, codexAppSteerable: true };
   const prepareStableDispatch = (target: DaemonSession, willFork: boolean): number | undefined => {
-    armTriggerStreamingCard(target, req, triggerId);
+    preparePresentation(target);
     if (!stableTurnId || !internal?.beforeDispatch) return undefined;
     const currentWorkerGeneration = Math.max(
       target.workerGeneration ?? 0,
@@ -833,7 +841,7 @@ async function triggerSessionTurnAdmitted(
   // Card presentation also needs an exact worker turn id, independently of
   // final-output suppression. Otherwise a reused worker invents its own id and
   // its input-committed acknowledgement cannot consume the armed handoff card.
-  const loudTurnId = suppressLoudFinal || req.presentation?.liveCard === 'on-start'
+  const loudTurnId = suppressLoudFinal || req.presentation?.liveCard === 'on-start' || req.presentation?.thinking === 'hidden'
     ? triggerId : undefined;
   const armLoudFinalSuppression = (target: DaemonSession): void => {
     if (!suppressLoudFinal) return;
@@ -1837,7 +1845,7 @@ async function triggerSessionTurnAdmitted(
     // suppress a normal turn. The suppression is best-effort for this narrow race,
     // not a hard guarantee — consistent with the 256/TTL best-effort bound.
     if (loudTurnId) newDs.pendingTurnId = loudTurnId;
-    armTriggerStreamingCard(newDs, req, triggerId);
+    preparePresentation(newDs);
     armLoudFinalSuppression(newDs);
     const { runAutoWorktreeCommit } = await import('../im/lark/card-handler.js');
     void runAutoWorktreeCommit({
@@ -2176,7 +2184,7 @@ async function triggerSessionTurnAdmitted(
     releaseInitialReservation();
   }
   else if (loudTurnId) {
-    armTriggerStreamingCard(newDs, req, triggerId);
+    preparePresentation(newDs);
     armLoudFinalSuppression(newDs);
     forkWorker(newDs, promptInput, loudTurnId);
     releaseInitialReservation();

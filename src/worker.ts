@@ -313,6 +313,7 @@ import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { HerdrBackend, type HerdrWebTerminalCursor } from './adapters/backend/herdr-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { applyCodexInstanceEnv, codexInstanceIdentity } from './services/codex-instance-pool.js';
+import { prepareAidenCodexConfig } from './services/aiden-codex-config.js';
 import { withFileLockSync } from './utils/file-lock.js';
 import { TmuxPipeBackend } from './adapters/backend/tmux-pipe-backend.js';
 import { ZellijBackend, ZELLIJ_CONFIG_KDL } from './adapters/backend/zellij-backend.js';
@@ -14403,6 +14404,19 @@ async function spawnCli(
       process.env.CODEX_HOME = isolatedCodexHome;
     }
   }
+  // Aiden accepts CODEX_HOME but refuses -c model_reasoning_effort. Keep the
+  // frozen session effort in a private config and use the same home for native
+  // resume/submit discovery and the spawned CLI. Never edit the user's config.
+  const aidenCodexConfigHome = !sandboxRequested && cfg.cliId === 'codex'
+    && cfg.wrapperCli?.trim() === 'aiden x codex' && cfg.reasoningEffort
+    ? prepareAidenCodexConfig(
+        join(homedir(), '.codex'),
+        join(config.session.dataDir, 'sessions', cfg.sessionId),
+        cfg.reasoningEffort,
+      )
+    : undefined;
+  if (aidenCodexConfigHome) process.env.CODEX_HOME = aidenCodexConfigHome;
+
   // Predict reattach vs fresh BEFORE the resume pre-flight. On a persistent
   // backend (tmux/herdr/zellij/zmx) a daemon restart finds the CLI process still
   // alive in its pane, so the backend will `attach` to the live process and
@@ -15273,7 +15287,7 @@ async function spawnCli(
     turnTimeoutMs: cfg.turnTimeoutMs,
     // dsh runner only; other adapters ignore the field.
     dshProfile: cfg.dshProfile,
-    reasoningEffort: cfg.reasoningEffort,
+    reasoningEffort: aidenCodexConfigHome ? undefined : cfg.reasoningEffort,
     disableCliBypass: cfg.disableCliBypass === true,
     settingsEnv: perBotSettingsEnv,
     settingsFilePath: perBotSettingsFilePath,

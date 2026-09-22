@@ -109,6 +109,8 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 
 当前完整 `cliId` 以 [`src/adapters/cli/registry.ts`](https://github.com/deepcoldy/botmux/blob/master/src/adapters/cli/registry.ts) 为准；各 CLI 的配置与套 wrapper / 网关方法见 [多 CLI 适配器](https://deepcoldy.github.io/botmux/adapters)。
 
+`aiden x codex` 拒绝透传 `-c model_reasoning_effort=...`。为此，Botmux 将该组合的显式 `reasoningEffort` 写入当前会话的独立配置；保留原模型、认证、原生会话数据库和历史路径，不修改普通 Codex 的默认配置。该适配用于未启用文件沙盒的普通本地会话；全局配置显式选择了 `profile` 时会报告配置冲突，避免实际强度被 profile 覆盖。已有运行中的 CLI 不会热切思考强度，应以实际终端显示为准。
+
 ### 会话级 CLI 选择
 
 在会话尚未启动前，可以用 `/cli <cliId>` 为当前会话选择已注册的 CLI，例如：

@@ -1126,6 +1126,22 @@ export function buildStreamingCard(
     });
   }
   if (headerActions.length > 0) elements.push({ tag: 'action', actions: headerActions });
+  const effortControl = !adoptMode && usage?.reasoningControl;
+  if (effortControl && effortControl.choices.length > 0) {
+    elements.push({ tag: 'action', actions: [{
+      tag: 'select_static',
+      placeholder: { tag: 'plain_text', content: t('card.effort.select', undefined, locale) },
+      ...(effortControl.selected ? { initial_option: effortControl.selected } : {}),
+      options: effortControl.choices.map(effort => ({
+        text: { tag: 'plain_text', content: `${t('card.effort.select', undefined, locale)}: ${t(`card.effort.${effort}`, undefined, locale)}` },
+        value: effort,
+      })),
+      value: { action: 'set_reasoning_effort', ...actionBase, expected_effort: effortControl.selected ?? '' },
+    }] });
+    elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: t(
+      effortControl.pending ? 'card.effort.pending' : 'card.effort.scope', undefined, locale,
+    ) }] });
+  }
 
   // ── Writable terminal link (opt-in) ─────────────────────────────────────
   // When the bot enables `writableTerminalLinkInCard`, embed the token-bearing

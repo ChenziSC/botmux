@@ -82,6 +82,12 @@ async function runReport(options: {
   }), { mode: 0o600 });
   const requests: Array<{ url?: string; body: Record<string, unknown> }> = [];
   const server = createServer(async (req, res) => {
+    // The fork also probes session context over authenticated read-only routes.
+    if (req.method !== 'POST') {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'not_found' }));
+      return;
+    }
     let body = '';
     for await (const chunk of req) body += chunk;
     requests.push({ url: req.url, body: JSON.parse(body) });
@@ -160,7 +166,7 @@ describe('report CLI recipient root and authenticated relay', () => {
     expect(result.output.messageTarget).toEqual({ mode: 'thread', rootMessageId: THREAD });
     expect(result.output.recipient).toMatchObject({ source: 'recipient-root-chat-creator', sourceSessionId: 'source-chat' });
     expect(result.requests).toEqual([{ url: '/api/report-relay', body: {
-      sessionId: 'current-thread', dispatchRoot: THREAD, content: 'Ready for review',
+      sessionId: 'current-thread', dispatchRoot: THREAD, content: 'Ready for review', delivery: 'relay',
       originCapability: CAPABILITY, originTurnId: 'turn-report', originDispatchAttempt: 2,
     } }]);
   });

@@ -553,3 +553,23 @@ describe('visible handoff dispatch to a reused session', () => {
     expect(commitTriggerStreamingCard(ds, res.triggerId, vi.fn())).toBe(false);
   });
 });
+
+
+describe('recovery thinking presentation', () => {
+  it.each([true, false])('preserves async receipts and ordinary turns with live worker=%s', async live => {
+    const ds = existingDs({ worker: live ? { killed: false, send: vi.fn() } as any : null });
+    const active = activeWith(ds);
+    const req = followUpReq('hidden-recovery'); req.presentation = { thinking: 'hidden' };
+    const first = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(first.ok).toBe(true);
+    expect(ds.session.hiddenThinkingTurns).toEqual([first.triggerId]);
+    expect(ds.asyncTriggerResults?.has(first.triggerId!)).toBe(true);
+    const repeated = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(repeated.triggerId).toBe(first.triggerId);
+    expect(ds.session.hiddenThinkingTurns).toEqual([first.triggerId]);
+    const normal = await triggerSessionTurn(followUpReq('normal'), { larkAppId: APP, activeSessions: active });
+    expect(normal.ok).toBe(true);
+    expect(ds.session.hiddenThinkingTurns).not.toContain(normal.triggerId);
+    expect(ds.suppressedTriggerFinalTurns?.has(first.triggerId!)).not.toBe(true);
+  });
+});

@@ -163,6 +163,7 @@ export type BotDefaultsRow = {
   oncallGroup?: import('../../services/oncall-group-policy.js').OncallGroupPolicy | null;
   docSubscribeDefaultMode?: string;
   maxLiveWorkers?: number | null;
+  idleSuspendMinutes?: number | null;
   logicalSessionCount?: number;
   residentSessionCount?: number;
   dormantSessionCount?: number;

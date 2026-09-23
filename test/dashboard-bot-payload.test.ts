@@ -44,7 +44,7 @@ describe('dashboard bot payload helpers', () => {
       'grantDefaultDurationMs', 'messageQuotaDefaultLimit', 'p2pMode',
       'envelopeInjection', 'replyDelivery', 'replyDeliveryDefault', 'replyDeliverySupported', 'codexAuthSync', 'triggerUserAuth',
       'skillInjection', 'skillInjectionDefault', 'skillInjectionSupport',
-      'maxLiveWorkers', 'logicalSessionCount', 'residentSessionCount', 'dormantSessionCount',
+      'maxLiveWorkers', 'idleSuspendMinutes', 'logicalSessionCount', 'residentSessionCount', 'dormantSessionCount',
       'nativeSubagentRuntime',
       'sessionOwnerReminder',
       'startupCommands', 'customPassthroughCommands', 'canTalkDaemonCommands', 'launchShell', 'env',

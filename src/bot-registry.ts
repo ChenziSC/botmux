@@ -1683,6 +1683,17 @@ export interface BotConfig {
    * sessions are never suspended. See core/idle-worker-sweeper.ts.
    */
   maxLiveWorkers?: number;
+  /**
+   * Per-bot idle session time-to-live, in MINUTES. A live session whose screen
+   * status has stayed continuously `idle` for this long is suspended
+   * automatically (worker + CLI killed to reclaim memory; the next message
+   * cold-resumes from transcript), independently of the {@link maxLiveWorkers}
+   * count cap. Unset / 0 / non-positive = TTL disabled (the default — idle
+   * sessions are never timed out, only the count cap can suspend them).
+   * Positive integer only. Adopted sessions and non-resumable backends
+   * (pty/riff/mojo) are never TTL-suspended. See core/idle-worker-sweeper.ts.
+   */
+  idleSuspendMinutes?: number;
   /** Periodically @ the persisted Session owner while selected actionable
    * runtime states remain unchanged. Missing means disabled. */
   sessionOwnerReminder?: SessionOwnerReminderConfig;
@@ -1945,6 +1956,8 @@ export interface BotConfig {
    * `usageDisplay` set is read as `'off'` (see {@link resolveUsageDisplay}).
    */
   usageDisplay?: UsageDisplayMode;
+  /** Show per-turn waiting and native execution time on final reply cards. Default off. */
+  showReplyTiming?: boolean;
   tuiSlashAllow?: string[];
   /**
    * When true, suppress the live streaming session card entirely. The web
@@ -3721,6 +3734,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         && Number.isInteger(entry.maxLiveWorkers) && entry.maxLiveWorkers > 0
         ? entry.maxLiveWorkers
         : undefined,
+      // Positive integer minutes only; 0 / negative / fractional / absent →
+      // undefined (= idle TTL disabled).
+      idleSuspendMinutes: typeof entry.idleSuspendMinutes === 'number'
+        && Number.isInteger(entry.idleSuspendMinutes) && entry.idleSuspendMinutes > 0
+        ? entry.idleSuspendMinutes
+        : undefined,
       sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
       quotaFallbackBot: normalizedQuotaFallback.config,
       // Only explicit true persisted (undefined = off), same as restrictGrantCommands.
@@ -3787,6 +3806,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       usageDisplay: normalizeUsageDisplay(entry) === DEFAULT_USAGE_DISPLAY
         ? undefined
         : normalizeUsageDisplay(entry),
+      showReplyTiming: entry.showReplyTiming === true || undefined,
       // Retired final-only preference must not opt into an extra terminal card.
       disableStreamingCard: entry.disableStreamingCard === true || entry.replyCardMode === 'final-only' || undefined,
       replyCardMode: entry.replyCardMode === 'unified' || entry.replyCardMode === 'final-only' ? 'unified' : undefined,

@@ -181,6 +181,7 @@ import {
   wrapCommandInSessionScope,
 } from './core/session-scope.js';
 import {
+  deriveTerminalCardViewToken,
   deriveTerminalWriteToken,
   resolveTerminalAccessForRequest,
   safeTerminalTokenEqual,
@@ -194,6 +195,7 @@ import {
   verifyTerminalControlGrant,
   verifyTerminalViewForward,
 } from './core/terminal-control-grant.js';
+import { terminalStatusHtml } from './core/terminal-status-page.js';
 import { appendControlAudit, controlAuditRecord } from './dashboard/control-audit.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { buildPlatformDashboardLoginUrl } from './core/dashboard-url.js';
@@ -583,7 +585,7 @@ let remoteWsUrl: string | undefined;
 let remoteThreadId: string | undefined;
 let rpcDialogDismissTimer: ReturnType<typeof setTimeout> | null = null;
 let rpcEnginePidMarker: string | null = null;
-let readonlyContinuationRpcGeneration: string | undefined;
+let taskContinuationRpcGeneration: string | undefined;
 const piInitialPromptCleanupPaths: string[] = [];
 const piInitialPromptCleanupDirs: string[] = [];
 let piInitialPromptReadonlyRoots: string[] = [];
@@ -740,7 +742,7 @@ function stopCodexRpcEngine(): void {
   // a restart. That stale continuation must never republish the stopped engine.
   rpcEngagementFence.invalidate();
   const engine = codexRpcEngine;
-  readonlyContinuationRpcGeneration = undefined;
+  taskContinuationRpcGeneration = undefined;
   const ownedRpcTurns = new Set([
     ...rpcTurnsAwaitingActivation.keys(),
     ...rpcLifecycleFailClosedOwners.keys(),
@@ -1256,8 +1258,6 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
   let engine: CodexRpcEngine | undefined;
   let enginePidMarker: string | null = null;
   let freshDeliveryOwned = false;
-  const readonlyContinuationEnabled = cfg.cliId === 'traex'
-    && process.env.BOTMUX_READONLY_CONTINUATION_ENABLED?.trim().toLowerCase() === 'true';
   const assertRpcEngagementCurrent = (): void => {
     if (!rpcEngagementFence.isCurrent(engagementLease)) {
       throw new CliSpawnSupersededError();
@@ -1310,7 +1310,6 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       appServerConfig: cfg.cliId === 'traex'
         ? [traexNativeSubagentHookConfig(nativeSubagentRuntimeHookCommand())]
         : undefined,
-      readonlyContinuationHardened: readonlyContinuationEnabled,
       onRequestUserInput: cfg.cliId === 'traex'
         ? (params: unknown) => bridgeTraexUserInput(cfg, params)
         : undefined,
@@ -1349,6 +1348,10 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // Mark its pid before the first turn so `botmux send` resolves the current
     // per-turn identity instead of falling back to a stale/session-only env.
     enginePidMarker = registerRpcEnginePidMarker(engine.appServerPid);
+    // The opening turn can start executing tools before the remote viewer TUI
+    // exists. Publish the independently attested engine root immediately so
+    // current-actor remains available during that narrow startup window.
+    publishLocalProcessAttestation(undefined, engine.appServerPid);
     const threadId = wantResume ? await engine.resumeThread(cfg.cliSessionId!) : await engine.startThread();
     assertRpcEngagementCurrent();
     let outcome: EngageOutcome = wantResume ? 'resumed' : 'accepted';
@@ -1477,18 +1480,12 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       outcome = first.outcome; // accepted | ambiguous — both stay engaged, prompt never re-queued
     }
     codexRpcEngine = engine;
-    const capability = readonlyContinuationEnabled
-      ? await engine.checkReadonlyContinuationCapabilities()
-      : { ok: false, reason: 'readonly_continuation_disabled' };
-    readonlyContinuationRpcGeneration = capability.ok
-      ? randomBytes(16).toString('hex')
-      : undefined;
+    taskContinuationRpcGeneration = randomBytes(16).toString('hex');
     send({
-      type: 'readonly_continuation_rpc_status',
+      type: 'task_continuation_rpc_status',
       sessionId: cfg.sessionId,
-      rpcGeneration: readonlyContinuationRpcGeneration ?? 'unavailable',
-      eligible: capability.ok,
-      ...(capability.reason ? { reason: capability.reason } : {}),
+      rpcGeneration: taskContinuationRpcGeneration,
+      eligible: cfg.cliId === 'traex',
     });
     remoteWsUrl = engine.wsUrl;
     remoteThreadId = threadId;
@@ -2124,15 +2121,14 @@ const readOnlyRemoteScrollLimiter = new ReadOnlyRemoteScrollLimiter({
 // daemon restart re-forks every worker — a per-process random token would 403
 // every previously-issued operate link).
 let writeToken = randomBytes(16).toString('hex');
-// Per-BOOT random read capability, reported to the daemon in `ready` and
-// embedded in Feishu card 「打开 Web 终端」 links. Deliberately NOT the stable
-// per-session HMAC any more (P1-5): a stable view token could never be revoked
-// — a viewer who fetched it once kept terminal read access forever, across
-// worker restarts included. Per-boot randomness bounds every card link to this
-// worker generation (restart ⇒ all previously issued view tokens die), and the
-// dashboard view-link API mints its own short-lived signed read grants instead
-// of ever handing this value out (see resolveTerminalAccessForReq).
+// Per-BOOT random read capability used to pin dashboard-minted grants to this
+// exact worker generation. It is deliberately separate from the revocable
+// session-lifecycle card capability below.
 let viewToken = randomBytes(32).toString('base64url');
+// Lark cards outlive worker processes. Keep their read capability stable only
+// within this logical Session lifecycle; the daemon persists/rotates the epoch.
+// Dashboard-minted grants remain pinned to the per-boot viewToken above.
+let cardViewToken = viewToken;
 
 // Active dashboard token, persisted by the dashboard process at this stable
 // path (mirrors dashboard.ts TOKEN_PATH). The platform proxy injects it as the
@@ -2148,6 +2144,13 @@ const DASHBOARD_SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 function refreshTerminalWriteToken(): void {
   const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
   if (secret && sessionId) writeToken = deriveTerminalWriteToken(secret, sessionId);
+}
+
+function refreshTerminalCardViewToken(epoch: string | undefined): void {
+  const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
+  cardViewToken = secret && sessionId && epoch
+    ? deriveTerminalCardViewToken(secret, sessionId, epoch)
+    : viewToken;
 }
 
 /**
@@ -2196,9 +2199,11 @@ function resolveTerminalAccessForReq(req: IncomingMessage, url: URL): WorkerTerm
   if (safeTerminalTokenEqual(url.searchParams.get('token'), writeToken)) {
     return { hasRead: true, hasWrite: true, platformReadonly: false };
   }
-  // `?viewToken=` read capability, two accepted forms (P1-5):
-  //   • this worker's per-boot random token (Feishu card links) — plain
-  //     equality; dies with the worker generation;
+  // `?viewToken=` read capability, three accepted forms (P1-5):
+  //   • this worker's per-boot random token — plain equality; dies with the
+  //     worker generation and anchors dashboard-minted grants;
+  //   • the epoch-bound Lark-card token — survives worker replacement within
+  //     one logical Session lifecycle;
   //   • a short-lived signed read grant minted by the dashboard view-link API.
   // The retired stable per-session HMAC matches neither form, so every
   // previously issued stable view token fails closed on this worker.
@@ -2219,7 +2224,8 @@ function resolveTerminalAccessForReq(req: IncomingMessage, url: URL): WorkerTerm
   //      though `.dashboard-secret` is unchanged.
   // The WebSocket is additionally closed at the grant's expiresAt.
   const viewParam = url.searchParams.get('viewToken');
-  let viewTokenMatches = safeTerminalTokenEqual(viewParam, viewToken);
+  let viewTokenMatches = safeTerminalTokenEqual(viewParam, viewToken)
+    || safeTerminalTokenEqual(viewParam, cardViewToken);
   let viewGrantUser: string | undefined;
   let viewGrantExpiresAt: number | undefined;
   if (!viewTokenMatches && looksLikeTerminalControlGrant(viewParam) && sessionId) {
@@ -2304,7 +2310,7 @@ let closeRequested = false;
 let capturedSpawnCommand: string | null = null;
 let deferredTopicOutputTail = '';
 const reportedDeferredTopicRoots = new Set<string>();
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', opencode2: 'OpenCode 2', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', ebsd: 'ebsd', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro', riff: 'Riff', reasonix: 'Reasonix', dsh: 'DeepSeek Harness', 'dsh-tui': 'DeepSeek Harness TUI', mojo: 'Mojo', minimax: 'MiniMax' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', opencode2: 'OpenCode 2', mimocode: 'MiMoCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', ebsd: 'ebsd', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro', riff: 'Riff', reasonix: 'Reasonix', dsh: 'DeepSeek Harness', 'dsh-tui': 'DeepSeek Harness TUI', mojo: 'Mojo', minimax: 'MiniMax' };
 function cliName(): string {
   return (lastInitConfig?.cliRuntime?.source === 'configured'
     ? (lastInitConfig.cliRuntime.displayName?.trim() || lastInitConfig.cliRuntime.id)
@@ -3400,10 +3406,6 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
       ...(capability.turnId ? { turnId: capability.turnId } : {}),
       ...(capability.dispatchAttempt !== undefined
         ? { dispatchAttempt: capability.dispatchAttempt }
-        : {}),
-      ...(currentBotmuxTurnId?.startsWith('bmx-readonly-')
-        && currentBotmuxDispatchAttempt !== undefined
-        ? { readonlyContinuation: true as const }
         : {}),
     });
   }
@@ -9831,10 +9833,11 @@ async function driveCocoPicker(navKeys: string[], needsReviewSubmit: boolean, co
 // ─── Trust Dialog Detection ──────────────────────────────────────────────────
 
 // Claude Code: "Yes, I trust this folder"
-// Codex:       "› 1. Yes, continue  2. No, quit" (ANSI cursor codes strip spaces from
-//               longer phrases like "Do you trust…", but "Yes, continue" survives intact
-//               in a single PTY chunk)
-const TRUST_DIALOG_PATTERN = /Yes, I trust this folder|Yes, continue/;
+// Codex:       older versions used "› 1. Yes, continue"; 0.155+ uses
+//               "› 1. Trust and continue". ANSI cursor codes strip spaces from
+//               longer phrases like "Do you trust…", but the option label survives
+//               intact in a single PTY chunk.
+const TRUST_DIALOG_PATTERN = /Yes, I trust this folder|Yes, continue|Trust and continue/;
 let trustHandled = false;
 const codexUpdateDialogGuard = new CodexUpdateDialogGuard();
 const AIDEN_CODEX_UPDATE_RETRY_MS = 1_000;
@@ -12464,47 +12467,34 @@ async function flushPending(): Promise<void> {
       let rpcTurnIdentity: CodexRpcTurnIdentity | undefined;
       let rpcTurnGeneration: RpcTurnGeneration | undefined;
       try {
-        if (item.readonlyContinuation && !writeRpcEngine) {
+        if (item.taskContinuation && !writeRpcEngine) {
           emitTurnTerminal(
-            item.turnId ?? 'readonly-continuation-unknown',
+            item.turnId ?? 'task-continuation-unknown',
             'failed',
-            'readonly_continuation_rpc_unavailable',
+            'continuation_rpc_unavailable',
             item.dispatchAttempt,
           );
           break;
         }
         if (writeRpcEngine) {
-          if (item.readonlyContinuation) {
-            const exactRestrictedInput = item.turnId?.startsWith('bmx-readonly-')
-              && item.dispatchAttempt !== undefined
-              && item.readonlyContinuation.rpcGeneration === readonlyContinuationRpcGeneration;
-            if (!exactRestrictedInput) {
-              emitTurnTerminal(
-                item.turnId ?? 'readonly-continuation-unknown',
-                'failed',
-                'readonly_continuation_rpc_proof_mismatch',
-                item.dispatchAttempt,
-              );
-              break;
-            }
-            const capability = await writeRpcEngine.checkReadonlyContinuationCapabilities();
-            if (!capability.ok) {
-              readonlyContinuationRpcGeneration = undefined;
-              emitTurnTerminal(
-                item.turnId!,
-                'failed',
-                capability.reason ?? 'readonly_continuation_capability_probe_failed',
-                item.dispatchAttempt,
-              );
-              break;
-            }
+          if (item.taskContinuation
+            && (item.turnId?.startsWith('bmx-continuation-') !== true
+              || item.dispatchAttempt === undefined
+              || item.taskContinuation.rpcGeneration !== taskContinuationRpcGeneration
+              || item.taskContinuation.authorizationMode !== 'inherited')) {
+            emitTurnTerminal(
+              item.turnId ?? 'task-continuation-unknown',
+              'failed',
+              'continuation_authority_mismatch',
+              item.dispatchAttempt,
+            );
+            break;
           }
           rpcTurnIdentity = {
             turnId: item.turnId ?? `codex-rpc-${randomBytes(8).toString('hex')}`,
             ...(item.dispatchAttempt !== undefined
               ? { dispatchAttempt: item.dispatchAttempt }
               : {}),
-            ...(item.readonlyContinuation ? { readonlyContinuation: true } : {}),
           };
           rpcTurnGeneration = {
             engine: writeRpcEngine,
@@ -12913,7 +12903,7 @@ async function flushPending(): Promise<void> {
       // adjacent IM turns wait for separate idle edges so neither can be
       // HOL-dropped or steered into the other.
       if (rpcLifecycleFailClosedOwners.size > 0) break;
-      if (item.readonlyContinuation) break;
+      if (item.taskContinuation) break;
       if (item.trustedCaller && lastInitConfig?.cliId === 'codex') break;
       // A type-ahead adapter may accept several queued submits in one flush.
       // Keep that optimization only within one authenticated principal: a
@@ -12983,7 +12973,7 @@ function sendToPty(
      *  path's `atMostOnce → noReplay` for a keyed follow-up delivered to a LIVE
      *  worker via `type: 'message'` (codex #776 round-8; turn-level PR #71). */
     atMostOnce?: true;
-    readonlyContinuation?: import('./types.js').ReadonlyContinuationDispatchMarker;
+    taskContinuation?: import('./types.js').TaskContinuationDispatchMarker;
   } = {},
 ): boolean {
   const next: PendingCliInput = {
@@ -13002,7 +12992,7 @@ function sendToPty(
     ...(opts.trustedController ? { trustedController: opts.trustedController } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
     ...(opts.atMostOnce ? { noReplay: true } : {}),
-    ...(opts.readonlyContinuation ? { readonlyContinuation: opts.readonlyContinuation } : {}),
+    ...(opts.taskContinuation ? { taskContinuation: opts.taskContinuation } : {}),
     ...(opts.vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin: opts.vcMeetingImTurnOrigin }
       : {}),
@@ -18214,11 +18204,13 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       }
       const { hasRead, hasWrite, platformReadonly } = resolveTerminalAccessForReq(req, url);
       if (!hasRead) {
+        const body = terminalStatusHtml('forbidden');
         res.writeHead(403, {
-          'Content-Type': 'text/plain; charset=utf-8',
+          'Content-Type': 'text/html; charset=utf-8',
           'Cache-Control': 'no-store',
+          'Referrer-Policy': 'no-referrer',
         });
-        res.end('Forbidden');
+        res.end(body);
         return;
       }
       // #933 回归修复：平台注入的 Cookie/Role 会被中央前门剥掉（P1-6 / 内部 grant），
@@ -20193,9 +20185,20 @@ function emitTurnTerminal(
 }
 
 function workerIpcPayload(msg: WorkerToDaemon): WorkerToDaemon {
-  return msg.type === 'final_output' && sessionId
-    ? { ...msg, sessionId }
-    : msg;
+  if (msg.type !== 'final_output') return msg;
+  // Signed Codex finals already freeze the native completion instant. Other
+  // bridges sample their exact turn before emitTurnTerminal consumes the clock.
+  const timing = msg.codexAppSettlement
+    ?? turnExecutionClock.peek(msg.turnId, msg.dispatchAttempt);
+  const durationMs = timing?.durationMs;
+  const executionStartedAtMs = durationMs !== undefined && timing?.completedAtMs !== undefined
+    ? timing.completedAtMs - durationMs : undefined;
+  return {
+    ...msg,
+    ...(sessionId ? { sessionId } : {}),
+    ...(durationMs !== undefined ? { durationMs } : {}),
+    ...(executionStartedAtMs !== undefined ? { executionStartedAtMs } : {}),
+  };
 }
 
 function send(msg: WorkerToDaemon): void {
@@ -20249,14 +20252,20 @@ function rejectOrdinaryImTurn(
   });
 }
 
-function publishLocalProcessAttestation(cliPid?: number): void {
+function publishLocalProcessAttestation(
+  cliPid?: number,
+  enginePid = codexRpcEngine?.appServerPid,
+): void {
   const cliProcStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
+  const engineProcStart = enginePid ? readProcessStartIdentity(enginePid) : undefined;
   send({
     type: 'local_process_attestation',
     backendType: effectiveBackendType,
     credentialIsolated: currentCliCredentialIsolated,
     ...(cliPid ? { cliPid } : {}),
     ...(cliProcStart ? { cliProcStart } : {}),
+    ...(enginePid ? { enginePid } : {}),
+    ...(engineProcStart ? { engineProcStart } : {}),
   });
   // IPC preserves order: the daemon records this exact CLI pid/generation
   // before it snapshots the current turn's pre-existing descendants. This is
@@ -20424,9 +20433,10 @@ process.on('message', async (raw: unknown) => {
       initialInputOwnershipPending = !!msg.prompt;
       activeRestartAttemptId = msg.restartAttemptId;
       sessionId = msg.sessionId;
-      // The view token intentionally stays per-boot random (no refresh): a
-      // worker restart must invalidate every previously issued read link.
+      // Dashboard grants stay per-boot, while the Lark-card capability is
+      // revocable at the logical Session lifecycle boundary.
       refreshTerminalWriteToken();
+      refreshTerminalCardViewToken(msg.terminalCardEpoch);
       applySessionOwnerEnv(process.env, msg.ownerOpenId);
       // Pin this worker's i18n locale early so every t() call below resolves
       // against the bot's chosen language without each callsite needing to
@@ -20813,6 +20823,7 @@ process.on('message', async (raw: unknown) => {
           port,
           token: writeToken,
           viewToken,
+          cardViewToken,
           ...(capturedSpawnCommand ? { spawnCommand: capturedSpawnCommand } : {}),
           // A fast initial turn can complete via `botmux send` before Herdr
           // reports idle and this ready IPC is emitted. Tell the daemon not to
@@ -21018,7 +21029,7 @@ process.on('message', async (raw: unknown) => {
           trustedController: msg.trustedController,
           // Applied when THIS item is written, not on receipt.
           ...(msg.mojoLivePatch ? { mojoLivePatch: msg.mojoLivePatch } : {}),
-          ...(msg.readonlyContinuation ? { readonlyContinuation: msg.readonlyContinuation } : {}),
+          ...(msg.taskContinuation ? { taskContinuation: msg.taskContinuation } : {}),
           ...(postSubmitNativeSessionTitle ? { nativeSessionTitle: postSubmitNativeSessionTitle } : {}),
           ...(msg.nativeSessionTitlePrompt ? { nativeSessionTitlePrompt: msg.nativeSessionTitlePrompt } : {}),
         });

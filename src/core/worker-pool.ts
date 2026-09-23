@@ -1,4 +1,7 @@
+import { withHandoffPreview, handoffNeedsAttachment } from './handoff-preview.js';
+import { automaticStatusCardHidden, commitTurnStatusPolicy, rejectTurnStatusPolicy, currentTurnStatusPolicy, statusCardTitle, captureStatusCardFence } from './turn-status-policy.js';
 import { assertSendTopicsAvailable } from '../cli/topic-send-guard.js';
+import { recordManagedAskTerminal, advanceManagedAskPresentation } from './ask-broker.js';
 import { getMessageDetail as getTopicMessageDetail } from '../im/lark/client.js';
 import { handoffCardClosed, applyHandoffCardEvent, type HandoffCardEvent } from './handoff-card-lifecycle.js';
 import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTriggerStreamingCard } from './trigger-streaming-card.js';
@@ -40,7 +43,7 @@ import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self
 import { resolveSessionLaunchModel, resolveSessionGroupSettings } from './session-model.js';
 import { effectiveReplyDelivery } from './reply-delivery.js';
 import { resolveSessionReplyTarget, fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
-import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
+import { updateMessage, deleteMessage, uploadFile, replyMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName, type IdleCardLabel } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
@@ -1035,7 +1038,7 @@ export function isDisposableCommandScratch(ds: DaemonSession): boolean {
 // takes effect without a daemon restart. The `/card` command can override it
 // per-session via `ds.streamingCardForced` (manually summon a live card).
 function streamingCardDisabled(ds: DaemonSession, turnId?: string): boolean {
-  if (isDocNativeSession(ds) || handoffCardClosed(ds, turnId)) return true;
+  if (isDocNativeSession(ds) || handoffCardClosed(ds, turnId) || automaticStatusCardHidden(ds, turnId)) return true;
   if (ds.streamingCardForced) return false;
   try {
     const cfg = getBot(ds.larkAppId).config;
@@ -1116,7 +1119,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     ds.session.sessionId,
     sessionAnchorId(ds),
     readableTerminalUrlFor(ds),
-    ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
+    statusCardTitle(ds, sessionCliDisplayName(ds, botCfg)),
     ds.lastScreenContent ?? '',
     status,
     effectiveCliId,
@@ -1172,7 +1175,7 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): void {
     ds.session.sessionId,
     sessionAnchorId(ds),
     readableTerminalUrlFor(ds),
-    ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
+    statusCardTitle(ds, sessionCliDisplayName(ds, botCfg)),
     ds.lastScreenContent ?? '',
     status,
     effectiveCliId,
@@ -1216,6 +1219,7 @@ export function silentIdleCardFlag(ds: DaemonSession): boolean {
  *  卡头照旧「等待输入」。两个 turnId 在每个新轮次入口一起清理，正常不会同时
  *  存在；万一同时存在，「已完成」更贴近事实（回复确实发出去了）。 */
 export function idleCardLabel(ds: DaemonSession): IdleCardLabel | undefined {
+  if (currentTurnStatusPolicy(ds)) return 'processing';
   if (ds.failedIdleTurnId) return 'failed';
   if (ds.completedIdleTurnId) return 'completed';
   if (ds.silentIdleTurnId) return 'silent';
@@ -1376,7 +1380,7 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     // URL would render a fake `:undefined`/backend-less link. Mirror every other
     // card path — empty string when there is no real terminal.
     readableTerminalUrlFor(ds),
-    ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
+    statusCardTitle(ds, sessionCliDisplayName(ds, botCfg)),
     ds.lastScreenContent ?? '',
     ds.lastScreenStatus ?? 'working',
     effectiveCliId,
@@ -1466,7 +1470,7 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     ds.session.sessionId,
     sessionAnchorId(ds),
     buildTerminalUrl(ds),
-    ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
+    statusCardTitle(ds, sessionCliDisplayName(ds, botCfg)),
     ds.lastScreenContent ?? '',
     status,
     effectiveCliId,
@@ -3138,6 +3142,7 @@ export type StreamingCardPublicationFence = {
   /** The live id expected while this POST is in flight. For resume reposts this
    * is the prior card id: it must remain current until the fresh card commits. */
   expectedPriorCardId: string | undefined;
+  statusFence?: () => boolean;
 };
 
 /** Positive commit fence for a card whose POST has returned. This deliberately
@@ -3148,6 +3153,7 @@ export function canCommitStreamingCardPublication(
   ds: DaemonSession,
   fence: StreamingCardPublicationFence,
 ): boolean {
+  if (automaticStatusCardHidden(ds) || (fence.statusFence && !fence.statusFence())) return false;
   if (ds.session !== fence.session || ds.session.status !== 'active') return false;
   if (ds.larkAppId !== fence.larkAppId || sessionAnchorId(ds) !== fence.anchorId) return false;
   if (ds.streamCardId !== fence.expectedPriorCardId || isSessionTransferring(ds)) return false;
@@ -3796,7 +3802,7 @@ function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefin
     ds.session.sessionId,
     sessionAnchorId(ds),
     readableTerminalUrlFor(ds),
-    ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
+    statusCardTitle(ds, sessionCliDisplayName(ds, botCfg)),
     ds.lastScreenContent ?? '',
     status,
     effectiveCliId,
@@ -3860,7 +3866,7 @@ export async function postTurnStartingCard(
   if (!ds.streamCardPending || ds.streamCardPendingTurnId !== turnId) return false;
   if (remoteRetirementAdmissionPhase(ds)) return false;
   let replyPost: Promise<boolean> = Promise.resolve(false);
-  if (replyCardModeFor(ds, turnId) !== 'legacy') {
+  if (!currentTurnStatusPolicy(ds, turnId)?.context && !automaticStatusCardHidden(ds, turnId) && replyCardModeFor(ds, turnId) !== 'legacy') {
     // Reserve the turn before the CLI can call `botmux send`. Its reply uses
     // the same durable record even while the first card POST is in flight.
     replyPost = updateTurnReplyCard(ds, turnId, { kind: 'refresh' },
@@ -3888,6 +3894,7 @@ async function postTurnStartingStatusCard(
   if (!workerHasInitialized(ds)) return false;
   if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return false;
 
+  const statusFence = captureStatusCardFence(ds, turnId);
   const generation = ds.streamCardTurnGeneration ?? 0;
   const sessionAtPost = ds.session;
   const larkAppIdAtPost = ds.larkAppId;
@@ -3910,7 +3917,7 @@ async function postTurnStartingStatusCard(
     ds.session.sessionId,
     sessionAnchorId(ds),
     readableTerminalUrlFor(ds),
-    ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
+    statusCardTitle(ds, sessionCliDisplayName(ds, botCfg)),
     '',
     status,
     effectiveCliId,
@@ -3943,9 +3950,9 @@ async function postTurnStartingStatusCard(
     && ds.streamCardNonce === nonce
     && activeSessionsRegistry?.get(registryKeyAtPost) === ds;
   const stillOwnsPost = (): boolean =>
-    ownsPostIdentity() && remoteRetirementAdmissionPhase(ds) === null && !handoffCardClosed(ds, turnId);
+    ownsPostIdentity() && statusFence() && remoteRetirementAdmissionPhase(ds) === null && !handoffCardClosed(ds, turnId);
   const restorePrePostIdentityForRetirement = (): boolean => {
-    if (remoteRetirementAdmissionPhase(ds) === null || !ownsPostIdentity()) return false;
+    if ((remoteRetirementAdmissionPhase(ds) === null && statusFence()) || !ownsPostIdentity()) return false;
     ds.streamCardId = previousCardId;
     ds.streamCardNonce = previousNonce;
     ds.streamCardReplyTargetKey = previousReplyTargetKey;
@@ -3954,7 +3961,7 @@ async function postTurnStartingStatusCard(
   };
   try {
     const messageId = await sessionReply(
-      anchorAtPost, cardJson, 'interactive', larkAppIdAtPost, cardReplyTarget.turnId,
+      anchorAtPost, withHandoffPreview(cardJson, currentTurnStatusPolicy(ds, turnId)?.handoffPreview), 'interactive', larkAppIdAtPost, cardReplyTarget.turnId,
     );
     if (!stillOwnsPost()) {
       void deleteMessage(larkAppIdAtPost, messageId).catch(() => { /* best-effort stale-card cleanup */ });
@@ -3972,6 +3979,7 @@ async function postTurnStartingStatusCard(
     }
     const predecessorIds = snapshotStreamingCardPredecessorIds(ds, messageId);
     persistStreamCardState(ds);
+    void publishHandoffAttachment(ds, turnId, messageId);
     recallFrozenCards(ds);
     flushPendingLocalCliOpenReadinessPatch(ds);
     flushPendingRiffUrlPatch(ds);
@@ -4026,7 +4034,7 @@ export async function postFreshStreamingCard(
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = sessionCliId(ds, botCfg);
   const readUrl = readableTerminalUrlFor(ds);
-  const title = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);
+  const title = statusCardTitle(ds, sessionCliDisplayName(ds, botCfg));
   const status = ds.lastScreenStatus ?? 'idle';
 
   // Park the current card (no-op when there's none) so the fresh one replaces
@@ -4178,7 +4186,7 @@ export async function postPrivateSnapshotCard(
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = sessionCliId(ds, botCfg);
   const readUrl = readableTerminalUrlFor(ds);
-  const title = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);
+  const title = statusCardTitle(ds, sessionCliDisplayName(ds, botCfg));
   const status = ds.lastScreenStatus ?? 'idle';
   const cardJson = buildPrivateSnapshotCard(
     readUrl, title, status, effectiveCliId, ds.currentImageKey, ds.lastScreenContent ?? '',
@@ -4495,6 +4503,34 @@ export async function deliverEphemeralOrReply(
  * any previously queued value — only the latest state matters). Returns
  * whether the PATCH was accepted for immediate or queued delivery.
  */
+const handoffAttachmentInFlight = new WeakMap<DaemonSession, Set<string>>();
+async function publishHandoffAttachment(ds: DaemonSession, turnId: string, messageId: string): Promise<void> {
+  const policy = currentTurnStatusPolicy(ds, turnId);
+  const preview = policy?.handoffPreview;
+  if (!preview || preview.overflowMessageId || !handoffNeedsAttachment(preview)) return;
+  const active = handoffAttachmentInFlight.get(ds) ?? new Set<string>();
+  if (active.has(turnId)) return;
+  active.add(turnId); handoffAttachmentInFlight.set(ds, active);
+  const fence = captureStatusCardFence(ds, turnId);
+  try {
+    const directory = join(config.session.dataDir, 'handoff-previews');
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const file = join(directory, `${preview.displayHash}.md`);
+    atomicWriteFileSync(file, preview.text, { mode: 0o600, durable: true, followTargetSymlink: false });
+    const fileKey = await uploadFile(ds.larkAppId, file);
+    if (!fence()) return;
+    const uuid = 'handoff_' + createHash('sha256').update(`${ds.session.sessionId}\0${turnId}\0${preview.displayHash}`).digest('hex').slice(0, 40);
+    const attachment = await replyMessage(ds.larkAppId, messageId, JSON.stringify({ file_key: fileKey }), 'file', true, uuid);
+    if (currentTurnStatusPolicy(ds, turnId)?.handoffPreview?.displayHash !== preview.displayHash) return;
+    currentTurnStatusPolicy(ds, turnId)!.handoffPreview!.overflowMessageId = attachment;
+    sessionStore.updateSession(ds.session);
+    if (fence()) scheduleCardPatch(ds, buildStreamingCardJson(ds), turnId);
+  } catch (error) { logger.warn(`[handoff] attachment pending: ${error instanceof Error ? error.message : String(error)}`); }
+  finally { active.delete(turnId); }
+}
+
+const pendingStatusPatchFence = new WeakMap<DaemonSession, () => boolean>();
+
 export function scheduleCardPatch(ds: DaemonSession, cardJson: string, turnId?: string): boolean {
   // A late screen/config callback must not repaint a closed session as working.
   if (ds.session.status === 'closed') return false;
@@ -4510,7 +4546,8 @@ export function scheduleCardPatch(ds: DaemonSession, cardJson: string, turnId?: 
   if (streamingCardDisabled(ds, turnId)) return false;
   const cardId = ds.streamCardId;
   if (!cardId || cardId === CARD_POSTING_SENTINEL) return false;
-  ds.pendingCardJson = cardJson;
+  pendingStatusPatchFence.set(ds, captureStatusCardFence(ds, turnId));
+  ds.pendingCardJson = withHandoffPreview(cardJson, currentTurnStatusPolicy(ds, turnId)?.handoffPreview);
   // Capture the card ID now — by the time flushCardPatch runs, ds.streamCardId
   // may have been overwritten by a new turn's card (CARD_POSTING_SENTINEL).
   ds.pendingCardId = cardId;
@@ -4522,7 +4559,9 @@ export function scheduleCardPatch(ds: DaemonSession, cardJson: string, turnId?: 
 function flushCardPatch(ds: DaemonSession): void {
   const json = ds.pendingCardJson;
   const cardId = ds.pendingCardId;
-  if (!json || !cardId || cardId === CARD_POSTING_SENTINEL) {
+  const fence = pendingStatusPatchFence.get(ds);
+  pendingStatusPatchFence.delete(ds);
+  if (!json || !cardId || cardId === CARD_POSTING_SENTINEL || (fence && !fence())) {
     ds.pendingCardJson = undefined;
     ds.pendingCardId = undefined;
     return;
@@ -7283,7 +7322,7 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     ds.session.sessionId,
     sessionAnchorId(ds),
     readableTerminalUrlFor(ds),
-    ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
+    statusCardTitle(ds, sessionCliDisplayName(ds, botCfg)),
     ds.lastScreenContent ?? '',
     status ?? ds.lastScreenStatus ?? 'starting',
     effectiveCliId,
@@ -12860,6 +12899,8 @@ function setupWorkerHandlers(
           break;
         }
         discardTriggerStreamingCard(ds, msg.turnId);
+        rejectTurnStatusPolicy(ds, msg.turnId);
+        sessionStore.updateSession(ds.session);
         await rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg);
         break;
       }
@@ -12879,6 +12920,10 @@ function setupWorkerHandlers(
         // receipt ACK was delayed or dropped on the reverse IPC channel.
         completeOrdinaryImDelivery(ds, msg.turnId, workerGeneration);
         ds.failedIdleTurnId = undefined;
+        commitTurnStatusPolicy(ds, msg.turnId, workerGeneration);
+        advanceManagedAskPresentation({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId,
+          turnId: msg.turnId, workerGeneration, phase: 'running' });
+        sessionStore.updateSession(ds.session);
         commitTriggerStreamingCard(ds, msg.turnId, (target, title, turnId) => {
           if (!managedAuxUiSuppressed(turnId) && !streamingCardDisabled(target, turnId)
             && !getBot(target.larkAppId).config.privateCard) {
@@ -12893,7 +12938,7 @@ function setupWorkerHandlers(
         } else {
           logger.warn(`[${t}] Ignored unbound input commit turn=${msg.turnId.slice(0, 16)}`);
         }
-        if (!managedAuxUiSuppressed(msg.turnId)) {
+        if (!currentTurnStatusPolicy(ds, msg.turnId)?.context && !managedAuxUiSuppressed(msg.turnId) && !automaticStatusCardHidden(ds, msg.turnId)) {
           ds.replyCardRunningTurnId = msg.turnId;
           void updateTurnReplyCard(ds, msg.turnId, { kind: 'start' },
             (body, type, uuid) => scopedReply(body, type, msg.turnId, { uuid }),
@@ -13135,8 +13180,9 @@ function setupWorkerHandlers(
           const restoredAppId = ds.larkAppId;
           const restoredAnchor = sessionAnchorId(ds);
           const restoredRegistryKey = sessionKey(restoredAnchor, restoredAppId);
+          const statusFence = captureStatusCardFence(ds, msg.turnId);
           const ownsRestoredCard = (): boolean =>
-            ds.session === restoredSession
+            statusFence() && ds.session === restoredSession
             && ds.session.status === 'active'
             && ds.larkAppId === restoredAppId
             && sessionAnchorId(ds) === restoredAnchor
@@ -13144,7 +13190,7 @@ function setupWorkerHandlers(
             && ds.streamCardId === restoredCardId
             && activeSessionsRegistry?.get(restoredRegistryKey) === ds;
           try {
-            const initTitle = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);
+            const initTitle = statusCardTitle(ds, sessionCliDisplayName(ds, botCfg));
             // Reuse persisted nonce so existing card buttons (toggle/etc) keep working.
             if (!ds.streamCardNonce) ds.streamCardNonce = randomBytes(4).toString('hex');
             // Prefer the last-known screen status when we have one — for /relay
@@ -13180,7 +13226,7 @@ function setupWorkerHandlers(
               dshRuntimeForSession(ds),
               resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
             );
-            await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
+            await updateMessage(ds.larkAppId, restoredCardId, withHandoffPreview(streamCardJson, currentTurnStatusPolicy(ds, msg.turnId)?.handoffPreview));
             if (!ownsLifecycleMutation()) break;
             ds.parkedStreamCardNonce = undefined;
             // Worker IPC handlers may run while the direct restore PATCH is in
@@ -13246,16 +13292,17 @@ function setupWorkerHandlers(
             && ds.streamCardNonce === postingNonce
             && activeSessionsRegistry?.get(postingRegistryKey) === ds;
           restoreFreshReadyPrePostIdentityForRetirement = (): boolean => {
-            if (remoteRetirementAdmissionPhase(ds) === null || !ownsFreshReadyPost()) return false;
+            if ((remoteRetirementAdmissionPhase(ds) === null && statusFence()) || !ownsFreshReadyPost()) return false;
             ds.streamCardId = undefined;
             persistStreamCardState(ds);
             return true;
           };
+          const statusFence = captureStatusCardFence(ds, msg.turnId);
           stillOwnsFreshReadyPost = (): boolean =>
-            ownsFreshReadyPost()
+            ownsFreshReadyPost() && statusFence()
             && remoteRetirementAdmissionPhase(ds) === null
             && retainsLarkStreamingCardTransport(ds);
-          const initTitle = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);
+          const initTitle = statusCardTitle(ds, sessionCliDisplayName(ds, botCfg));
           // See PATCH-branch comment above re: lastScreenStatus preference.
           // For relay (kill+fork with surviving tmux/CLI), this avoids the
           // jarring "启动中" right after the M1 "已接力" announcement.
@@ -13291,7 +13338,7 @@ function setupWorkerHandlers(
             resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
           );
           const postedCardId = await scopedReply(
-            streamCardJson, 'interactive', cardReplyTarget.turnId,
+            withHandoffPreview(streamCardJson, currentTurnStatusPolicy(ds, msg.turnId)?.handoffPreview), 'interactive', cardReplyTarget.turnId,
           );
           if (!ownsLifecycleMutation() || !stillOwnsFreshReadyPost()) {
             void deleteMessage(postingAppId, postedCardId).catch(() => { /* best-effort stale-card cleanup */ });
@@ -13299,6 +13346,7 @@ function setupWorkerHandlers(
             break;
           }
           ds.streamCardId = postedCardId;
+          if (msg.turnId) void publishHandoffAttachment(ds, msg.turnId, postedCardId);
           ds.streamCardReplyTargetKey = cardReplyTarget.replyTargetKey;
           // This card IS the current turn's live card — clear the new-turn flag
           // so subsequent screen_updates PATCH it (starting → working) instead of
@@ -13636,7 +13684,7 @@ function setupWorkerHandlers(
         // summon the bubble mid-turn with everything accumulated so far.
         ds.lastThinkingUpdate = { entries: msg.entries, turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt };
         if (replyCardModeFor(ds, msg.turnId) !== 'legacy') {
-          if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+          if (!currentTurnStatusPolicy(ds, msg.turnId)?.context && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt) && !automaticStatusCardHidden(ds, msg.turnId)) {
             queueTurnReplyTools(ds, msg,
               (body, type, uuid) => scopedReply(body, type, msg.turnId, { uuid }), ownsLifecycleMutation);
           }
@@ -13658,6 +13706,10 @@ function setupWorkerHandlers(
         ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit);
         stampIdleSinceAt(ds, prevStatus);
         bumpStreamCardStatusRevision(ds);
+        if (['working', 'limited', 'stalled'].includes(msg.status)) advanceManagedAskPresentation({ larkAppId: ds.larkAppId,
+          sessionId: ds.session.sessionId, turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt,
+          workerGeneration, observedAt: msg.observedAt, phase: msg.status === 'working' ? 'running' : 'blocked',
+          blockedReason: msg.status === 'limited' ? 'rate_limit' : msg.status === 'stalled' ? 'stalled' : undefined });
         try {
           const published = cb.onScreenStatus?.(ds, {
             prevStatus,
@@ -13893,7 +13945,7 @@ function setupWorkerHandlers(
         if (ds.suppressRecoveryCard) { clearUsageRefreshTimer(ds); break; }
 
         const readUrl = readableTerminalUrlFor(ds);
-        const turnTitle = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);
+        const turnTitle = statusCardTitle(ds, sessionCliDisplayName(ds, botCfg));
         const mode: DisplayMode = ds.displayMode ?? 'hidden';
 
         if (ds.streamCardPending || !ds.streamCardId) {
@@ -13951,17 +14003,18 @@ function setupWorkerHandlers(
             && ds.streamCardNonce === postingNonce
             && activeSessionsRegistry?.get(postingRegistryKey) === ds;
           const restoreFreshScreenPrePostIdentityForRetirement = (): boolean => {
-            if (remoteRetirementAdmissionPhase(ds) === null || !ownsFreshScreenPost()) return false;
+            if ((remoteRetirementAdmissionPhase(ds) === null && statusFence()) || !ownsFreshScreenPost()) return false;
             ds.streamCardId = undefined;
             persistStreamCardState(ds);
             return true;
           };
+          const statusFence = captureStatusCardFence(ds, msg.turnId);
           const stillOwnsFreshScreenPost = (): boolean =>
-            ownsFreshScreenPost()
+            ownsFreshScreenPost() && statusFence()
             && remoteRetirementAdmissionPhase(ds) === null
             && retainsLarkStreamingCardTransport(ds);
           const cardReplyTarget = captureStreamingCardReplyTarget(ds, msg.turnId);
-          scopedReply(cardJson, 'interactive', cardReplyTarget.turnId)
+          scopedReply(withHandoffPreview(cardJson, currentTurnStatusPolicy(ds, msg.turnId)?.handoffPreview), 'interactive', cardReplyTarget.turnId)
             .then(async msgId => {
               if (!ownsLifecycleMutation() || !stillOwnsFreshScreenPost()) {
                 void deleteMessage(postingAppId, msgId).catch(() => { /* best-effort stale-card cleanup */ });
@@ -13969,6 +14022,7 @@ function setupWorkerHandlers(
                 return;
               }
               ds.streamCardId = msgId;
+              if (msg.turnId) void publishHandoffAttachment(ds, msg.turnId, msgId);
               ds.streamCardReplyTargetKey = cardReplyTarget.replyTargetKey;
               const superseded = (ds.streamCardTurnGeneration ?? 0) !== postingGeneration;
               if (!superseded) ds.streamCardPendingTurnId = undefined;
@@ -14095,12 +14149,13 @@ function setupWorkerHandlers(
         // uploading during a suppressed managed/silent turn — letting that
         // frame into ds.currentImageKey would paste it onto the next visible
         // card render (the same leak class the comment above names).
+        if (streamingCardDisabled(ds, msg.turnId)) { clearUsageRefreshTimer(ds); break; }
         ds.currentImageKey = msg.imageKey;
         persistStreamCardState(ds);
         if ((ds.displayMode ?? 'hidden') !== 'screenshot') break;
         if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !workerHasInitialized(ds)) break;
         const readUrl = readableTerminalUrlFor(ds);
-        const turnTitle = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);
+        const turnTitle = statusCardTitle(ds, sessionCliDisplayName(ds, botCfg));
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
           sessionAnchorId(ds),
@@ -14560,7 +14615,7 @@ function setupWorkerHandlers(
           // Freeze the streaming card
           if (!suppressExitUi && ds.streamCardId && workerHasInitialized(ds)) {
             const readUrl = readableTerminalUrlFor(ds);
-            const turnTitle = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);
+            const turnTitle = statusCardTitle(ds, sessionCliDisplayName(ds, botCfg));
             const frozenCard = buildStreamingCard(
               ds.session.sessionId, sessionAnchorId(ds), readUrl, turnTitle,
               ds.lastScreenContent ?? '', 'idle', effectiveCliId,
@@ -14635,7 +14690,7 @@ function setupWorkerHandlers(
           // the card keeps snapshot/manage controls and omits terminal links.
           if (!suppressExitUi && ds.streamCardId && workerHasInitialized(ds)) {
             const readUrl = readableTerminalUrlFor(ds);
-            const turnTitle = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);
+            const turnTitle = statusCardTitle(ds, sessionCliDisplayName(ds, botCfg));
             const frozenCard = buildStreamingCard(
               ds.session.sessionId, sessionAnchorId(ds), readUrl, turnTitle,
               ds.lastScreenContent ?? '', 'idle', effectiveCliId,
@@ -14967,6 +15022,16 @@ function setupWorkerHandlers(
           break;
         }
         forgetScheduledTurnCaller(ds, msg.turnId);
+        try {
+          recordManagedAskTerminal({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId,
+            turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt, status: msg.status,
+            workerGeneration, bootId: getDaemonBootId() });
+          advanceManagedAskPresentation({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId,
+            turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt, workerGeneration,
+            phase: msg.status === 'completed' ? 'execution_completed' : 'unknown' });
+        } catch (error) {
+          logger.error(`[${t}] Managed Ask terminal proof unavailable: ${error instanceof Error ? error.message : String(error)}`);
+        }
         // Defense in depth: the worker sends a token-matched revoke before the
         // terminal IPC, but an older/mixed worker must still lose authority at
         // this exact terminal edge. Tuple-match prevents a late turn N event
@@ -14988,7 +15053,7 @@ function setupWorkerHandlers(
         // (RUN_FINISHED auto-completes the CoT server-side). Also consumes the
         // one-shot `/cot show` force and drops the mid-turn thinking cache (a
         // post-terminal summon would create a bubble nobody ever finishes).
-        if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt) && replyCardModeFor(ds, msg.turnId) !== 'legacy') {
+        if (!currentTurnStatusPolicy(ds, msg.turnId)?.context && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt) && !automaticStatusCardHidden(ds, msg.turnId) && replyCardModeFor(ds, msg.turnId) !== 'legacy') {
           if (ds.replyCardRunningTurnId === msg.turnId) ds.replyCardRunningTurnId = undefined;
           void (async () => {
             await flushTurnReplyTools(ds, msg.turnId, msg.dispatchAttempt).catch(error => {

@@ -1,3 +1,7 @@
+import { createManagedAskPresenter } from './core/managed-ask-presentation.js';
+import { setManagedAskPresenter, managedAskStore } from './core/ask-broker.js';
+import { retireManagedAskCot } from './im/lark/cot-message.js';
+import { automaticStatusCardHidden } from './core/turn-status-policy.js';
 import { armProjectPeerFinalSuppression } from './core/trigger-final-suppression.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -351,7 +355,7 @@ import {
   closeCliMismatchedSessionsForBot,
 } from './core/session-manager.js';
 import { publishTurnCliIdentity } from './core/turn-cli-identity.js';
-import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
+import { triggerSessionTurn, lookupRegisteredTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
   runIdempotencyFailClose,
   runWithdrawAutoClose,
@@ -613,14 +617,22 @@ import {
   setCanTalkChecker as setAskCanTalkChecker,
   setAskPersistStore as setAskPersistStoreBroker,
   registerAsk as registerAskBroker,
+  lookupManagedAsk,
+  isAuthorizedToAnswer as isManagedAnswerAuthorized,
   registerHostAsk,
   restorePersistedAsks as restorePersistedAsksBroker,
   findPendingAskByAnchor,
   submitCustomReply,
 } from './core/ask-broker.js';
-import { createAskPersistStore } from './core/ask-persist-store.js';
+import { createAskPersistStore, dispatchUuidForKey } from './core/ask-persist-store.js';
 import { parseAskBody } from './core/ask-api.js';
-import { shouldReturnAskStartupNotReady } from './core/ask-types.js';
+import { authorizeManagedAsk, parseAskLookup } from './core/managed-ask-api.js';
+import { ManagedAskError } from './core/managed-ask-types.js';
+import { continueManagedAsk, type ManagedAskPolicy } from './core/managed-ask-continuation.js';
+import { loadManagedAskPolicy } from './core/managed-ask-policy.js';
+import { lookupStrict as lookupManagedOriginalResult } from './services/async-trigger-store.js';
+let managedAskDomainPolicy: ManagedAskPolicy | undefined;
+import { shouldReturnAskStartupNotReady, askReplyRoute } from './core/ask-types.js';
 import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
 import { replyCardAskTarget } from './core/turn-reply-ask.js';
@@ -3722,6 +3734,7 @@ export async function noteTurnReceived(
     && resolveVcMeetingImTurnOrigin(ds.session, triggerMessageId) !== undefined) return;
   // Turn-exact card-off check: the reaction ack belongs to THIS message's turn,
   // not to whichever turn most recently overwrote currentReplyTarget.
+  if (automaticStatusCardHidden(ds, _turnId ?? triggerMessageId)) return;
   if (!streamingCardDisabledFor(ds, triggerMessageId)) return;
   if (silentTurnReactionsFor(ds)) return;
   // Only Lark messages carry reactions — doc-comment ids / chat anchors can't.
@@ -4021,7 +4034,7 @@ async function maybeSeedCardlessForceTopicTurn(args: {
   messageId: string;
 }): Promise<void> {
   const { ds, enabled, anchor, messageId } = args;
-  if (!enabled || !streamingCardDisabledFor(ds, messageId)) return;
+  if (!enabled || automaticStatusCardHidden(ds, messageId) || !streamingCardDisabledFor(ds, messageId)) return;
   try {
     await sessionReply(
       anchor,
@@ -5171,7 +5184,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
       dshRuntimeForSession(ds),
       resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
     );
-    scheduleCardPatch(ds, frozenCard);
+    scheduleCardPatch(ds, frozenCard, ds.currentTurnId);
 
     if (ds.streamCardNonce && ds.streamCardId !== CARD_POSTING_SENTINEL) {
       if (!ds.frozenCards) ds.frozenCards = new Map();
@@ -6728,6 +6741,77 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
 // the request's lifetime is bounded by `body.timeoutMs` which the broker
 // enforces. Default fetch on the CLI side has no read timeout.
 
+ipcRoute('GET', '/api/asks/capabilities', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'core_owner_required' });
+  return jsonRes(res, 200, { larkAppId: selfV3LarkAppId, capabilities: {
+    managed_ask_delivery_v1: true, managed_ask_continuation_v1: !!managedAskDomainPolicy,
+    turn_status_card_policy_v1: true,
+  } });
+});
+
+ipcRoute('POST', '/api/asks/continue', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'core_owner_required' });
+  let raw: unknown;
+  try { raw = await readJsonBody<unknown>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  try {
+    const identity = parseAskLookup(raw);
+    const live = findActiveBySessionId(identity.sessionId);
+    const session = live?.session ?? sessionStore.getSession(identity.sessionId);
+    authorizeManagedAsk({ identity, raw: raw as Record<string, unknown>, trustedHost: true,
+      selfAppId: selfV3LarkAppId, registration: false, session: session ? {
+        sessionId: session.sessionId, larkAppId: session.larkAppId ?? '', chatId: session.chatId,
+        rootMessageId: session.scope === 'chat' ? null : session.rootMessageId,
+        receiver: !!session.vcMeetingReceiver, liveOrigin: live?.managedTurnOrigin,
+      } : undefined });
+    const result = await continueManagedAsk(identity, {
+      dataDir: config.session.dataDir, policy: managedAskDomainPolicy,
+      originalActive: ask => {
+        const current = findActiveBySessionId(ask.sessionId);
+        return current?.managedTurnOrigin?.turnId === ask.originalTurn.turnId;
+      },
+      answerAuthorized: ask => ask.terminalResult?.kind === 'answered'
+        && isManagedAnswerAuthorized(ask, ask.terminalResult.by),
+      readOriginalResult: ask => lookupManagedOriginalResult(ask.sessionId, ask.originalTurn.turnId),
+      lookupRegistered: request => lookupRegisteredTurn(request, identity.larkAppId),
+      register: (request, assertInputCurrent) => triggerSessionTurn(request,
+        { larkAppId: identity.larkAppId, activeSessions }, { assertInputCurrent }),
+    });
+    return jsonRes(res, 200, result);
+  } catch (error) {
+    if (error instanceof ManagedAskError) return jsonRes(res, error.status, { ok: false, state: 'unknown', reason: error.code });
+    logger.warn(`Managed Ask continuation unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    return jsonRes(res, 503, { ok: false, state: 'unknown', reason: 'continuation_evidence_unavailable' });
+  }
+});
+
+ipcRoute('POST', '/api/asks/lookup', async (req, res) => {
+  let raw: unknown;
+  try { raw = await readJsonBody<unknown>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  try {
+    const identity = parseAskLookup(raw);
+    const live = findActiveBySessionId(identity.sessionId);
+    const session = live?.session ?? sessionStore.getSession(identity.sessionId);
+    authorizeManagedAsk({ identity, raw: raw as Record<string, unknown>,
+      trustedHost: isTrustedHostIpcRequest(req), selfAppId: selfV3LarkAppId, registration: false,
+      session: session ? {
+        sessionId: session.sessionId, larkAppId: session.larkAppId ?? '', chatId: session.chatId,
+        rootMessageId: session.scope === 'chat' ? null : session.rootMessageId,
+        receiver: !!session.vcMeetingReceiver, liveOrigin: live?.managedTurnOrigin,
+      } : undefined,
+    });
+    return jsonRes(res, 200, { ...lookupManagedAsk(identity), capabilities: {
+      managed_ask_delivery_v1: true,
+      managed_ask_continuation_v1: !!managedAskDomainPolicy,
+      turn_status_card_policy_v1: true,
+    } });
+  } catch (error) {
+    if (error instanceof ManagedAskError) return jsonRes(res, error.status, { ok: false, error: error.code });
+    throw error;
+  }
+});
+
 ipcRoute('POST', '/api/asks', async (req, res) => {
   let raw: unknown;
   try {
@@ -6830,13 +6914,36 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // p2pOpen 的 bot 在私聊里会出现「对方点不动按钮」，留痕便于排查。
     logger.warn(`[ask:${boundAsk.larkAppId}] no active session for ${boundAsk.sessionId.substring(0, 8)}; chatType unknown (p2pOpen answer gate falls back to allowlist)`);
   }
-  const result = await registerAskBroker({
+  let result: import('./core/ask-types.js').AskResult;
+  const waiterAbort = new AbortController();
+  const releaseWaiter = () => waiterAbort.abort();
+  if (boundAsk.managedDelivery) res.once('close', releaseWaiter);
+  try {
+  const originalTurn = boundAsk.managedDelivery ? authorizeManagedAsk({
+    identity: boundAsk, raw: body, trustedHost: isTrustedHostIpcRequest(req),
+    selfAppId: selfV3LarkAppId, registration: true,
+    session: askSession ? {
+      sessionId: askSession.session.sessionId, larkAppId: askSession.larkAppId, chatId: askSession.chatId,
+      rootMessageId: askSession.session.scope === 'chat' ? null : askSession.session.rootMessageId,
+      receiver: !!askSession.session.vcMeetingReceiver, liveOrigin: askSession.managedTurnOrigin,
+    } : undefined,
+  }) : undefined;
+  result = await registerAskBroker({
+    managedDelivery: boundAsk.managedDelivery, originalTurn,
+    managedHandoffPreview: originalTurn ? askSession?.session.turnStatusPolicies?.[originalTurn.turnId]?.handoffPreview : undefined,
+    originalExecution: originalTurn && askSession?.idempotentAsyncTurns?.get(originalTurn.turnId)
+      && !askSession.idempotentAsyncTurns.get(originalTurn.turnId)!.postBarrierFault
+      ? { bootId: getDaemonBootId(), workerGeneration: askSession.workerGeneration ?? 0,
+          replayKey: askSession.idempotentAsyncTurns.get(originalTurn.turnId)!.key,
+          replayKind: askSession.idempotentAsyncTurns.get(originalTurn.turnId)!.kind }
+      : undefined,
+    waiterSignal: boundAsk.managedDelivery ? waiterAbort.signal : undefined,
     larkAppId: boundAsk.larkAppId,
     chatId: boundAsk.chatId,
     rootMessageId: boundAsk.rootMessageId,
     sessionId: boundAsk.sessionId,
     questions: boundAsk.questions,
-    replyCardTarget: replyCardAskTarget(askSession, boundAsk, body),
+    replyCardTarget: boundAsk.managedDelivery ? undefined : replyCardAskTarget(askSession, boundAsk, body),
     timeoutMs: boundAsk.timeoutMs,
     chatType: askChatType,
     // Invocation identity (from the hook; enables cross-restart re-attach).
@@ -6849,6 +6956,11 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     backendSurvivesRestart:
       !!askSession && getSessionPersistentBackendType(askSession) !== undefined,
   });
+  } catch (error) {
+    if (res.destroyed) return;
+    if (error instanceof ManagedAskError) return jsonRes(res, error.status, { ok: false, error: error.code });
+    throw error;
+  } finally { res.off('close', releaseWaiter); }
 
   // CoCo 专属：它的 hook 不能用 directive 代答（hook 客户端永远 passthrough，CoCo 会
   // 渲染原生 picker）。这里在 ask 结算为「已作答」时，把答案翻成按键序列下发给该会话
@@ -6859,7 +6971,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     for (const ds of activeSessions.values()) {
       if (ds.session.sessionId === parsed.sessionId) { cocoDs = ds; break; }
     }
-    if (cocoDs?.session.cliId === 'coco' && cocoDs.worker) {
+    if (!boundAsk.managedDelivery && cocoDs?.session.cliId === 'coco' && cocoDs.worker) {
       try {
         // 单题：picker 选完直接提交（无 Review）；多题：最后一题之后才出 Review，需补提交。
         const needsReviewSubmit = parsed.questions.length > 1;
@@ -23245,8 +23357,17 @@ async function handleThreadReplyAdmitted(
           memberUnionId: threadSenderUnionId,
         },
       });
-      if (outcome === 'accepted') {
+      if (askReplyRoute(outcome) === 'handled') {
         logger.info(`[${anchor.substring(0, 12)}] ask custom reply accepted from ${askCandidate.senderOpenId.substring(0, 12)}`);
+        return;
+      }
+      if (askReplyRoute(outcome) === 'retry') {
+        // This message is still an answer to the original Ask, never a new task.
+        try {
+          await replyMessage(larkAppId, parsed.messageId,
+            tr('card.ask.toast.persistence_failed', undefined, localeForBot(larkAppId)), 'text', true,
+            dispatchUuidForKey(JSON.stringify(['ask-save-failed', larkAppId, pendingAsk.askId, parsed.messageId])));
+        } catch (error) { logger.warn(`[ask:${pendingAsk.askId}] failed to deliver save-retry notice: ${(error as Error).message}`); }
         return;
       }
       logger.info(`[${anchor.substring(0, 12)}] ask custom reply not accepted (${outcome}); falling through to normal routing`);
@@ -25871,6 +25992,38 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Bind the durable store to the real data dir (dependency-injected so unit
     // tests use a temp dir and never touch live data — codex P1-4).
     setAskPersistStoreBroker(createAskPersistStore(join(config.session.dataDir, 'asks')));
+    setManagedAskPresenter(createManagedAskPresenter(managedAskStore(), {
+      send: (record, body, uuid) => replyMessage(record.larkAppId, record.cardMessageId!, body, 'interactive', true, uuid),
+      patch: (record, messageId, body) => updateMessage(record.larkAppId, messageId, body),
+      remove: (record, messageId) => deleteMessage(record.larkAppId, messageId),
+      retire: record => {
+        const ds = [...activeSessions.values()].find(target => target.session.sessionId === record.sessionId && target.larkAppId === record.larkAppId);
+        if (!ds) throw new Error('runtime_owner_not_loaded');
+        const turnId = record.originalTurn.turnId;
+        ds.session.hiddenThinkingTurns = [...new Set([...(ds.session.hiddenThinkingTurns ?? []), turnId])];
+        const policies = ds.session.turnStatusPolicies ??= {};
+        const policy = policies[turnId] ??= { statusCard: 'visible', title: record.deliveryContext.title,
+          context: record.deliveryContext, state: 'committed', workerGeneration: record.execution?.workerGeneration,
+          dispatchAttempt: record.originalTurn.dispatchAttempt };
+        policy.runtimeSegmentAskKey = record.askKey;
+        sessionStore.updateSession(ds.session);
+        const ids = retireManagedAskCot(ds, turnId);
+        if (ds.session.statusPolicyTurnId === turnId || ds.currentTurnId === turnId || ds.replyCardRunningTurnId === turnId) {
+          if (ds.streamCardId && ds.streamCardId !== '__posting__') ids.push(ds.streamCardId);
+        }
+        return ids;
+      },
+      commitRetirement: (record, messageIds) => {
+        const ds = [...activeSessions.values()].find(target => target.session.sessionId === record.sessionId && target.larkAppId === record.larkAppId);
+        if (!ds || !ds.streamCardId || !messageIds.includes(ds.streamCardId)) return;
+        ds.streamCardId = undefined; ds.streamCardNonce = undefined;
+        ds.streamCardPending = false; ds.streamCardPendingTurnId = undefined;
+        ds.pendingCardJson = undefined; ds.pendingCardId = undefined;
+        persistStreamCardState(ds);
+      },
+    }));
+    try { managedAskDomainPolicy = await loadManagedAskPolicy(cfg.managedAskPolicyModule); }
+    catch (error) { logger.error(`Managed Ask policy unavailable: ${error instanceof Error ? error.message : String(error)}`); }
     restorePersistedAsksBroker(Date.now(), cfg.larkAppId);
   } catch (e) {
     logger.warn(`[ask] restorePersistedAsks failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -26114,6 +26267,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onScreenStatus(ds, context) {
+      if (automaticStatusCardHidden(ds, context.turnId)) return;
       return cardRuntimeStatusBridge.publish({
         sessionId: ds.session.sessionId,
         larkAppId: ds.larkAppId,

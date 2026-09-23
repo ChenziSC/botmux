@@ -50,6 +50,7 @@ export const messages: Record<string, string> = {
   // ─── Card status ─────────────────────────────────────────────────────────
   'card.status.starting': '启动中…',
   'card.status.working': '工作中',
+  'card.status.idle_processing': '本轮执行已空闲 · 等待阶段结果',
   'card.status.idle': '等待输入',
   'card.status.idle_silent': '已处理 · 判定无需回复',
   'card.status.idle_failed': '执行失败',
@@ -1587,6 +1588,7 @@ export const messages: Record<string, string> = {
   // 与 grant_pending 分开：owner 已明确拒绝、还在冷却期内，不能谎报成「等 owner 处理」。
   'card.ask.toast.grant_denied': 'owner 已拒绝你的授权申请，如需答复请直接联系 ta',
   'card.ask.toast.already_settled': '这个 ask 已经被回答或结束',
+  'card.ask.toast.persistence_failed': '暂未保存成功，请在这张卡上重试，任务尚未继续',
   'card.ask.toast.stale': '⚠️ 此 ask 已失效',
   'card.ask.custom_reply': '自定义回复',
   'card.ask.q_summary_line': '问题{n}：{labels}',

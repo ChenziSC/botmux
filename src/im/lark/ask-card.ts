@@ -593,6 +593,8 @@ function toastForOutcome(outcome: AskClickOutcome, locale?: Locale): { toast: { 
   switch (outcome) {
     case 'accepted':
       return undefined;
+    case 'persistence_failed':
+      return { toast: { type: 'error', content: t('card.ask.toast.persistence_failed', undefined, locale) } };
     case 'unauthorized':
       return { toast: { type: 'warning', content: t('card.ask.toast.unauthorized', undefined, locale) } };
     case 'already_settled':

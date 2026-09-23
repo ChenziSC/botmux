@@ -102,6 +102,7 @@ import {
   type WorkflowDaemonIpcTarget,
 } from './workflows/v3/daemon-ipc-auth.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
+import { lookupAskForOwner } from './dashboard/managed-asks.js';
 import { REPLY_STYLE_REQUEST_MAX_BYTES } from './dashboard/reply-style.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
 import {
@@ -4292,6 +4293,29 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, {
         sessions: projectSessionsForAudience(browserSessions, sessionBoardAudience),
       });
+    }
+
+    const managedAskCapabilities = url.pathname.match(/^\/api\/bots\/([^/]+)\/asks\/capabilities$/);
+    if (req.method === 'GET' && managedAskCapabilities) {
+      if (!legacyAuthed) return jsonRes(res, 403, { ok: false, error: 'core_owner_required' });
+      try {
+        const response = await proxyToDaemon(decodeURIComponent(managedAskCapabilities[1]), '/api/asks/capabilities', {
+          method: 'GET', signal: AbortSignal.timeout(10000),
+        });
+        return jsonRes(res, response.status, await response.json());
+      } catch { return jsonRes(res, 503, { ok: false, error: 'daemon_unavailable' }); }
+    }
+
+    const managedAskLookup = url.pathname.match(/^\/api\/sessions\/([^/]+)\/asks\/(lookup|continue)$/);
+    if (req.method === 'POST' && managedAskLookup) {
+      if (!legacyAuthed) return jsonRes(res, 403, { ok: false, error: 'core_owner_required' });
+      let raw: unknown;
+      try { raw = await readJsonBody(req); }
+      catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      const result = await lookupAskForOwner({ ownerAuthenticated: legacyAuthed,
+        sessionId: decodeURIComponent(managedAskLookup[1]), raw, proxyToDaemon,
+        operation: managedAskLookup[2] as 'lookup' | 'continue' });
+      return jsonRes(res, result.status, result.body);
     }
 
     // Desktop / operator UI: aggregate pending ask-hooks across daemons.

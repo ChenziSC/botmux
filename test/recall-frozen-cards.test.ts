@@ -1617,3 +1617,45 @@ describe('syncUsageRefreshTimer (state-boundary arm/clear)', () => {
     expect(buildStreamingCardMock.mock.calls.length).toBe(before + 1);
   });
 });
+
+describe('managed governance automatic status boundaries', () => {
+  it('does not publish a starting card for a hidden turn, including a stale forced flag', async () => {
+    const ds = makeDs();
+    ds.streamCardPending = true; ds.streamCardPendingTurnId = 'governance';
+    ds.streamingCardForced = true;
+    ds.session.turnStatusPolicies = { governance: { statusCard: 'hidden', title: '进度核查', state: 'committed' } };
+    ds.session.statusPolicyTurnId = 'governance';
+    const send = vi.fn(async () => 'om_new');
+    expect(await postTurnStartingCard(ds, send, 'governance')).toBe(false);
+    expect(send).not.toHaveBeenCalled();
+    expect(scheduleCardPatch(ds, '{}', 'governance')).toBe(false);
+  });
+  it('drops a queued old PATCH when a governance turn commits while the first PATCH is in flight', async () => {
+    const ds = makeDs(); ds.streamCardId = 'om_before';
+    let finish!: () => void;
+    updateMessageMock.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
+    scheduleCardPatch(ds, '{"revision":1}');
+    scheduleCardPatch(ds, '{"revision":2}');
+    ds.session.turnStatusPolicies = { governance: { statusCard: 'hidden', title: '进度核查', state: 'committed' } };
+    ds.session.statusPolicyTurnId = 'governance';
+    finish(); await flush();
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(ds.pendingCardJson).toBeUndefined();
+  });
+});
+
+it('drops an in-flight old POST after governance commits and permits the next business turn', async () => {
+  const ds = makeDs(); ds.workerReady = true;
+  ds.streamCardPending = true; ds.streamCardPendingTurnId = 'old'; activate(ds);
+  let finish!: (id: string) => void;
+  const send = vi.fn(() => new Promise<string>(resolve => { finish = resolve; }));
+  const pending = postTurnStartingCard(ds, send, 'old');
+  ds.session.statusPolicyTurnId = 'governance';
+  ds.session.turnStatusPolicies = { governance: { statusCard: 'hidden', title: '进度核查', state: 'committed' } };
+  finish('om_stale'); expect(await pending).toBe(false); await flush();
+  expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_stale');
+  expect(ds.streamCardId).not.toBe('__posting__');
+  ds.session.statusPolicyTurnId = 'new'; ds.streamCardPending = true; ds.streamCardPendingTurnId = 'new';
+  expect(await postTurnStartingCard(ds, vi.fn(async () => 'om_valid'), 'new')).toBe(true);
+  expect(ds.streamCardId).toBe('om_valid');
+});

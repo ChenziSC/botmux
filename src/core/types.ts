@@ -41,7 +41,7 @@ export interface FrozenCard {
   silentIdle?: boolean;
   /** 冻结时的 idle 卡头标签：'silent' = 判定无需回复；'completed' = transcript
    *  模式下最终回复卡已投递。新写入以此为准，`silentIdle` 仅为读旧盘保留。 */
-  idleLabel?: 'silent' | 'completed' | 'failed';
+  idleLabel?: 'silent' | 'completed' | 'failed' | 'processing';
 }
 
 /** Resolve effective display mode for a frozen card.

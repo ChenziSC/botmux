@@ -1,3 +1,4 @@
+import { automaticStatusCardHidden, captureStatusCardFence } from './turn-status-policy.js';
 /**
  * Reconcile the public streaming card after a closed session is resumed from
  * outside its original topic (for example the current-group `/sessions` card).
@@ -34,6 +35,7 @@ export async function reconcileResumedStreamingCard(
   staleCardId: string,
   postCard: (cardJson: string) => Promise<string>,
 ): Promise<ResumeStreamingCardReconcileResult> {
+  if (automaticStatusCardHidden(ds)) return { status: 'superseded' };
   const botCfg = getBot(ds.larkAppId).config;
   const shouldRepost = botCfg.disableStreamingCard !== true
     && !botCfg.noCardChats?.includes(ds.chatId);
@@ -43,6 +45,7 @@ export async function reconcileResumedStreamingCard(
     larkAppId: ds.larkAppId,
     anchorId: sessionAnchorId(ds),
     expectedPriorCardId: priorCardId,
+    statusFence: captureStatusCardFence(ds),
   };
 
   let freshCardId: string | undefined;

@@ -56,6 +56,45 @@ function runAsk(
 }
 
 describe('botmux ask — CLI boundary', () => {
+  it('passes managed identity and local context, preserves invalidation and uses only lookup for queries', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-managed-ask-cli-'));
+    tempDirs.push(dataDir);
+    const context = { version: 1, domain: 'gaia', handoffId: 'handoff', stage: 'review', actor: 'quality', title: 'Review' };
+    const contextFile = join(dataDir, 'context.json');
+    writeFileSync(contextFile, JSON.stringify(context));
+    const received: Array<{ url?: string; body: Record<string, unknown> }> = [];
+    const server = createServer(async (req, res) => {
+      let raw = '';
+      for await (const chunk of req) raw += chunk;
+      received.push({ url: req.url, body: JSON.parse(raw) });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(req.url === '/api/asks/lookup'
+        ? { found: true, state: 'terminal', terminalResult: { kind: 'invalidated', reason: 'cancelled' } }
+        : { kind: 'invalidated', reason: 'cancelled', selected: null, by: null, comment: null, timedOut: false }));
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const registryDir = join(dataDir, 'dashboard-daemons');
+      mkdirSync(registryDir);
+      writeFileSync(join(registryDir, 'cli_test.json'), JSON.stringify({
+        larkAppId: 'cli_test', ipcPort: (server.address() as AddressInfo).port, lastHeartbeat: Date.now(),
+      }));
+      const result = await runAsk(dataDir, ['ask', 'buttons', '--json', '--request-id', 'stable-id',
+        '--delivery-context-file', contextFile, '--options', 'yes,no', '请作答']);
+      expect(result.status).toBe(3);
+      expect(JSON.parse(result.stdout)).toMatchObject({ kind: 'invalidated', reason: 'cancelled', requestId: 'stable-id' });
+      expect(received[0].body).toMatchObject({ requestId: 'stable-id', originKind: 'explicit', managedDelivery: context, prompt: '请作答' });
+      expect(JSON.stringify(received[0])).not.toContain(contextFile);
+      const lookup = await runAsk(dataDir, ['ask', 'lookup', '--request-id', 'stable-id', '--json']);
+      expect(lookup.status).toBe(0);
+      expect(JSON.parse(lookup.stdout)).toMatchObject({ found: true, state: 'terminal' });
+      expect(received.map(r => r.url)).toEqual(['/api/asks', '/api/asks/lookup']);
+      const invalid = await runAsk(dataDir, ['ask', 'buttons', '--delivery-context-file', contextFile, '--options', 'yes,no', '请作答']);
+      expect(invalid.status).toBe(2);
+      expect(received).toHaveLength(2);
+    } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+  });
+
   it('--multi 发送多选问题并输出逗号分隔的 keys', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-cli-'));
     tempDirs.push(dataDir);

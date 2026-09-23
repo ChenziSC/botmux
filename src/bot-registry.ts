@@ -1921,6 +1921,10 @@ export interface BotConfig {
    * the shared tmux/zellij server env. Missing/empty → undefined.
    */
   env?: Record<string, string>;
+  /** Host-owner pinned Ask continuation policy module for this bot. Not a CLI
+   * environment setting. Absent inherits the process default; null/empty disables
+   * it. Invalid explicit values normalize to null, never to another bot's default. */
+  managedAskPolicyModule?: string | null;
   /**
    * Optional per-bot priority skill policy. Missing means botmux does not alter
    * the underlying CLI's native skill discovery or spawn arguments.
@@ -3793,6 +3797,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       tuiSlashAllow,
       startupCommands,
       env,
+      managedAskPolicyModule: Object.hasOwn(entry, 'managedAskPolicyModule')
+        ? (typeof entry.managedAskPolicyModule === 'string' ? entry.managedAskPolicyModule.trim() : null)
+        : undefined,
       skills,
       plugins,
       lang: isLocale(entry.lang) ? entry.lang : undefined,

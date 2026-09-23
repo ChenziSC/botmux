@@ -1,3 +1,5 @@
+import { parseManagedDeliveryContext, type ManagedDeliveryContextV1 } from '../core/managed-ask-types.js';
+
 export type TriggerSourceType = 'webhook' | 'ui' | 'workflow' | 'schedule' | 'vc_meeting' | 'headless';
 export type TriggerTargetKind = 'turn' | 'workflow';
 export type TriggerAction = 'queued' | 'delivered' | 'dry_run' | 'ignored' | 'completed';
@@ -45,6 +47,9 @@ export interface TriggerRequest {
     liveCard?: 'on-start';
     /** Hide only this trigger's thinking bubble; business notices and HTTP results remain available. */
     thinking?: 'hidden';
+    /** Independent from thinking/final output; requires turn_status_card_policy_v1. */
+    statusCard?: 'hidden';
+    deliveryContext?: ManagedDeliveryContextV1;
   };
   options?: {
     dryRun?: boolean;
@@ -276,11 +281,20 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
     if (!isRecord(raw.presentation)) {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation must be an object' } };
     }
+    if (raw.presentation.deliveryContext !== undefined && !parseManagedDeliveryContext(raw.presentation.deliveryContext)) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'invalid managed delivery context' } };
+    }
     if (raw.presentation.liveCard !== undefined && raw.presentation.liveCard !== 'on-start') {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.liveCard must be on-start' } };
     }
     if (raw.presentation.thinking !== undefined && raw.presentation.thinking !== 'hidden') {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.thinking must be hidden' } };
+    }
+    if (raw.presentation.statusCard !== undefined && raw.presentation.statusCard !== 'hidden') {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.statusCard must be hidden' } };
+    }
+    if (raw.presentation.statusCard === 'hidden' && raw.presentation.liveCard === 'on-start') {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.statusCard:hidden conflicts with liveCard:on-start' } };
     }
     const topicMessage = raw.presentation.topicMessage;
     if (topicMessage !== undefined && topicMessage !== null && typeof topicMessage !== 'string') {

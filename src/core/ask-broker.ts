@@ -26,6 +26,8 @@ import type {
   PendingAsk,
 } from './ask-types.js';
 import { AskDispatchError } from './ask-types.js';
+import { ManagedAskError, parseManagedDeliveryContext, validAskOriginalTurn } from './managed-ask-types.js';
+import type { PersistedManagedAsk } from './managed-ask-store.js';
 
 /** Origins for which restart-resume + durable handoff are enabled. Only a
  *  caller that has a reconnecting claimant after a daemon restart may persist:
@@ -36,6 +38,11 @@ import { AskDispatchError } from './ask-types.js';
 const RESUMABLE_ORIGINS = new Set(['hook']);
 
 interface InternalPending extends Omit<PendingAsk, 'selections'> {
+  managedRecord?: PersistedManagedAsk;
+  persistenceRetryHandle?: NodeJS.Timeout;
+  persistenceRetryCount?: number;
+  pendingSystemResult?: AskResult;
+  managedExpiryHandle?: NodeJS.Timeout;
   /** Stable identity = larkAppId.sessionId.originKind.requestId (see
    *  ask-persist-store.askKeyFor). NOT a bearer secret — scoped to the
    *  authenticated session so another session can't reclaim by reusing a
@@ -149,7 +156,7 @@ export function setCanTalkChecker(
  *  `botmux ask` is a talk-level interaction (answering the agent's question),
  *  so it follows the canTalk gate — not the stricter canOperate / allowedUsers.
  *  `actor` is only supplied by the text-reply path; card clicks omit it. */
-function isAuthorizedToAnswer(ask: InternalPending, by: string, actor?: AskAnswerActor): boolean {
+export function isAuthorizedToAnswer(ask: Pick<InternalPending, 'answererOpenId' | 'larkAppId' | 'chatId' | 'chatType'>, by: string, actor?: AskAnswerActor): boolean {
   if (ask.answererOpenId && ask.answererOpenId !== by) return false;
   return canTalkChecker?.(ask.larkAppId, ask.chatId, by, ask.chatType, actor) ?? false;
 }
@@ -200,7 +207,16 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promi
     throw new Error('ask-broker: cardDispatcher not wired — daemon bootstrap bug');
   }
 
+  if (input.managedDelivery) input = { ...input,
+    managedDelivery: parseManagedDeliveryContext(input.managedDelivery) ?? input.managedDelivery,
+  };
   const originKind = input.originKind ?? 'hook';
+  if (input.managedDelivery && (!parseManagedDeliveryContext(input.managedDelivery)
+    || !input.requestId || originKind !== 'explicit' || !validAskOriginalTurn(input.originalTurn))) {
+    throw new ManagedAskError('managed_ask_identity_required', 400);
+  }
+  if (input.managedDelivery && input.waiterSignal?.aborted) throw new ManagedAskError('managed_ask_waiter_disconnected');
+  if (input.managedDelivery && !persistStore?.managed) throw new ManagedAskError('managed_ask_store_unavailable');
   // CLI-origin resumability is gated by TWO independent facts (codex P1-4):
   //  1. the origin has a reconnecting claimant (only 'hook' re-POSTs after a
   //     restart; an explicit `botmux ask buttons` process exits), AND
@@ -231,9 +247,31 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promi
   // (codex P1-1). The scoped key already pins (app/session/origin/request); here
   // we additionally require the FULL immutable identity (chat/root/questions) to
   // match before joining/replaying/re-attaching.
-  const existing = findByKey(askKey);
+  let existing = findByKey(askKey);
+  if (persistStore?.managed && input.requestId) {
+    const saved = persistStore!.managed!.get(askKey);
+    if (!saved.found && saved.reason !== 'not_found') throw new ManagedAskError(`managed_ask_${saved.reason}`);
+    if (saved.found) {
+      if (!existing) existing = restoreManagedAsk(saved.record);
+      else existing.managedRecord = saved.record;
+    }
+  }
   if (existing) {
     if (sameIdentity(existing, input)) {
+      if (existing.managedRecord) {
+        if (existing.managedRecord.resultExpired || (existing.managedRecord.expiresAt ?? Infinity) <= Date.now()) {
+          throw new ManagedAskError('managed_ask_result_expired', 409);
+        }
+        if (existing.managedRecord.continuation) throw new ManagedAskError('managed_ask_consumption_transferred', 409);
+        if (existing.terminalResult) return Promise.resolve(existing.terminalResult);
+      }
+      if (existing.managedRecord && !existing.settled) {
+        if (existing.waiters.length) throw new ManagedAskError('managed_ask_waiter_attached', 409);
+        existing.dormant = false;
+        const waiter = managedWaiter(existing, input.waiterSignal);
+        if (!existing.cardMessageId && existing.deadlineAt > Date.now()) sendCardForAsk(existing);
+        return waiter;
+      }
       // active (still awaiting a click): add another waiter → both callers get the
       // one result; no second ask, no second card.
       if (!existing.settled && !existing.dormant) {
@@ -257,6 +295,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promi
       logger.warn?.(
         `ask-broker: identity mismatch on key ${askKey} (existing ask ${existing.askId}) — rejecting re-register`,
       );
+      if (input.managedDelivery || existing.managedRecord) throw new ManagedAskError('managed_ask_identity_conflict', 409);
       return Promise.resolve<AskResult>({
         kind: 'invalidated',
         reason: 'ask identity mismatch (same key, different question set / chat)',
@@ -270,7 +309,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promi
   const createdAt = Date.now();
   const deadlineAt = createdAt + input.timeoutMs;
 
-  return new Promise<AskResult>((resolve) => {
+  return new Promise<AskResult>((resolve, reject) => {
     const selections = new Map<number, Set<string>>();
     for (let i = 0; i < input.questions.length; i++) selections.set(i, new Set<string>());
 
@@ -289,6 +328,8 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promi
       answererOpenId: input.answererOpenId,
       questions: input.questions,
       replyCardTarget: input.replyCardTarget,
+      managedDelivery: input.managedDelivery,
+      originalTurn: input.originalTurn,
       createdAt,
       deadlineAt,
       settled: false,
@@ -297,8 +338,25 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promi
       timeoutStartsAfterDelivery: hostManaged,
       selections,
     };
+    if (input.managedDelivery) {
+      ask.managedRecord = {
+        v: 3, askId, askKey, requestId, originKind, nonce,
+        larkAppId: ask.larkAppId, sessionId: ask.sessionId, chatId: ask.chatId, rootMessageId: ask.rootMessageId,
+        chatType: ask.chatType, answererOpenId: ask.answererOpenId, questions: ask.questions, createdAt, deadlineAt, timeoutMs: input.timeoutMs,
+        replyCardTarget: input.replyCardTarget, selections: input.questions.map(() => []), phase: 'pending',
+        deliveryContext: input.managedDelivery, originalTurn: input.originalTurn!,
+        execution: input.originalExecution, handoffPreview: input.managedHandoffPreview,
+        presentation: { state: 'none', revision: 0 },
+      };
+      // Creation is durable BEFORE publishing memory, starting timers, or sending a card.
+      ask.managedRecord = persistStore!.managed!.create(ask.managedRecord!);
+    }
     if (!hostManaged) armAskTimeout(ask, input.timeoutMs, createdAt);
     pending.set(askId, ask);
+    if (ask.managedRecord) {
+      ask.waiters = [];
+      managedWaiter(ask, input.waiterSignal).then(resolve, reject);
+    }
     // Persist ONLY resumable origins (codex P1-4). A restart before the card
     // lands still leaves a resumable record; restore/re-attach re-sends.
     if (resumable) {
@@ -320,6 +378,8 @@ function sameIdentity(ask: InternalPending, input: CreateAskInput): boolean {
     ask.rootMessageId === input.rootMessageId &&
     ask.originKind === (input.originKind ?? 'hook') &&
     ask.answererOpenId === input.answererOpenId &&
+    JSON.stringify(ask.managedDelivery) === JSON.stringify(input.managedDelivery) &&
+    JSON.stringify(ask.originalTurn) === JSON.stringify(input.originalTurn) &&
     questionsShape(ask.questions) === questionsShape(input.questions)
   );
 }
@@ -374,16 +434,17 @@ function sendCardForAsk(ask: InternalPending): void {
         }
         const { messageId } = await dispatcher!.send(snapshot(ask));
         const cur = pending.get(ask.askId);
-        if (cur && !cur.settled) {
+        if (cur === ask && (!cur.settled || cur.managedRecord)) {
           cur.cardMessageId = messageId;
-          if (cur.timeoutStartsAfterDelivery && cur.timeoutStartedAt === undefined) {
+          if (!cur.settled && cur.timeoutStartsAfterDelivery && cur.timeoutStartedAt === undefined) {
             armAskTimeout(cur, cur.timeoutMs, Date.now());
           }
-          if (cur.resumable) persistFromInternal(cur);
+          if (cur.resumable || cur.managedRecord) persistFromInternal(cur);
+          if (cur.settled) publishManagedStatus(cur);
         }
         return; // sent (or server-deduped to the original) — done
       } catch (err) {
-        const retryable = err instanceof AskDispatchError && err.retryable;
+        const retryable = (err instanceof AskDispatchError && err.retryable) || (err instanceof ManagedAskError && err.status === 503);
         const msg = err instanceof Error ? err.message : String(err);
         if (retryable && attempt < CARD_DISPATCH_MAX_ATTEMPTS) {
           const backoff = Math.min(CARD_DISPATCH_BACKOFF_MS * attempt, CARD_DISPATCH_BACKOFF_CAP_MS);
@@ -432,6 +493,151 @@ function findByKey(askKey: string): InternalPending | undefined {
   return undefined;
 }
 
+type ManagedPresenter = ReturnType<typeof import('./managed-ask-presentation.js').createManagedAskPresenter>;
+let managedPresenter: ManagedPresenter | undefined;
+export function setManagedAskPresenter(presenter: ManagedPresenter): void { managedPresenter = presenter; }
+export function refreshManagedAskPresentation(key: string): void {
+  const ask = findByKey(key); if (ask) publishManagedStatus(ask);
+}
+function publishManagedStatus(ask: InternalPending): void {
+  if (ask.managedRecord && managedPresenter) void managedPresenter.publish(ask.askKey)
+    .catch(error => logger.warn(`managed Ask presentation: ${error.message}`));
+}
+
+/** Worker generation is checked at the caller; require exact turn/attempt too.
+ * No inference from idle, timeout, or text saying that work has completed. */
+export function advanceManagedAskPresentation(identity: {
+  larkAppId: string; sessionId: string; turnId?: string; dispatchAttempt?: number;
+  workerGeneration: number; phase: 'running' | 'execution_completed' | 'unknown' | 'blocked';
+  observedAt?: number; blockedReason?: 'rate_limit' | 'stalled';
+}): void {
+  if (!managedPresenter || !identity.turnId) return;
+  for (const ask of pending.values()) {
+    if (!ask.managedRecord || ask.larkAppId !== identity.larkAppId || ask.sessionId !== identity.sessionId) continue;
+    const saved = managedAskStore().get(ask.askKey);
+    if (!saved.found || saved.record.terminalResult?.kind !== 'answered') continue;
+    const p = saved.record;
+    if (identity.observedAt !== undefined && identity.observedAt < (p.acceptedAt ?? Infinity)) continue;
+    const original = !p.continuation?.triggerId && p.originalTurn.turnId === identity.turnId
+      && p.originalTurn.dispatchAttempt === identity.dispatchAttempt && p.execution?.workerGeneration === identity.workerGeneration;
+    // Continuation triggerId comes only from native fixed-key registration.
+    const continuation = p.continuation?.triggerId === identity.turnId;
+    if (original || continuation) void managedPresenter.advance(ask.askKey, identity.phase, identity.turnId, identity.blockedReason)
+      .catch(error => logger.warn(`managed Ask runtime event: ${error.message}`));
+  }
+}
+
+/** Only one managed HTTP waiter may own an invocation at a time. A disconnect
+ * releases the connection, not the Ask or its execution authority. */
+function managedWaiter(ask: InternalPending, signal?: AbortSignal): Promise<AskResult> {
+  return new Promise((resolve, reject) => {
+    const finish = (result: AskResult) => {
+      signal?.removeEventListener('abort', abort);
+      const saved = persistStore?.managed?.get(ask.askKey);
+      if (!saved?.found || saved.record.continuation) {
+        reject(new ManagedAskError('managed_ask_consumption_transferred', 409));
+        return;
+      }
+      resolve(result);
+    };
+    const abort = () => {
+      const index = ask.waiters.indexOf(finish);
+      if (index >= 0) ask.waiters.splice(index, 1);
+      reject(new ManagedAskError('managed_ask_waiter_disconnected'));
+    };
+    if (signal?.aborted) { abort(); return; }
+    ask.waiters.push(finish);
+    signal?.addEventListener('abort', abort, { once: true });
+  });
+}
+
+/** Restore v3 without claiming a result, dispatching a card, or reopening a terminal. */
+function restoreManagedAsk(p: PersistedManagedAsk, now = Date.now()): InternalPending {
+  const ask: InternalPending = {
+    askId: p.askId, askKey: p.askKey, requestId: p.requestId, originKind: p.originKind,
+    nonce: p.nonce, larkAppId: p.larkAppId, sessionId: p.sessionId, chatId: p.chatId,
+    rootMessageId: p.rootMessageId, chatType: p.chatType, answererOpenId: p.answererOpenId,
+    questions: p.questions, createdAt: p.createdAt, deadlineAt: p.deadlineAt,
+    cardMessageId: p.cardMessageId, replyCardTarget: p.replyCardTarget, originalTurn: p.originalTurn,
+    managedRecord: p, managedDelivery: p.deliveryContext,
+    resumable: false, dormant: true, waiters: [],
+    timeoutMs: p.timeoutMs ?? p.deadlineAt - p.createdAt, timeoutStartsAfterDelivery: false,
+    settled: p.phase === 'terminal', settledAt: p.acceptedAt,
+    terminalResult: p.terminalResult,
+    selections: new Map(p.questions.map((_, i) => [i, new Set(p.selections?.[i] ?? [])])),
+  };
+  pending.set(ask.askId, ask);
+  if (!ask.settled) armAskTimeout(ask, Math.max(0, p.deadlineAt - now), now);
+  else if (!p.resultExpired) { armManagedExpiry(ask); publishManagedStatus(ask); }
+  return ask;
+}
+
+export interface AskLookupIdentity {
+  larkAppId: string;
+  sessionId: string;
+  chatId: string;
+  rootMessageId: string | null;
+  requestId: string;
+  originKind: string;
+}
+
+/** Internal daemon seam; no HTTP body can supply the store or mutate it. */
+export function managedAskStore() {
+  if (!persistStore?.managed) throw new ManagedAskError('managed_ask_store_unavailable');
+  return persistStore.managed;
+}
+
+export function managedAskHasWaiter(key: string): boolean {
+  return !!findByKey(key)?.waiters.length;
+}
+
+/** Called only after worker/session/generation validation in worker-pool. A
+ * missing event or failed disk write stays unknown; idle is never a substitute. */
+export function recordManagedAskTerminal(identity: {
+  larkAppId: string; sessionId: string; turnId: string; dispatchAttempt?: number;
+  workerGeneration: number; bootId: string;
+  status: 'completed' | 'failed' | 'cancelled' | 'ambiguous';
+}): void {
+  for (const ask of pending.values()) {
+    if (!ask.managedRecord || ask.larkAppId !== identity.larkAppId || ask.sessionId !== identity.sessionId
+      || ask.originalTurn?.turnId !== identity.turnId || ask.originalTurn.dispatchAttempt !== identity.dispatchAttempt) continue;
+    ask.managedRecord = managedAskStore().update(ask.askKey, p => {
+      const e = p.execution;
+      if (!e || e.bootId !== identity.bootId || e.workerGeneration !== identity.workerGeneration) return p;
+      if (e.terminal && e.terminal.status !== identity.status) throw new ManagedAskError('managed_ask_terminal_conflict', 409);
+      return { ...p, execution: { ...e, terminal: e.terminal ?? { status: identity.status, observedAt: Date.now() } } };
+    });
+  }
+}
+
+/** Strictly read-only, including when the session/record is expired or malformed. */
+export function lookupManagedAsk(identity: AskLookupIdentity, now = Date.now()) {
+  if (!persistStore?.managed) throw new ManagedAskError('managed_ask_store_unavailable');
+  const key = askKeyFor(identity.larkAppId, identity.sessionId, identity.originKind, identity.requestId);
+  const saved = persistStore.managed.get(key);
+  if (!saved.found) return { found: false as const, state: 'unknown' as const, reason: saved.reason };
+  const p = saved.record;
+  if (p.chatId !== identity.chatId || p.rootMessageId !== identity.rootMessageId) {
+    throw new ManagedAskError('managed_ask_identity_conflict', 403);
+  }
+  if (p.resultExpired || (p.expiresAt ?? Infinity) <= now) {
+    return { found: true as const, state: 'unknown' as const, reason: 'result_expired', askKey: key };
+  }
+  const active = findByKey(key);
+  return {
+    found: true as const, state: p.phase, askKey: key, requestId: p.requestId, originKind: p.originKind,
+    deliveryContext: p.deliveryContext, originalTurn: p.originalTurn,
+    execution: p.execution,
+    cardMessageId: p.cardMessageId, terminalResult: p.terminalResult,
+    acceptedAt: p.acceptedAt, expiresAt: p.expiresAt,
+    presentation: p.presentation, continuation: p.continuation,
+    ...(p.phase === 'pending' && (p.deadlineAt <= now || active?.pendingSystemResult)
+      ? { state: 'unknown' as const, reason: 'terminal_persistence_pending' } : {}),
+    // Absence of a live HTTP waiter does NOT prove the original CLI has stopped.
+    waiter: active && active.waiters.length > 0 ? 'attached' as const : 'unknown' as const,
+  };
+}
+
 /**
  * Re-attach a reconnecting hook to a restored DORMANT ask. Two cases:
  *  - answer already stashed (click → reattach): deliver the durable-handoff
@@ -447,7 +653,8 @@ function reattachByRequest(ask: InternalPending): Promise<AskResult> {
     ask.settledAt = Date.now();
     ask.terminalResult = result;
     clearTimeout(ask.timeoutHandle);
-    clearTimeout(ask.handoffExpiryHandle); // claimed → cancel the unclaimed-stash reaper
+    clearTimeout(ask.handoffExpiryHandle);
+    clearTimeout(ask.persistenceRetryHandle); // claimed → cancel the unclaimed-stash reaper
     persistStore?.remove(ask.askKey); // claimed → durable record no longer needed
     gcSettled();
     logger.info?.(`ask-broker: re-attach delivered stashed answer for ask ${ask.askId} (key=${ask.askKey})`);
@@ -472,6 +679,13 @@ function reattachByRequest(ask: InternalPending): Promise<AskResult> {
 /** Build the persisted projection from a live internal ask and write it. Only
  *  called for resumable asks. */
 function persistFromInternal(ask: InternalPending): void {
+  if (ask.managedRecord) {
+    const next = { ...ask.managedRecord, cardMessageId: ask.cardMessageId,
+      selections: ask.questions.map((_, i) => [...(ask.selections.get(i) ?? [])]) };
+    persistStore!.managed!.put(next);
+    ask.managedRecord = next;
+    return;
+  }
   if (!persistStore || !ask.resumable) return;
   // A settled ask with a stashed answer is a durable handoff that must be KEPT
   // until claimed; a settled ask without one has nothing left to resume.
@@ -533,6 +747,7 @@ export function toggleAsk(args: {
   if (!question.options.some((o) => o.key === args.key)) return 'stale';
 
   const sel = ask.selections.get(args.questionIndex)!;
+  const previousSelection = new Set(sel);
 
   if (question.multiSelect) {
     // 多选：有则删、无则加
@@ -549,7 +764,11 @@ export function toggleAsk(args: {
 
   // Persist the updated checkbox state so a restart mid-multi-select keeps the
   // boxes the user already ticked (best-effort; never blocks the toggle).
-  persistFromInternal(ask);
+  try { persistFromInternal(ask); }
+  catch {
+    ask.selections.set(args.questionIndex, previousSelection);
+    return 'persistence_failed';
+  }
 
   return 'toggled';
 }
@@ -623,14 +842,14 @@ export function submitAsk(args: {
     return 'needs_empty_confirm';
   }
 
-  settle(args.askId, {
+  const accepted = settle(args.askId, {
     kind: 'answered',
     answers,
     by: args.by,
     comment: null,
     timedOut: false,
   });
-  return 'accepted';
+  return accepted ? 'accepted' : 'persistence_failed';
 }
 
 /**
@@ -663,14 +882,14 @@ export function submitCustomReply(args: {
   const text = args.text.trim();
   if (!text) return 'stale';
 
-  settle(args.askId, {
+  const accepted = settle(args.askId, {
     kind: 'answered',
     answers: ask.questions.map(() => []),
     by: args.by,
     comment: text,
     timedOut: false,
   });
-  return 'accepted';
+  return accepted ? 'accepted' : 'persistence_failed';
 }
 
 /**
@@ -774,6 +993,10 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
     logger.info?.('ask-broker: restore sweep skipped — no persist store wired');
     return 0;
   }
+  for (const p of persistStore.managed?.list(now, larkAppId) ?? []) {
+    if (larkAppId && p.larkAppId !== larkAppId) continue;
+    if (!findByKey(p.askKey)) { restoreManagedAsk(p, now); restored++; }
+  }
   for (const p of persistStore.list(now)) {
     // One bot per daemon process: only restore asks this daemon can actually
     // serve (its own bot's sessions). Another bot's daemon owns the rest.
@@ -862,13 +1085,85 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
   return restored;
 }
 
+function armManagedExpiry(ask: InternalPending, retries = 0): void {
+  clearTimeout(ask.managedExpiryHandle);
+  const expiresAt = ask.managedRecord?.expiresAt;
+  if (expiresAt === undefined || ask.managedRecord?.resultExpired) return;
+  const wait = retries ? 30000 : Math.max(0, expiresAt - Date.now());
+  ask.managedExpiryHandle = setTimeout(() => {
+    if (pending.get(ask.askId) !== ask) return;
+    try {
+      const record = persistStore?.managed?.expire(ask.askKey);
+      if (record?.resultExpired) {
+        ask.managedRecord = record;
+        ask.terminalResult = undefined;
+        ask.selections = new Map(ask.questions.map((_, i) => [i, new Set<string>()]));
+        gcSettled();
+      }
+    } catch (error) {
+      logger.warn(`ask-broker: answer expiry failed for ${ask.askId}: ${(error as Error).message}`);
+      if (retries < 10) armManagedExpiry(ask, retries + 1);
+    }
+  }, wait);
+  ask.managedExpiryHandle.unref?.();
+}
+
 /** Internal — settle an ask exactly once and notify the dispatcher's onSettle
  *  hook (best-effort, never blocks broker state transitions). The settled
  *  entry stays in the map for `SETTLED_RETENTION_MS` so late race-losers get
  *  a precise `already_settled` outcome; `gcSettled` reaps it afterward. */
-function settle(askId: string, result: AskResult): void {
+function settle(askId: string, result: AskResult): boolean {
   const ask = pending.get(askId);
-  if (!ask || ask.settled) return;
+  if (!ask || ask.settled) return false;
+
+  if (ask.managedRecord) {
+    const acceptedAt = Date.now();
+    let next: PersistedManagedAsk = { ...ask.managedRecord,
+      cardMessageId: ask.cardMessageId, phase: 'terminal', terminalResult: result,
+      acceptedAt, expiresAt: acceptedAt + HANDOFF_RETENTION_MS,
+      presentation: { ...ask.managedRecord.presentation, state: result.kind === 'answered' ? 'pending' : 'none', revision: 1, phase: 'accepted' },
+    };
+    if (result.kind !== 'answered') ask.pendingSystemResult = result;
+    if (result.kind === 'answered' && (ask.pendingSystemResult || ask.deadlineAt <= acceptedAt)) return false;
+    try {
+      const saved = persistStore!.managed!.get(ask.askKey);
+      if (saved.found && saved.record.phase === 'terminal') {
+        // A previous rename may have landed before an fsync/response error.
+        // Never overwrite its result or extend its retention on retry.
+        if (JSON.stringify(saved.record.terminalResult) !== JSON.stringify(result)) {
+          throw new ManagedAskError('managed_ask_terminal_conflict', 409);
+        }
+        next = { ...saved.record, cardMessageId: ask.cardMessageId ?? saved.record.cardMessageId };
+      }
+      persistStore!.managed!.put(next);
+    }
+    catch (e) {
+      logger.warn(`ask-broker: durable acceptance failed for ${askId}: ${e instanceof Error ? e.message : String(e)}`);
+      // No answer is acknowledged on failure. Timeout/cancel has no human retry,
+      // so retry the SAME result with a bounded timer; never create another Ask.
+      if (result.kind !== 'answered' && !ask.persistenceRetryHandle && (ask.persistenceRetryCount ?? 0) < 60) {
+        ask.persistenceRetryCount = (ask.persistenceRetryCount ?? 0) + 1;
+        ask.persistenceRetryHandle = setTimeout(() => {
+          ask.persistenceRetryHandle = undefined;
+          settle(askId, result);
+        }, 5000);
+        ask.persistenceRetryHandle.unref?.();
+      }
+      return false;
+    }
+    ask.managedRecord = next;
+    ask.settled = true;
+    ask.settledAt = next.acceptedAt;
+    ask.terminalResult = result;
+    clearTimeout(ask.timeoutHandle);
+    clearTimeout(ask.persistenceRetryHandle);
+    const waiters = ask.waiters.splice(0);
+    // Release is synchronous after commit. Presentation cannot hold the answer hostage.
+    for (const waiter of waiters) waiter(result);
+    armManagedExpiry(ask);
+    notifyOnSettle(ask, result);
+    return true;
+  }
 
   // Durable handoff (codex P1-1): a dormant ask (restored after a restart, no
   // waiter yet) that receives an ANSWER must NOT drop it into the void. Stash
@@ -891,7 +1186,7 @@ function settle(askId: string, result: AskResult): void {
     logger.info?.(`ask-broker: stashed answer for dormant ask ${askId} (key=${ask.askKey}) — awaiting hook claim`);
     // Still notify the card layer so the Feishu card flips to its settled view.
     notifyOnSettle(ask, result);
-    return;
+    return true;
   }
 
   ask.settled = true;
@@ -921,11 +1216,13 @@ function settle(askId: string, result: AskResult): void {
   }
 
   notifyOnSettle(ask, result);
+  return true;
 }
 
 /** Notify the IM-side dispatcher's onSettle hook (best-effort — never blocks
  *  broker state). Shared by the normal settle path and the dormant-answer stash. */
 function notifyOnSettle(ask: InternalPending, result: AskResult): void {
+  publishManagedStatus(ask);
   if (!dispatcher?.onSettle) return;
   try {
     void Promise.resolve(dispatcher.onSettle(snapshot(ask), result)).catch((err) => {
@@ -946,7 +1243,8 @@ function snapshot(ask: InternalPending): PendingAsk {
   const {
     // Runtime-only / broker-internal fields excluded from the IM contract:
     waiters: _w, timeoutHandle: _t, settledAt: _sat, selections: _sel,
-    handoffExpiryHandle: _he,
+    handoffExpiryHandle: _he, managedRecord: _mr, persistenceRetryHandle: _pr,
+    persistenceRetryCount: _pc, pendingSystemResult: _ps, managedExpiryHandle: _me,
     timeoutMs: _tm, timeoutStartsAfterDelivery: _td, timeoutStartedAt: _ts,
     askKey: _ak, requestId: _rid, resumable: _rs,
     dormant: _dm, answeredResult: _ar, terminalResult: _tr,
@@ -974,6 +1272,7 @@ function snapshot(ask: InternalPending): PendingAsk {
 function gcSettled(): void {
   const cutoff = Date.now() - SETTLED_RETENTION_MS;
   for (const [id, ask] of pending) {
+    if (ask.managedRecord && !ask.managedRecord.resultExpired) continue;
     if (ask.dormant && ask.answeredResult) continue; // unclaimed handoff — keep
     if (ask.settled && ask.settledAt !== undefined && ask.settledAt < cutoff) {
       pending.delete(id);
@@ -1067,14 +1366,14 @@ export function submitAskFromDesktop(args: {
   }
   const answers = canonical;
 
-  settle(args.askId, {
+  const accepted = settle(args.askId, {
     kind: 'answered',
     answers,
     by: args.by ?? 'desktop',
     comment: null,
     timedOut: false,
   });
-  return 'accepted';
+  return accepted ? 'accepted' : 'persistence_failed';
 }
 
 /** Read a pending ask by id — for tests only. Returns a snapshot; mutating it
@@ -1095,9 +1394,12 @@ export function _resetForTest(): void {
   for (const ask of pending.values()) {
     clearTimeout(ask.timeoutHandle);
     clearTimeout(ask.handoffExpiryHandle);
+    clearTimeout(ask.persistenceRetryHandle);
+    clearTimeout(ask.managedExpiryHandle);
   }
   pending.clear();
   dispatcher = null;
+  managedPresenter = undefined;
   canTalkChecker = null;
   handoffRetentionMs = HANDOFF_RETENTION_MS; // restore default retention
   // Detach the injected store — never delete files here (codex P1-4: a helper

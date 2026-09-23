@@ -13195,7 +13195,10 @@ async function cmdCreateGroupTeam(rest: string[]): Promise<void> {
  *     与非 JSON 是 retryable=false —— 重试 24h 也不会变,应立即 passthrough。
  */
 async function postAsk(body: Record<string, unknown>): Promise<import('./core/ask-types.js').AskResult> {
-  type AskResult = import('./core/ask-types.js').AskResult;
+  return postAskRequest(body, '/api/asks');
+}
+
+async function postAskRequest<T>(body: Record<string, unknown>, path: '/api/asks' | '/api/asks/lookup'): Promise<T> {
   type AskError = Error & { exitCode: number; retryable: boolean };
   const mkErr = (message: string, retryable: boolean): AskError =>
     Object.assign(new Error(message), { exitCode: 3, retryable });
@@ -13234,8 +13237,8 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
       try { hostSecret = loadDaemonIpcSecret(); } catch { /* read-isolated CLI uses live marker auth */ }
     }
     res = hostSecret
-      ? await fetchDaemonIpc(daemon.ipcPort, '/api/asks', init, hostSecret)
-      : await loopbackFetch(`http://127.0.0.1:${daemon.ipcPort}/api/asks`, init);
+      ? await fetchDaemonIpc(daemon.ipcPort, path, init, hostSecret)
+      : await loopbackFetch(`http://127.0.0.1:${daemon.ipcPort}${path}`, init);
   } catch (fetchErr) {
     // Socket refused / reset / timeout → daemon is down or restarting → retryable.
     const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
@@ -13254,7 +13257,7 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
   }
 
   try {
-    return (await res.json()) as AskResult;
+    return (await res.json()) as T;
   } catch (jsonErr) {
     // A malformed body is not something a retry fixes.
     throw mkErr(`botmux ask: daemon 返回非 JSON: ${jsonErr}`, false);
@@ -13281,9 +13284,9 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   // Only `buttons` shipped in v0.1.7. The bare alias (`botmux ask --options`)
   // routes here with sub='' — accept it and behave identically. `ask text` /
   // `ask confirm` are reserved for later versions.
-  if (sub && sub !== 'buttons') {
+  if (sub && sub !== 'buttons' && sub !== 'lookup') {
     console.error(
-      `botmux ask: 未知 subcommand "${sub}"（v0.1.7 仅支持 \`buttons\` 或省略）`,
+      `botmux ask: 未知 subcommand "${sub}"（支持 buttons、lookup 或省略）`,
     );
     process.exit(2);
   }
@@ -13301,6 +13304,32 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     );
     process.exit(2);
   }
+
+  if (sub === 'lookup') {
+    const { parseAskLookup } = await import('./core/managed-ask-api.js');
+    const { managedAskRootFromEnv } = await import('./core/managed-ask-args.js');
+    const sessionId = process.env.BOTMUX_SESSION_ID!;
+    const origin = resolveSessionContext(resolveDataDir(), sessionId);
+    try {
+      const identity = parseAskLookup({
+        sessionId, larkAppId: process.env.BOTMUX_LARK_APP_ID, chatId: process.env.BOTMUX_CHAT_ID,
+        rootMessageId: managedAskRootFromEnv(process.env),
+        requestId: argValue(rest, '--request-id'), originKind: argValue(rest, '--origin-kind') ?? 'explicit',
+      });
+      const result = await postAskRequest({ ...identity,
+        originTurnId: origin?.turnId, originDispatchAttempt: origin?.dispatchAttempt,
+      }, '/api/asks/lookup');
+      process.stdout.write(JSON.stringify(result) + '\n');
+      return;
+    } catch (error) {
+      console.error((error as Error).message);
+      process.exit(3);
+    }
+  }
+  const { readManagedAskArgsFromArgv, managedAskRootFromEnv } = await import('./core/managed-ask-args.js');
+  let managedArgs;
+  try { managedArgs = readManagedAskArgsFromArgv(rest); }
+  catch (error) { console.error((error as Error).message); process.exit(2); }
 
   const optionsRaw = argValue(rest, '--options');
   const timeoutRaw = argValue(rest, '--timeout');
@@ -13340,10 +13369,11 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     process.env.BOTMUX_ORIGIN_CHANNEL_ID,
   )?.capability;
   const body = {
+    ...managedArgs,
     sessionId: askSessionId,
     chatId: process.env.BOTMUX_CHAT_ID!,
     larkAppId,
-    rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID || null,
+    rootMessageId: managedArgs.managedDelivery ? managedAskRootFromEnv(process.env) : process.env.BOTMUX_ROOT_MESSAGE_ID || null,
     ...(multiSelect
       ? { questions: [{ prompt, options, multiSelect: true }] }
       : { options, prompt }),
@@ -13373,6 +13403,10 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
 
   if (useJson) {
     const out: AskJsonOutput = {
+      ...(managedArgs.managedDelivery ? {
+        kind: result.kind, requestId: managedArgs.requestId, originKind: 'explicit',
+        ...(result.kind === 'invalidated' ? { reason: result.reason } : {}),
+      } : {}),
       // `selected` 是「单问单选」的向后兼容值（= toLegacySelected 的形状判据：
       // 恰好 1 问且恰好 1 个 key）。`--multi` 下调用方明确按多选语义读 `answers[0]`，
       // 此时 `selected` 必须恒为 null——否则「多选恰好 1 项」会因形状巧合退化出一个

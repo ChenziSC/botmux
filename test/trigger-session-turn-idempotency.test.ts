@@ -87,7 +87,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   hasQueuedActivationAdmissionGate: () => queuedActivationGateActive,
 }));
 
-import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit } from '../src/core/trigger-session.js';
+import { triggerSessionTurn, lookupRegisteredTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit } from '../src/core/trigger-session.js';
 import * as asyncTriggerStore from '../src/services/async-trigger-store.js';
 import * as idempotencyStore from '../src/services/idempotency-store.js';
 import { sessionKey } from '../src/core/types.js';
@@ -572,4 +572,42 @@ describe('recovery thinking presentation', () => {
     expect(ds.session.hiddenThinkingTurns).not.toContain(normal.triggerId);
     expect(ds.suppressedTriggerFinalTurns?.has(first.triggerId!)).not.toBe(true);
   });
+});
+
+describe('managed Ask input-boundary guard', () => {
+  it.each([true, false])('rejects changed scope before %s worker input and never replays the same key', async live => {
+    const ds = existingDs(live ? { worker: { connected: true, killed: false } as any } : {});
+    const activeSessions = activeWith(ds);
+    const request = followUpReq('ask-a:answered-continuation');
+    const guard = vi.fn(() => { throw new Error('scope_cancelled'); });
+    const result = await triggerSessionTurn(request, { larkAppId: APP, activeSessions }, { assertInputCurrent: guard });
+    expect(result.ok).toBe(false);
+    expect(guard).toHaveBeenCalledTimes(1);
+    expect(mockForkWorker).not.toHaveBeenCalled();
+    expect(mockSendWorkerInput).not.toHaveBeenCalled();
+    await triggerSessionTurn(request, { larkAppId: APP, activeSessions }, { assertInputCurrent: () => {} });
+    expect(mockForkWorker).not.toHaveBeenCalled();
+    expect(mockSendWorkerInput).not.toHaveBeenCalled();
+  });
+  it('does not accept a sourceAsk display claim as continuation authorization', async () => {
+    const request = followUpReq('ask-a:answered-continuation');
+    request.presentation = { deliveryContext: { version: 1, domain: 'ip', handoffId: 'h', actor: 'leader', stage: 'review', title: 'Review', sourceAsk: { requestId: 'ask-a', originKind: 'explicit' } } };
+    const result = await triggerSessionTurn(request, { larkAppId: APP, activeSessions: activeWith(existingDs()) });
+    expect(result).toMatchObject({ ok: false, errorCode: 'bad_request' });
+    expect(mockForkWorker).not.toHaveBeenCalled();
+    expect(mockSendWorkerInput).not.toHaveBeenCalled();
+  });
+});
+
+
+it('recovers only the matching turn lease through a read-only key lookup', async () => {
+  const request = followUpReq('ask-read-only-key');
+  expect(lookupRegisteredTurn(request, APP)).toBeUndefined();
+  const activeSessions = activeWith(existingDs());
+  const result = await triggerSessionTurn(request, { larkAppId: APP, activeSessions });
+  const leaseBefore = idempotencyStore.lookup(APP, `${SID}\0ask-read-only-key`, 'turn');
+  expect(lookupRegisteredTurn(request, APP)).toEqual({ triggerId: result.triggerId });
+  expect(idempotencyStore.lookup(APP, `${SID}\0ask-read-only-key`, 'turn')).toEqual(leaseBefore);
+  expect(() => lookupRegisteredTurn({ ...request, instruction: 'changed' }, APP)).toThrow('registered_trigger_conflict');
+  expect(mockForkWorker).toHaveBeenCalledTimes(1);
 });

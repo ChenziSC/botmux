@@ -47,6 +47,7 @@ export const messages: Record<string, string> = {
   // ─── Card status ─────────────────────────────────────────────────────────
   'card.status.starting': 'Starting…',
   'card.status.working': 'Working',
+  'card.status.idle_processing': 'Execution idle · awaiting workflow confirmation',
   'card.status.idle': 'Awaiting input',
   'card.status.idle_silent': 'Handled · no reply needed',
   'card.status.idle_failed': 'Failed',
@@ -1591,6 +1592,7 @@ export const messages: Record<string, string> = {
   'card.ask.toast.grant_pending': 'Your access request is pending — click again once the owner approves',
   'card.ask.toast.grant_denied': 'The owner declined your access request — reach out to them directly if you need to answer',
   'card.ask.toast.already_settled': 'This ask was already answered or closed',
+  'card.ask.toast.persistence_failed': 'Your answer could not be saved. Retry this card; the task has not resumed.',
   'card.ask.toast.stale': '⚠️ This ask is no longer valid',
   'card.ask.custom_reply': 'Custom reply',
   'card.ask.q_summary_line': 'Q{n}: {labels}',

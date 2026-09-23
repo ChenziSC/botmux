@@ -91,6 +91,17 @@ const states = new WeakMap<DaemonSession, CotState>();
 const recentStates = new WeakMap<DaemonSession, Map<string, CotState>>();
 const RECENT_COT_STATES_MAX = 8;
 
+/** Called only after a replacement Ask segment is durably visible. Never
+ * returns other turns' messages, final replies, Ask cards or user notices. */
+export function retireManagedAskCot(ds: DaemonSession, turnId: string): string[] {
+  const current = states.get(ds);
+  const state = current?.turnId === turnId ? current : recentStates.get(ds)?.get(turnId);
+  if (!state) return [];
+  state.disabled = true;
+  if (state.pumping && !state.messageId) throw new Error('runtime_cot_publication_pending');
+  return state.messageId ? [state.messageId] : [];
+}
+
 function rememberRecentState(ds: DaemonSession, state: CotState): void {
   let m = recentStates.get(ds);
   if (!m) { m = new Map(); recentStates.set(ds, m); }

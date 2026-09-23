@@ -1,3 +1,5 @@
+import type { ManagedDeliveryContextV1, AskOriginalTurn } from './managed-ask-types.js';
+
 /**
  * Public types for `botmux ask` (v0.1.8).
  *
@@ -71,6 +73,11 @@ export type AskResult =
  *  保留 `selected: string | null` 做向后兼容（等价于 `toLegacySelected`）。
  *  `comment` 携带用户的自定义回复原文（话题直接打字作答），无则 null。 */
 export interface AskJsonOutput {
+  /** Managed callers retain the exact terminal, including invalidation reason. */
+  kind?: AskResult['kind'];
+  reason?: string;
+  requestId?: string;
+  originKind?: string;
   /** 向后兼容：单问单选时等于 `answers[0][0]`，否则为 null。 */
   selected: string | null;
   /** v0.1.8 新增：按问题分组的完整答案，answered 时非 null。 */
@@ -87,6 +94,13 @@ export interface AskJsonOutput {
  *
  *  v0.1.8 变更：`options`/`prompt` 字段替换为 `questions: ReadonlyArray<AskQuestion>`。 */
 export interface CreateAskInput {
+  /** Daemon-only HTTP waiter lifetime; never accepted from request JSON. */
+  waiterSignal?: AbortSignal;
+  managedHandoffPreview?: import('./handoff-preview.js').HandoffPreview;
+  managedDelivery?: ManagedDeliveryContextV1;
+  /** Daemon-bound, never copied from arbitrary request JSON. */
+  originalTurn?: AskOriginalTurn;
+  originalExecution?: import('./managed-ask-types.js').ManagedAskExecution;
   /** Daemon-bound presentation target; never accepted directly from CLI JSON. */
   replyCardTarget?: { turnId: string; dispatchAttempt?: number };
   larkAppId: string;
@@ -131,6 +145,8 @@ export interface CreateAskInput {
  *
  *  v0.1.8 变更：`options`/`prompt` 替换为 `questions`。 */
 export interface PendingAsk {
+  managedDelivery?: ManagedDeliveryContextV1;
+  originalTurn?: AskOriginalTurn;
   replyCardTarget?: CreateAskInput['replyCardTarget'];
   result?: AskResult;
   askId: string;
@@ -172,6 +188,8 @@ export interface PendingAsk {
 export type AskClickOutcome =
   /** First valid click — caller's Promise resolves with `kind:'answered'`. */
   | 'accepted'
+  /** Durable acceptance failed; keep the same Ask pending and allow a retry. */
+  | 'persistence_failed'
   /** Clicker can't canTalk to the bot in this chat — caller shows "你没有权限". */
   | 'unauthorized'
   /** No such askId, nonce mismatch, or unknown option — caller shows
@@ -185,6 +203,12 @@ export type AskClickOutcome =
    *  都允许空集（全多选），提交极可能是手滑——先不 settle，要求带 confirmEmpty 再点
    *  一次。仅当所有问题都可空时才可能返回；任一单选未选走 `stale`（空非有效答案）。 */
   | 'needs_empty_confirm';
+
+/** An authenticated answer whose persistence failed still belongs to its Ask.
+ * It must never fall through to the normal new-turn dispatcher. */
+export function askReplyRoute(outcome: AskClickOutcome): 'handled' | 'retry' | 'passthrough' {
+  return outcome === 'accepted' ? 'handled' : outcome === 'persistence_failed' ? 'retry' : 'passthrough';
+}
 
 /** 旧单选语义兼容：仅当"单问且恰好选 1 个"时返回该 key，否则 null。
  *  `botmux ask buttons` 子命令与其测试据此保持单选行为不变。 */

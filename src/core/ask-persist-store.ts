@@ -46,6 +46,7 @@ import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
 import type { AskQuestion, AskResult } from './ask-types.js';
+import { createManagedAskStore, type ManagedAskStore } from './managed-ask-store.js';
 
 /** Sentinel file marking a directory as a botmux ask store. teardown/reset only
  *  ever touches a directory that contains this file — a guard against a missing
@@ -153,6 +154,8 @@ export function dispatchUuidForKey(askKey: string): string {
 }
 
 export interface AskPersistStore {
+  /** Separate namespace protects managed records from legacy v2 garbage collection. */
+  readonly managed?: ManagedAskStore;
   /** Absolute directory this store owns. */
   readonly dir: string;
   /** Create-or-update a record. Best-effort durable (atomic rename + fsync). */
@@ -189,6 +192,7 @@ export function createAskPersistStore(dir: string): AskPersistStore {
 
   return {
     dir,
+    managed: createManagedAskStore(dir),
     put(ask: PersistedAsk): void {
       try {
         ensureDir();
@@ -231,7 +235,8 @@ export function createAskPersistStore(dir: string): AskPersistStore {
           try { unlinkSync(fp); } catch { /* ignore */ }
           continue;
         }
-        if (!parsed || parsed.v !== 2 || !parsed.askKey || !parsed.requestId || !Array.isArray(parsed.questions)) {
+        if (parsed && parsed.v !== 2) continue; // Unknown schema belongs to another reader; preserve it.
+        if (!parsed || !parsed.askKey || !parsed.requestId || !Array.isArray(parsed.questions)) {
           try { unlinkSync(fp); } catch { /* ignore */ }
           continue;
         }

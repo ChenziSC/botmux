@@ -1,3 +1,4 @@
+import { prepareTurnStatusPolicy, bindTurnStatusDispatch } from './turn-status-policy.js';
 import { armTriggerStreamingCard } from './trigger-streaming-card.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
@@ -47,6 +48,8 @@ export interface TriggerSessionDeps {
  * public TriggerRequest schema: an untrusted connector must not choose a turn
  * identity that participates in durable delivery reconciliation. */
 export interface TriggerSessionInternalOptions {
+  /** Host-owned synchronous scope/answer guard, re-read at the input boundary. */
+  assertInputCurrent?: () => void;
   stableTurnId?: string;
   /** Synchronous write-ahead hook invoked immediately before worker IPC/fork.
    *  Durable receivers use it to persist DISPATCHED with the exact worker
@@ -779,6 +782,8 @@ async function triggerSessionTurnAdmitted(
   const steerRequested = req.options?.steer === true;
   const preparePresentation = (target: DaemonSession): void => {
     armTriggerStreamingCard(target, req, triggerId);
+    prepareTurnStatusPolicy(target, req, triggerId);
+    sessionStore.updateSession(target.session);
     if (req.presentation?.thinking !== 'hidden') return;
     target.session.hiddenThinkingTurns = [
       ...(target.session.hiddenThinkingTurns ?? []).filter(id => id !== triggerId), triggerId,
@@ -794,8 +799,15 @@ async function triggerSessionTurnAdmitted(
         ? { content, codexAppSteerable: true }
         : { ...content, codexAppSteerable: true };
   const prepareStableDispatch = (target: DaemonSession, willFork: boolean): number | undefined => {
+    internal?.assertInputCurrent?.();
     preparePresentation(target);
-    if (!stableTurnId || !internal?.beforeDispatch) return undefined;
+    if (!stableTurnId || !internal?.beforeDispatch) {
+      bindTurnStatusDispatch(target, triggerId, willFork
+        ? Math.max(target.workerGeneration ?? 0, target.session.workerGeneration ?? 0) + 1
+        : Math.max(target.workerGeneration ?? 0, target.session.workerGeneration ?? 0, 1));
+      sessionStore.updateSession(target.session);
+      return undefined;
+    }
     const currentWorkerGeneration = Math.max(
       target.workerGeneration ?? 0,
       target.session.workerGeneration ?? 0,
@@ -808,6 +820,8 @@ async function triggerSessionTurnAdmitted(
     if (!Number.isSafeInteger(prepared.dispatchAttempt) || prepared.dispatchAttempt < 1) {
       throw new Error('beforeDispatch returned an invalid dispatchAttempt');
     }
+    bindTurnStatusDispatch(target, triggerId, workerGeneration, prepared.dispatchAttempt);
+    sessionStore.updateSession(target.session);
     return prepared.dispatchAttempt;
   };
   const armFinalOutputSuppression = (target: DaemonSession, dispatchAttempt: number | undefined): void => {
@@ -841,7 +855,7 @@ async function triggerSessionTurnAdmitted(
   // Card presentation also needs an exact worker turn id, independently of
   // final-output suppression. Otherwise a reused worker invents its own id and
   // its input-committed acknowledgement cannot consume the armed handoff card.
-  const loudTurnId = suppressLoudFinal || req.presentation?.liveCard === 'on-start' || req.presentation?.thinking === 'hidden'
+  const loudTurnId = suppressLoudFinal || req.presentation?.liveCard === 'on-start' || req.presentation?.thinking === 'hidden' || !!req.presentation?.statusCard || !!req.presentation?.deliveryContext
     ? triggerId : undefined;
   const armLoudFinalSuppression = (target: DaemonSession): void => {
     if (!suppressLoudFinal) return;
@@ -1043,17 +1057,8 @@ async function triggerSessionTurnAdmitted(
   // mistaken for (or collide with) any other session's/seam's hash (codex #818
   // P1-2: the fresh hash omits sessionId, so without this a same-payload fresh
   // and turn request could hash-match).
-  const { idempotencyKey: _omitK1, turnIdempotencyKey: _omitK2, ...turnOptionsForHash } = (req.options ?? {}) as Record<string, unknown>;
   const turnRequestHash = turnLeaseKey
-    ? computeInputHash({
-        seam: 'turn',
-        sessionId: req.target.sessionId ?? null,
-        instruction: req.instruction ?? null,
-        envelope: req.envelope,
-        source: req.source,
-        presentation: req.presentation ?? null,
-        options: turnOptionsForHash,
-      })
+    ? turnTriggerRequestHash(req)
     : '';
   let turnIdempotencyTakeover: idempotencyStore.IdempotencyRecord | undefined;
   if (turnLeaseKey && !dryRun) {
@@ -1845,7 +1850,7 @@ async function triggerSessionTurnAdmitted(
     // suppress a normal turn. The suppression is best-effort for this narrow race,
     // not a hard guarantee — consistent with the 256/TTL best-effort bound.
     if (loudTurnId) newDs.pendingTurnId = loudTurnId;
-    preparePresentation(newDs);
+    prepareStableDispatch(newDs, true);
     armLoudFinalSuppression(newDs);
     const { runAutoWorktreeCommit } = await import('../im/lark/card-handler.js');
     void runAutoWorktreeCommit({
@@ -2184,7 +2189,7 @@ async function triggerSessionTurnAdmitted(
     releaseInitialReservation();
   }
   else if (loudTurnId) {
-    preparePresentation(newDs);
+    prepareStableDispatch(newDs, true);
     armLoudFinalSuppression(newDs);
     forkWorker(newDs, promptInput, loudTurnId);
     releaseInitialReservation();
@@ -2203,11 +2208,33 @@ async function triggerSessionTurnAdmitted(
   };
 }
 
+function turnTriggerRequestHash(req: TriggerRequest): string {
+  const { idempotencyKey: _fresh, turnIdempotencyKey: _turn, ...options } = (req.options ?? {}) as Record<string, unknown>;
+  return computeInputHash({ seam: 'turn', sessionId: req.target.sessionId ?? null,
+    instruction: req.instruction ?? null, envelope: req.envelope, source: req.source,
+    presentation: req.presentation ?? null, options });
+}
+
+/** Pure reconciliation: no convergence, takeover, claim, GC or dispatch. */
+export function lookupRegisteredTurn(req: TriggerRequest, ownerLarkAppId: string): { triggerId: string } | undefined {
+  if (!req.target.sessionId || !req.options?.turnIdempotencyKey) return;
+  const hit = idempotencyStore.lookup(ownerLarkAppId, `${req.target.sessionId}\u0000${req.options.turnIdempotencyKey}`, 'turn');
+  if (!hit) return;
+  if (hit.ownerLarkAppId !== ownerLarkAppId || hit.sessionId !== req.target.sessionId
+    || hit.requestHash !== turnTriggerRequestHash(req)) throw new Error('managed_ask_registered_trigger_conflict');
+  // reserved is before the dispatch barrier and can still require a guarded
+  // same-key registration. attempting is uncertain and must never be replayed.
+  return hit.state === 'reserved' ? undefined : { triggerId: hit.triggerId };
+}
+
 export async function triggerSessionTurn(
   req: TriggerRequest,
   deps: TriggerSessionDeps,
   internal?: TriggerSessionInternalOptions,
 ): Promise<TriggerResponse> {
+  if (req.presentation?.deliveryContext?.sourceAsk && !internal?.assertInputCurrent) {
+    return { ok: false, errorCode: 'bad_request', error: 'sourceAsk requires managed Ask continuation admission' };
+  }
   const result = await withBotTurnAdmission(
     deps.larkAppId,
     () => triggerSessionTurnAdmitted(req, deps, internal),

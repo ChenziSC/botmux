@@ -20210,6 +20210,7 @@ function workerIpcPayload(msg: WorkerToDaemon): WorkerToDaemon {
 }
 
 function send(msg: WorkerToDaemon): void {
+  if (msg.type === 'screen_update') msg = { ...msg, observedAt: Date.now() };
   if (closeRequested && msg.type === 'final_output') {
     log('Dropped final_output after close fence');
     return;

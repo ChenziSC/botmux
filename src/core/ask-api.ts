@@ -1,3 +1,4 @@
+import { parseManagedDeliveryContext, type ManagedDeliveryContextV1 } from './managed-ask-types.js';
 /**
  * Pure helpers for the daemon's `POST /api/asks` IPC route.
  *
@@ -8,6 +9,7 @@
 import type { AskOption, AskQuestion } from './ask-types.js';
 
 export interface AskApiBody {
+  managedDelivery?: ManagedDeliveryContextV1;
   sessionId: string;
   chatId: string;
   larkAppId: string;
@@ -42,7 +44,8 @@ export type AskApiBodyError =
   | 'bad_question_shape'
   | 'bad_multiSelect'
   | 'bad_requestId'
-  | 'bad_originKind';
+  | 'bad_originKind'
+  | 'bad_managedDelivery';
 
 /** 校验单个 option 对象，返回解析后的 AskOption 或错误码。 */
 function parseOption(o: unknown): AskOption | AskApiBodyError {
@@ -117,6 +120,11 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     originKind = r.originKind;
   }
 
+  const managedDelivery = r.managedDelivery === undefined ? undefined : parseManagedDeliveryContext(r.managedDelivery);
+  if (r.managedDelivery !== undefined && (!managedDelivery || !requestId || originKind !== 'explicit')) {
+    return { error: 'bad_managedDelivery' };
+  }
+
   let questions: AskQuestion[];
 
   if (Array.isArray(r.questions)) {
@@ -147,6 +155,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   }
 
   return {
+    ...(managedDelivery ? { managedDelivery } : {}),
     sessionId: r.sessionId,
     chatId: r.chatId,
     larkAppId: r.larkAppId,

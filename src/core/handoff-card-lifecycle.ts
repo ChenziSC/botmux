@@ -54,7 +54,14 @@ export async function applyHandoffCardEvent(ds: DaemonSession, event: HandoffCar
   const cardId = ds.streamCardId;
   // Sentinel is runtime-private; a pending POST cleans itself on completion.
   if (cardId && cardId !== '__posting__') await io.remove(cardId);
-  if (ds.session.handoffLiveCard !== state || ds.streamCardId !== cardId) return;
+  // SQLite persistence rehydrates nested session values, so reference identity
+  // cannot distinguish the persisted state from a successor. Fence the exact
+  // completed event instead, including a turn/card change during the delete.
+  const latest = ds.session.handoffLiveCard;
+  if (!latest || latest.turnId !== event.turnId || latest.sequence !== event.sequence
+    || !latest.closed || latest.resultMessageId !== event.resultMessageId
+    || (ds.currentTurnId && ds.currentTurnId !== event.turnId)
+    || ds.streamCardId !== cardId) return;
   ds.streamCardId = undefined;
   ds.streamCardNonce = undefined;
   ds.streamCardPending = false;

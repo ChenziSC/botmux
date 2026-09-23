@@ -72,6 +72,7 @@ export interface BotCardPrefs {
    *  Default TRUE (absent = on; only explicit false persists). Per-chat
    *  opt-out lives in noCotChats (`/cot off`), not here. */
   cotEnabled: boolean;
+  thinkingCardToolResult: boolean;
   /** Whether each forwarded turn carries a `<sender …/>` tag naming the speaker.
    *  Default TRUE (absent = on; only an explicit false persists), same
    *  convention as cotEnabled. Off also drops the cursor anti-echo note (it is
@@ -126,6 +127,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       silentTurnReactions: c.silentTurnReactions === true,
       codexAppCleanInput: c.codexAppCleanInput === true,
       codexBrowser: c.codexBrowser?.enabled === true,
+      thinkingCardToolResult: c.thinkingCardToolResult !== false,
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
       privateCard: c.privateCard === true,
       cotEnabled: c.cotEnabled !== false,
@@ -156,6 +158,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       silentTurnReactions: false,
       codexAppCleanInput: false,
       codexBrowser: false,
+      thinkingCardToolResult: true,
       writableTerminalLinkInCard: false,
       privateCard: false,
       cotEnabled: true,
@@ -273,6 +276,7 @@ async function updateBotCardPrefsInternal(
     apply(entry, 'silentTurnReactions', patch.silentTurnReactions);
     apply(entry, 'codexAppCleanInput', patch.codexAppCleanInput);
     apply(entry, 'codexBrowser', patch.codexBrowser);
+    applyDefaultTrue(entry, 'thinkingCardToolResult', patch.thinkingCardToolResult);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
     apply(entry, 'privateCard', patch.privateCard);
     applyDefaultTrue(entry, 'cotEnabled', patch.cotEnabled);
@@ -303,6 +307,7 @@ async function updateBotCardPrefsInternal(
         codexAppCleanInput: entry.codexAppCleanInput === true,
         codexBrowser: entry.codexBrowser === true
           || (typeof entry.codexBrowser === 'object' && entry.codexBrowser?.enabled === true),
+        thinkingCardToolResult: entry.thinkingCardToolResult !== false,
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
         privateCard: entry.privateCard === true,
         cotEnabled: entry.cotEnabled !== false,
@@ -365,6 +370,9 @@ async function updateBotCardPrefsInternal(
   }
   if (patch.privateCard !== undefined) {
     bot.config.privateCard = patch.privateCard || undefined;
+  }
+  if (patch.thinkingCardToolResult !== undefined) {
+    bot.config.thinkingCardToolResult = patch.thinkingCardToolResult === false ? false : undefined;
   }
   if (patch.cotEnabled !== undefined) {
     // Default true: store false explicitly, clear (→ default on) when true.

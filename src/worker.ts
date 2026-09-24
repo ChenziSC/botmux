@@ -66,7 +66,7 @@ import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, ClaudeModelFallbackTracker, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, ClaudeModelFallbackTracker, BackgroundTaskTracker, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { bridgePostText, composeFailedBridgeFallbackContent, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
@@ -4700,6 +4700,12 @@ const bridgeSecondaryPaths = new Map<string, number>(); // path → offset
 let bridgeOffset = 0;
 let bridgePendingTail = '';
 const bridgeQueue = new BridgeTurnQueue();
+/** Counts background Agent/Task dispatches whose completion notification has
+ *  not yet arrived. Consulted at the PTY idle edge (markPromptReady): a main
+ *  turn that only went quiet because it is awaiting a background sub-agent must
+ *  keep the session card `working`, not flip it to idle (which Lark surfaces as
+ *  「已完成」) and then back to 「进行中」when the `<task-notification>` re-wakes it. */
+const backgroundTaskTracker = new BackgroundTaskTracker();
 /** Journal-restore of interrupted Lark turns is allowed AT MOST ONCE per worker
  *  process, and only on the FIRST baseline this process runs. Rationale: the
  *  journal exists to recover a turn that a *cross-process* death (daemon
@@ -6070,6 +6076,10 @@ function bridgeIngest(): void {
   bridgePendingTail = result.pendingTail;
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   bridgeQueue.ingest(result.events, bridgeJsonlPath, observeThinkingAttribution);
+  // Fold background Agent/Task dispatch and their `<task-notification>`
+  // completions so the idle edge (markPromptReady) knows whether this turn is
+  // only quiet because it is awaiting a background sub-agent.
+  for (const ev of result.events) backgroundTaskTracker.observe(ev);
   // Structured rate-limit: Claude Code writes an `error:"rate_limit"` record
   // at the turn's terminal boundary. This is the authoritative "limited"
   // signal — read it here (event-driven, once per record) instead of scraping
@@ -6656,6 +6666,10 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
   // the bound session's own trailing bytes — a switch record Claude wrote just
   // before the rotation lands here and nowhere else.
   observeModelFallbackEvents(path, result.events);
+  // Same reasoning for background-task bookkeeping: a dispatch launch-ack or a
+  // `<task-notification>` can land on the trailing bytes of a rotating path and
+  // reach the tracker nowhere else.
+  for (const ev of result.events) backgroundTaskTracker.observe(ev);
   return { offset: result.newOffset, tail: result.pendingTail };
 }
 
@@ -11477,16 +11491,18 @@ function markPromptReady(): void {
   // in the card.  This avoids a false "就绪" flash on daemon restart
   // (where the initial prompt is queued before the CLI becomes idle).
   //
-  // ALSO skip when the Grok-class busy arm is pending (spawnArgvInitialPromptBusy):
-  // for these adapters the FIRST ready is a pre-execution SessionStart edge, not a
-  // turn boundary — the argv-baked first prompt is still running. isPromptReady was
-  // just set true above, so this generic snapshot would project 'idle' and reach the
-  // daemon BEFORE the busy arm below re-publishes 'working'. Combined with the
-  // first-turn working already sent by startScreenUpdates, the daemon would then see
-  // working→idle and fire finishTurnReactions() — a premature ✅ DONE mid-turn (and a
+  // ALSO skip when the Grok-class busy arm is pending (spawnArgvInitialPromptBusy)
+  // or a background sub-agent is still in flight (backgroundTaskTracker.pending()):
+  // for these the FIRST/this ready is not a turn boundary — the argv-baked first
+  // prompt is still running, or the turn is only quiet awaiting a background
+  // <task-notification>. isPromptReady was just set true above, so this generic
+  // snapshot would project 'idle' and reach the daemon BEFORE the busy arm below
+  // re-publishes 'working'. Combined with the first-turn working already sent by
+  // startScreenUpdates, the daemon would then see working→idle and fire
+  // finishTurnReactions() — a premature ✅ DONE mid-turn (and a
   // 「工作中→等待输入→工作中」 flicker on the open card). The busy arm below owns the
-  // correct 'working' publish for this path, so this idle must not escape first.
-  if (renderer && !spawnArgvInitialPromptBusy && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
+  // correct 'working' publish for these paths, so this idle must not escape first.
+  if (renderer && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pending() === 0 && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
     const { content } = renderer.snapshot();
     send({
       type: 'screen_update',
@@ -11551,6 +11567,18 @@ function markPromptReady(): void {
       // is fine: gate allows working→limited.
       publishScreenStatus('idle');
       log('Argv-baked first prompt completed — seeded working→idle for card-off reactions');
+    } else if (backgroundTaskTracker.pending() > 0) {
+      // The main turn is only quiet because it dispatched background
+      // sub-agents and is awaiting their `<task-notification>`. Report
+      // working (not idle) so the session card is not frozen to 「已完成」
+      // mid-flight and then re-posted as 「进行中」when the notification
+      // re-wakes the turn. Stay non-ready + re-arm the detector (mirrors the
+      // spawn-argv branch above) so the genuine end-of-turn idle after the
+      // background work settles is still a real, re-fireable edge.
+      isPromptReady = false;
+      idleDetector?.reset();
+      publishScreenStatus('working');
+      log(`Idle prompt while ${backgroundTaskTracker.pending()} background task(s) pending — reporting working until their completion notification arrives`);
     } else {
       publishScreenStatus('idle');
     }

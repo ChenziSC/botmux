@@ -1,3 +1,4 @@
+import { parseProjectCoordinatorAction } from '../src/services/project-coordinator.js';
 import { describe, expect, it } from 'vitest';
 import { buildProjectGroupCard } from '../src/im/lark/project-group-card.js';
 import type { ProjectGroupState } from '../src/services/project-group-store.js';
@@ -58,4 +59,31 @@ describe('buildProjectGroupCard workstream table', () => {
     const card = buildProjectGroupCard(makeProject({ workstreams: [] })) as any;
     expect(card.body.elements.some((e: any) => e.tag === 'table')).toBe(false);
   });
+});
+
+  it.each(['status-dashboard', 'compact-list'] as const)('keeps user action and document visible in %s', templateId => {
+    const card = buildProjectGroupCard(makeProject({ status: 'active', phase: 'awaiting_confirmation',
+      userAction: { requestId: 'revision-5', summary: '方案已完成', question: '请确认 revision 5',
+        documentUrl: 'https://example.com/doc', state: 'delivery_failed' },
+    }), 'feishu', { templateId, sections: [] } as any) as any;
+    expect(card.header.text_tag_list[0].text.content).toBe('需要你');
+    expect(card.header.template).toBe('orange');
+    expect(card.body.elements[0].content).toContain('[技术方案](https://example.com/doc)');
+    expect(card.body.elements[0].content).toContain('受阻');
+    expect(card.config.summary.content).toContain('需要你');
+  });
+  it('recognizes legacy confirmation waits but never treats internal blockers as user input', () => {
+    const card = (p: Partial<ProjectGroupState>) => buildProjectGroupCard(makeProject(p)) as any;
+    expect(card({ phase: 'awaiting_confirmation' }).header.text_tag_list[0].text.content).toBe('需要你');
+    expect(card({ blockers: ['部署仍在运行'] }).header.text_tag_list[0].text.content).toBe('进行中');
+    expect(card({ status: 'completed', phase: 'awaiting_confirmation' }).header.text_tag_list[0].text.content).toBe('已完成');
+  });
+
+it('validates action documents and explicit clears at the API boundary', () => {
+  const action = { requestId: 'req', summary: 'Ready', question: 'Review?', state: 'pending' };
+  for (const documentUrl of ['javascript:alert(1)', 'http://example.com', 'https://user:password@example.com', 'not-a-url']) {
+    expect(parseProjectCoordinatorAction({ action: 'update', userAction: { ...action, documentUrl } })).toBeUndefined();
+  }
+  expect(parseProjectCoordinatorAction({ action: 'update', userAction: null, expectedUserActionId: 'req' }))
+    .toMatchObject({ userAction: null, expectedUserActionId: 'req' });
 });

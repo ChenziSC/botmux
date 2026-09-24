@@ -59,7 +59,7 @@ function validRecord(p: PersistedManagedAsk): boolean {
     || !p.presentation || !['none', 'pending', 'sent', 'cleanup_pending'].includes(p.presentation.state)
     || !Number.isSafeInteger(p.presentation.revision) || p.presentation.revision < 0
     || (p.presentation.segment !== undefined && (!Number.isSafeInteger(p.presentation.segment) || p.presentation.segment < 1))) return false;
-  if (p.originKind !== 'explicit') return false;
+  if (p.originKind !== 'explicit' || (p.originalTurn.dispatchAttempt === undefined && !p.execution)) return false;
   if (p.execution && (typeof p.execution.bootId !== 'string' || !p.execution.bootId
     || typeof p.execution.replayKey !== 'string' || !p.execution.replayKey
     || !['fresh', 'turn'].includes(p.execution.replayKind)

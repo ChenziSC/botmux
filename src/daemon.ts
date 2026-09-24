@@ -6926,6 +6926,10 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
       sessionId: askSession.session.sessionId, larkAppId: askSession.larkAppId, chatId: askSession.chatId,
       rootMessageId: askSession.session.scope === 'chat' ? null : askSession.session.rootMessageId,
       receiver: !!askSession.session.vcMeetingReceiver, liveOrigin: askSession.managedTurnOrigin,
+      keyedTurnId: askSession.managedTurnOrigin?.turnId
+        && askSession.idempotentAsyncTurns?.get(askSession.managedTurnOrigin.turnId)
+        && !askSession.idempotentAsyncTurns.get(askSession.managedTurnOrigin.turnId)!.postBarrierFault
+        ? askSession.managedTurnOrigin.turnId : undefined,
     } : undefined,
   }) : undefined;
   result = await registerAskBroker({

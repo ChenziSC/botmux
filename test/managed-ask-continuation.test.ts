@@ -46,6 +46,18 @@ beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'ask-continuation-')); store
 afterEach(() => { _resetForTest(); rmSync(dir, { recursive: true, force: true }); vi.restoreAllMocks(); });
 
 describe('managed Ask continuation admission', () => {
+  it('continues a keyed turn with an omitted attempt exactly once after restart', async () => {
+    const keyed = { ...input, originalTurn: { turnId: 'turn-a' } };
+    const promise = registerAsk(keyed); await flush();
+    tryResolveAsk({ askId: sent[0].askId, nonce: sent[0].nonce, selected: 'yes', by: 'owner' });
+    await promise;
+    recordManagedAskTerminal({ ...terminal, dispatchAttempt: undefined });
+    boot(); restorePersistedAsks();
+    const register = vi.fn(deps().register);
+    expect(await continueManagedAsk(identity, deps({ register }))).toMatchObject({ continuation: { state: 'accepted' } });
+    expect(await continueManagedAsk(identity, deps({ register }))).toMatchObject({ continuation: { state: 'accepted' } });
+    expect(register).toHaveBeenCalledTimes(1);
+  });
   it('does not turn a disconnected waiter into native termination proof', async () => {
     const abort = new AbortController(); const promise = registerAsk({ ...input, waiterSignal: abort.signal });
     await flush(); const rejected = expect(promise).rejects.toThrow('waiter_disconnected'); abort.abort(); await rejected;

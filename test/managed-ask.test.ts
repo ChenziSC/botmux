@@ -1,3 +1,4 @@
+import { authorizeManagedAsk } from '../src/core/managed-ask-api.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -43,6 +44,25 @@ beforeEach(() => {
 afterEach(() => { _resetForTest(); rmSync(dir, { recursive: true, force: true }); vi.restoreAllMocks(); });
 
 describe('managed Ask durable acceptance and replay', () => {
+  it('authenticates, persists and resumes a keyed Ask without dispatchAttempt', async () => {
+    const liveOrigin = { capability: 'cap', turnId: 'keyed-turn' };
+    const originalTurn = authorizeManagedAsk({
+      identity, raw: { originCapability: 'cap', originTurnId: 'keyed-turn' },
+      session: { ...identity, liveOrigin, keyedTurnId: liveOrigin.turnId },
+      selfAppId: input.larkAppId, trustedHost: false, registration: true,
+    });
+    const keyed = { ...input, originalTurn, originalExecution: {
+      bootId: 'boot', workerGeneration: 1, replayKey: 'request-key', replayKind: 'turn' as const,
+    } };
+    expect(() => registerAsk({ ...keyed, originalExecution: undefined })).toThrow('managed_ask_identity_required');
+    const promise = registerAsk(keyed); await flush();
+    expect(sent).toHaveLength(1);
+    expect(answer()).toBe('accepted');
+    expect(await promise).toMatchObject({ kind: 'answered' });
+    boot(); restorePersistedAsks(Date.now(), input.larkAppId);
+    expect(await registerAsk(keyed)).toMatchObject({ kind: 'answered' });
+    expect(sent).toHaveLength(1);
+  });
   it('allows only one attached managed waiter and reconnects after a proven HTTP disconnect', async () => {
     const abort = new AbortController();
     const old = registerAsk({ ...input, waiterSignal: abort.signal });

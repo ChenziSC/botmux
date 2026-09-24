@@ -1,3 +1,4 @@
+import { DEFAULT_REPLY_LAYOUT_TAGS, DEFAULT_REPLY_LAYOUT_TITLES } from './reply-card-style.js';
 import { threadAppLink, type Brand } from './lark-hosts.js';
 import { TABLE_AUTO_ROW_HEIGHT } from './table-style.js';
 import {
@@ -404,12 +405,26 @@ export function buildProjectGroupCard(
     : new Intl.DateTimeFormat('zh-CN', {
         timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
       }).format(updated).replace('/', '-');
+  const awaitingUser = project.status !== 'completed' && (!!project.userAction
+    || ['awaiting_confirmation', 'awaiting_user_input', 'waiting_user'].includes(project.phase));
   const statusMeta = project.status === 'completed'
     ? { label: '已完成', color: 'green', header: 'green' }
+    : awaitingUser
+      ? { label: DEFAULT_REPLY_LAYOUT_TAGS.risk, color: 'orange', header: 'orange' }
     : project.status === 'paused'
       ? { label: '已暂停', color: 'neutral', header: 'grey' }
       : { label: '进行中', color: 'blue', header: 'blue' };
   const body = TEMPLATE_BODY_BUILDERS[config.templateId]({ project, brand, config });
+  if (awaitingUser) {
+    const action = project.userAction;
+    body.unshift({ tag: 'markdown', text_size: 'normal', content: [
+      `**${statusMeta.label}**`,
+      escapeMarkdown(action?.summary ?? project.focus),
+      ...(action ? [escapeMarkdown(action.documentUrl ? action.question.replace(action.documentUrl, '').trim() : action.question), ...(action.documentUrl
+        ? [`[技术方案](${action.documentUrl.replace(/\(/g, '%28').replace(/\)/g, '%29')})`] : []),
+        ...(action.state === 'delivery_failed' ? [DEFAULT_REPLY_LAYOUT_TITLES.blocked] : [])] : []),
+    ].join('\n\n') });
+  }
   body.push(
     { tag: 'hr', margin: '12px 0px 0px 0px' },
     {
@@ -423,7 +438,7 @@ export function buildProjectGroupCard(
     config: {
       update_multi: true, compact_width: false, enable_forward: true,
       streaming_mode: false, width_mode: 'fill',
-      summary: { content: truncate(`${project.title} · ${projectProgressSummary(project)} · 当前 ${project.focus}`, 60) },
+      summary: { content: truncate(`${project.title} · ${statusMeta.label} · ${projectProgressSummary(project)} · 当前 ${project.focus}`, 60) },
     },
     header: {
       template: statusMeta.header,

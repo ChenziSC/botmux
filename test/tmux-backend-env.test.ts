@@ -53,11 +53,13 @@ describe('Aiden Codex pane launch', () => {
       const realBin = join(dir, 'real codex');
       writeFileSync(realBin, '#!/bin/sh\nprintf "%s\\n" "$@"\nprintf "shim-env=%s/%s\\n" "${BOTMUX_AIDEN_CODEX_REAL_BIN-unset}" "${BOTMUX_AIDEN_CODEX_REASONING_EFFORT-unset}"\n', { mode: 0o755 });
       const shimDir = installAidenCodexShim(join(dir, 'shim'));
-      const launch = buildWrappedLaunch('aiden x codex', ['--model', 'gpt-5.6-sol', '-c', `model_reasoning_effort="${effort}"`], b => b, {
+      const fakeAiden = join(dir, 'aiden');
+      writeFileSync(fakeAiden, '#!/bin/sh\nshift 2\nexec codex \"$@\"\n', { mode: 0o755 });
+      const launch = buildWrappedLaunch('aiden x codex', ['--model', 'gpt-5.6-sol', '-c', `model_reasoning_effort="${effort}"`], b => b === 'aiden' ? fakeAiden : b, {
         aidenCodexRealBin: realBin, aidenCodexShimDir: shimDir, childPath: '/usr/bin:/bin',
       });
       const result = spawnSync('/bin/sh', ['-c', shellWrapperScript(dir), '_', dir,
-        ...buildBotmuxEnvAssignments(launch.env), join(shimDir, 'codex'), '--model', 'gpt-5.6-sol'], {
+        ...buildBotmuxEnvAssignments(launch.env), launch.bin, ...launch.args], {
         encoding: 'utf8', env: { PATH: '/usr/bin:/bin', BOTMUX_AIDEN_CODEX_REAL_BIN: '/stale/codex', BOTMUX_AIDEN_CODEX_REASONING_EFFORT: 'low' },
       });
       expect(result.status, result.stderr).toBe(0);
@@ -123,6 +125,9 @@ describe('buildBotmuxEnvAssignments() — CA bundle', () => {
 });
 
 describe('buildBotmuxEnvAssignments()', () => {
+  it.each(['chat', 'thread'])('transports the authoritative %s scope', scope => {
+    expect(buildBotmuxEnvAssignments({ BOTMUX_SESSION_SCOPE: scope })).toContain(`BOTMUX_SESSION_SCOPE=${scope}`);
+  });
   it('forwards only the daemon-side keys; bare LARK_APP_* are NOT forwarded', () => {
     const out = buildBotmuxEnvAssignments({
       // Bare creds must never reach the child — the worker redacts them

@@ -19,6 +19,8 @@ export function parseAskLookup(raw: unknown): AskLookupIdentity {
 export interface ManagedAskSession extends SessionScopedIpcIdentity {
   receiver?: boolean;
   liveOrigin?: VcMeetingLiveManagedOrigin;
+  /** Computed from the live keyed registry, never from request metadata. */
+  keyedTurnId?: string;
 }
 
 /** Shared daemon seam for registration/lookup. A trusted host can look up a
@@ -50,6 +52,9 @@ export function authorizeManagedAsk(args: {
   if (!validAskOriginalTurn(originalTurn) || raw.originTurnId !== originalTurn.turnId
     || raw.originDispatchAttempt !== originalTurn.dispatchAttempt) {
     throw new ManagedAskError('managed_ask_original_turn_unproven', 403);
+  }
+  if (originalTurn.dispatchAttempt === undefined && session.keyedTurnId !== originalTurn.turnId) {
+    throw new ManagedAskError('managed_ask_keyed_turn_unproven', 403);
   }
   return originalTurn;
 }

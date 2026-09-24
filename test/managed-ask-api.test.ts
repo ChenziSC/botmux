@@ -20,6 +20,16 @@ describe('managed Ask authentication', () => {
   it('binds a registration to the authenticated live turn', () => {
     expect(authorizeManagedAsk(request)).toEqual({ turnId: 'turn', dispatchAttempt: 1 });
   });
+  it('accepts a live keyed turn without inventing a dispatch attempt', () => {
+    const keyed = { ...request, raw: { ...raw, originDispatchAttempt: undefined },
+      session: { ...session, liveOrigin: { capability: 'real-capability', turnId: 'turn' }, keyedTurnId: 'turn' } };
+    expect(authorizeManagedAsk(keyed)).toEqual({ turnId: 'turn', dispatchAttempt: undefined });
+    for (const changed of [
+      { session: { ...keyed.session, keyedTurnId: undefined } },
+      { raw: { ...keyed.raw, originDispatchAttempt: 1 } },
+      { raw: { ...keyed.raw, originCapability: 'stale' } },
+    ]) expect(() => authorizeManagedAsk({ ...keyed, ...changed })).toThrow();
+  });
   it('rejects stale capability, attempts, cross-app/session/chat/root and receivers', () => {
     for (const changed of [
       { raw: { ...raw, originCapability: 'stale' } },

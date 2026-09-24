@@ -212,7 +212,8 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promi
   };
   const originKind = input.originKind ?? 'hook';
   if (input.managedDelivery && (!parseManagedDeliveryContext(input.managedDelivery)
-    || !input.requestId || originKind !== 'explicit' || !validAskOriginalTurn(input.originalTurn))) {
+    || !input.requestId || originKind !== 'explicit' || !validAskOriginalTurn(input.originalTurn)
+    || (input.originalTurn.dispatchAttempt === undefined && !input.originalExecution))) {
     throw new ManagedAskError('managed_ask_identity_required', 400);
   }
   if (input.managedDelivery && input.waiterSignal?.aborted) throw new ManagedAskError('managed_ask_waiter_disconnected');

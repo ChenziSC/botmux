@@ -397,7 +397,8 @@ describe('session reasoning selector', () => {
       reasoningControl: { choices: ['low', 'high', 'ultra'], selected: 'high', pending: true },
     } });
     const select = card.elements.flatMap((e: any) => e.actions ?? []).find((a: any) => a.tag === 'select_static');
-    expect(select.initial_option).toBe('high');
+    expect(select.options.find((o: any) => o.value === 'high').text.content).toBe('思考强度: 高');
+    expect(select.initial_option).toBe('ultra');
     expect(select.value).toMatchObject({ action: 'set_reasoning_effort', root_id: ROOT, session_id: SID, expected_effort: 'high' });
     expect(select.options.map((o: any) => o.value)).toEqual(['low', 'high', 'ultra']);
     expect(JSON.stringify(card)).toContain('待生效');

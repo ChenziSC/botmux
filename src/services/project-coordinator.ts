@@ -7,6 +7,8 @@ import {
 import type { Brand } from '../im/lark/lark-hosts.js';
 import {
   mutateProjectGroup,
+  parseProjectUserAction,
+  type ProjectUserAction,
   readProjectGroup,
   type ProjectGroupState,
   type ProjectGroupStatus,
@@ -33,6 +35,7 @@ export type ProjectCoordinatorAction =
   | { action: 'status' }
   | { action: 'refresh' }
   | {
+      userAction?: ProjectUserAction | null; expectedUserActionId?: string;
       action: 'update'; goal?: string; phase?: string; focus?: string; progress?: number;
       remaining?: string; blocker?: string; clearBlockers?: boolean; milestone?: string; nextMilestone?: string;
     }
@@ -80,10 +83,12 @@ export function parseProjectCoordinatorAction(raw: unknown): ProjectCoordinatorA
   }
   if (action === 'status') return { action };
   if (action === 'update') {
+    const userAction = body.userAction === null ? null : parseProjectUserAction(body.userAction);
+    if (body.userAction !== undefined && userAction === undefined) return undefined;
     const progress = body.progress === undefined || typeof body.progress === 'number' ? body.progress as number | undefined : undefined;
     if (body.progress !== undefined && progress === undefined) return undefined;
     return {
-      action, goal: stringField(body, 'goal'), phase: stringField(body, 'phase'), focus: stringField(body, 'focus'),
+      action, userAction, expectedUserActionId: stringField(body, 'expectedUserActionId'), goal: stringField(body, 'goal'), phase: stringField(body, 'phase'), focus: stringField(body, 'focus'),
       progress, remaining: stringField(body, 'remaining'), blocker: stringField(body, 'blocker'),
       clearBlockers: body.clearBlockers === true, milestone: stringField(body, 'milestone'),
       nextMilestone: stringField(body, 'nextMilestone'),
@@ -286,6 +291,13 @@ export class ProjectCoordinator {
       current.revision += 1;
       current.updatedAt = now;
       if (action.action === 'update') {
+        if (action.userAction !== undefined) {
+          if (action.expectedUserActionId !== undefined && current.userAction?.requestId !== action.expectedUserActionId) {
+            throw new Error('invalid_user_action_revision');
+          }
+          if (action.userAction === null) delete current.userAction;
+          else current.userAction = parseProjectUserAction(action.userAction) ?? (() => { throw new Error('invalid_user_action'); })();
+        }
         if (action.goal !== undefined) current.goal = boundedText(action.goal, 500, current.goal);
         if (action.phase !== undefined) current.phase = boundedText(action.phase, 80, current.phase);
         if (action.focus !== undefined) current.focus = boundedText(action.focus, 300, current.focus);
@@ -300,6 +312,7 @@ export class ProjectCoordinator {
         if (milestone) current.milestones.push({ content: milestone, createdAt: now });
         if (action.nextMilestone !== undefined) current.nextMilestone = boundedText(action.nextMilestone, 160) || undefined;
       } else if (action.action === 'close') {
+        delete current.userAction;
         current.status = 'completed';
         current.manualProgress = 100;
         current.phase = '已完成';

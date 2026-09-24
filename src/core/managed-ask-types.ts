@@ -16,7 +16,8 @@ export interface ManagedDeliveryContextV1 {
 
 export interface AskOriginalTurn {
   turnId: string;
-  dispatchAttempt: number;
+  /** Durable dispatches have attempts; keyed async turns have none. */
+  dispatchAttempt?: number;
 }
 
 /** Only the daemon may create this from its live keyed-dispatch registry. */
@@ -89,7 +90,8 @@ export function parseManagedDeliveryContext(raw: unknown): ManagedDeliveryContex
 }
 
 export function validAskOriginalTurn(value: unknown): value is AskOriginalTurn {
-  return record(value) && text(value.turnId) && revision(value.dispatchAttempt);
+  return record(value) && text(value.turnId)
+    && (value.dispatchAttempt === undefined || revision(value.dispatchAttempt));
 }
 
 export function validAskResult(value: unknown): value is AskResult {

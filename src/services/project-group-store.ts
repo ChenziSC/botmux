@@ -37,6 +37,30 @@ export interface ProjectMilestone {
   createdAt: string;
 }
 
+export interface ProjectUserAction {
+  requestId: string;
+  summary: string;
+  question: string;
+  documentUrl?: string;
+  state: 'pending' | 'delivery_failed';
+}
+
+export function parseProjectUserAction(raw: unknown): ProjectUserAction | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return;
+  const r = raw as Record<string, unknown>;
+  for (const [key, limit] of [['requestId', 200], ['summary', 1000], ['question', 2000]] as const) {
+    if (typeof r[key] !== 'string' || !r[key].trim() || r[key].length > limit) return;
+  }
+  if (r.state !== 'pending' && r.state !== 'delivery_failed') return;
+  let documentUrl: string | undefined;
+  if (r.documentUrl !== undefined) {
+    if (typeof r.documentUrl !== 'string' || r.documentUrl.length > 2000) return;
+    try { const url = new URL(r.documentUrl); if (url.protocol !== 'https:' || url.username || url.password) return; documentUrl = url.href; } catch { return; }
+  }
+  return { requestId: r.requestId as string, summary: r.summary as string, question: r.question as string,
+    state: r.state, ...(documentUrl ? { documentUrl } : {}) };
+}
+
 export interface ProjectGroupState {
   schemaVersion: 1;
   revision: number;
@@ -48,6 +72,7 @@ export interface ProjectGroupState {
   phase: string;
   focus: string;
   status: ProjectGroupStatus;
+  userAction?: ProjectUserAction;
   manualProgress?: number;
   remaining?: string;
   blockers: string[];

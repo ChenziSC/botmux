@@ -294,7 +294,7 @@ import {
 } from './core/daemon-ipc-session-auth.js';
 import {
   authorizeReportSessionRelayRequest,
-  buildOrchestratorReportTrigger,
+  deliverReportSessionRelay,
   REPORT_SESSION_RELAY_MAX_BYTES,
   REPORT_SESSION_RELAY_ROUTE,
 } from './core/report-session-relay.js';
@@ -6407,6 +6407,8 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     dispatchRoot,
     targetLarkAppId: ds.larkAppId,
     targetSessionId: ds.session.sessionId,
+    targetChatId: ds.session.chatId,
+    targetScope: ds.scope ?? ds.session.scope ?? 'thread',
     sourceName: title || 'dispatched subtask',
     issuedAt,
   });
@@ -6519,50 +6521,54 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
   if (!targetDaemon) {
     return jsonRes(res, 503, { ok: false, error: 'orchestrator_daemon_offline' });
   }
-  const trigger = buildOrchestratorReportTrigger(decision, {
+  const triggerMeta = {
     requestId: `report:${decision.source.sessionId}:${Date.now()}`,
     receivedAt: new Date().toISOString(),
-  });
-  try {
-    const response = await fetchDaemonIpc(targetDaemon.ipcPort, '/api/trigger', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(trigger),
-    });
-    const responseBody: unknown = await response.json().catch(() => ({}));
-    let projectSynced = false;
-    let projectSyncError: string | undefined;
-    if (response.ok) {
-      try {
-        const projectResponse = await fetchDaemonIpc(
-          targetDaemon.ipcPort,
-          `/api/sessions/${encodeURIComponent(decision.target.sessionId)}/project`,
-          {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              action: 'report', dispatchRoot: decision.dispatchRoot, content: decision.content,
-              ...decision.projectUpdate,
-            }),
-          },
-        );
-        const projectBody = await projectResponse.json().catch(() => ({})) as { ok?: boolean; error?: string };
-        projectSynced = projectResponse.ok && projectBody.ok === true;
-        if (!projectSynced && !(projectResponse.status === 404 && projectBody.error === 'project_not_found')) {
-          projectSyncError = projectBody.error ?? `HTTP ${projectResponse.status}`;
-        }
-      } catch (error) {
-        projectSyncError = error instanceof Error ? error.message : String(error);
+  };
+  const postProjectUpdate = async (
+    target: { larkAppId: string; sessionId: string },
+  ): Promise<{ projectSynced: boolean; projectSyncError?: string }> => {
+    const projectDaemon = target.larkAppId === decision.target.larkAppId
+      ? targetDaemon
+      // deliverReportSessionRelay only chooses same-app fallbacks today. Keep
+      // the lookup defensive so a future broader target still syncs against the
+      // actual landing daemon instead of assuming the original one.
+      : findOnlineDaemon(target.larkAppId);
+    if (!projectDaemon) return { projectSynced: false, projectSyncError: 'orchestrator_daemon_offline' };
+    try {
+      const projectResponse = await fetchDaemonIpc(
+        projectDaemon.ipcPort,
+        `/api/sessions/${encodeURIComponent(target.sessionId)}/project`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            action: 'report', dispatchRoot: decision.dispatchRoot, content: decision.content,
+            ...decision.projectUpdate,
+          }),
+        },
+      );
+      const projectBody = await projectResponse.json().catch(() => ({})) as { ok?: boolean; error?: string };
+      const projectSynced = projectResponse.ok && projectBody.ok === true;
+      if (!projectSynced && !(projectResponse.status === 404 && projectBody.error === 'project_not_found')) {
+        return { projectSynced, projectSyncError: projectBody.error ?? `HTTP ${projectResponse.status}` };
       }
+      return { projectSynced };
+    } catch (error) {
+      return {
+        projectSynced: false,
+        projectSyncError: error instanceof Error ? error.message : String(error),
+      };
     }
-    return jsonRes(res, response.status, {
-      ...(responseBody && typeof responseBody === 'object' && !Array.isArray(responseBody)
-        ? responseBody as Record<string, unknown>
-        : {}),
-      reportTarget: decision.target,
-      projectSynced,
-      ...(projectSyncError ? { projectSyncError } : {}),
+  };
+  try {
+    const delivered = await deliverReportSessionRelay({
+      decision,
+      triggerMeta,
+      fetchTarget: (path, init) => fetchDaemonIpc(targetDaemon.ipcPort, path, init),
+      postProjectUpdate,
     });
+    return jsonRes(res, delivered.status, delivered.body);
   } catch (error) {
     return jsonRes(res, 502, {
       ok: false,

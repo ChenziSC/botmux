@@ -391,13 +391,23 @@ describe('buildStreamingCard: signature stability', () => {
 
 
 describe('session reasoning selector', () => {
+  it.each([undefined, 'unrecognized'])('falls back to the saved choice when reported effort is %s', reasoningEffort => {
+    const card = build({ cliId: 'codex', usage: {
+      context: null, tokens: null, reasoningEffort,
+      reasoningControl: { choices: ['low', 'high', 'xhigh'], selected: 'high', pending: true },
+    } });
+    const select = card.elements.flatMap((e: any) => e.actions ?? []).find((a: any) => a.tag === 'select_static');
+    expect(select.initial_option).toBe('high');
+    expect(select.value.expected_effort).toBe('high');
+  });
   it('renders a session-bound selector and distinguishes saved settings from executed effort', () => {
     const card = build({ cliId: 'codex', usage: {
       context: null, tokens: null, model: 'gpt-5.6-sol', reasoningEffort: 'ultra',
       reasoningControl: { choices: ['low', 'high', 'ultra'], selected: 'high', pending: true },
     } });
     const select = card.elements.flatMap((e: any) => e.actions ?? []).find((a: any) => a.tag === 'select_static');
-    expect(select.initial_option).toBe('high');
+    expect(select.options.find((o: any) => o.value === 'high').text.content).toBe('思考强度: 高');
+    expect(select.initial_option).toBe('ultra');
     expect(select.value).toMatchObject({ action: 'set_reasoning_effort', root_id: ROOT, session_id: SID, expected_effort: 'high' });
     expect(select.options.map((o: any) => o.value)).toEqual(['low', 'high', 'ultra']);
     expect(JSON.stringify(card)).toContain('待生效');

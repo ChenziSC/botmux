@@ -17,7 +17,7 @@ import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync,
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
-import { sessionIdentityBinDir, installIdentityWrapper, findRealToolBinary, ensureSessionIdentityPlaceholders, installGitAskpass, identityWrapperInstalled, gitIdentityConfigEnv, publishActiveTurn, installLoginShellPathShim, GIT_ASKPASS_BASENAME } from './core/cli-identity.js';
+import { sessionIdentityBinDir, prepareTriggerUserCliEnv, publishActiveTurn, GIT_ASKPASS_BASENAME } from './core/cli-identity.js';
 import { tokenStoreProtection } from './services/trigger-user-auth.js';
 import { installAidenCodexShim } from './services/aiden-codex-shim.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
@@ -66,7 +66,7 @@ import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, ClaudeModelFallbackTracker, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, ClaudeModelFallbackTracker, BackgroundTaskTracker, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { bridgePostText, composeFailedBridgeFallbackContent, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
@@ -1302,6 +1302,8 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // Session identity is host-owned. Pin it after the config-controlled merge,
     // matching every other backend and preventing stale owner resurrection.
     applySessionOwnerEnv(engineEnv, cfg.ownerOpenId);
+    // RPC shell tools execute here, before the viewer CLI is even spawned.
+    prepareTriggerUserCliEnv(engineEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, cfg.triggerUserAuth, log);
     engine = new CodexRpcEngine({
       cliBin, cwd: cfg.workingDir, env: engineEnv, sessionId: cfg.sessionId,
       model: cfg.model, modelBackendVariant: cfg.modelBackendVariant, reasoningEffort: cfg.reasoningEffort, log: (m: string) => log(m),
@@ -4698,6 +4700,12 @@ const bridgeSecondaryPaths = new Map<string, number>(); // path → offset
 let bridgeOffset = 0;
 let bridgePendingTail = '';
 const bridgeQueue = new BridgeTurnQueue();
+/** Counts background Agent/Task dispatches whose completion notification has
+ *  not yet arrived. Consulted at the PTY idle edge (markPromptReady): a main
+ *  turn that only went quiet because it is awaiting a background sub-agent must
+ *  keep the session card `working`, not flip it to idle (which Lark surfaces as
+ *  「已完成」) and then back to 「进行中」when the `<task-notification>` re-wakes it. */
+const backgroundTaskTracker = new BackgroundTaskTracker();
 /** Journal-restore of interrupted Lark turns is allowed AT MOST ONCE per worker
  *  process, and only on the FIRST baseline this process runs. Rationale: the
  *  journal exists to recover a turn that a *cross-process* death (daemon
@@ -6068,6 +6076,10 @@ function bridgeIngest(): void {
   bridgePendingTail = result.pendingTail;
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   bridgeQueue.ingest(result.events, bridgeJsonlPath, observeThinkingAttribution);
+  // Fold background Agent/Task dispatch and their `<task-notification>`
+  // completions so the idle edge (markPromptReady) knows whether this turn is
+  // only quiet because it is awaiting a background sub-agent.
+  for (const ev of result.events) backgroundTaskTracker.observe(ev);
   // Structured rate-limit: Claude Code writes an `error:"rate_limit"` record
   // at the turn's terminal boundary. This is the authoritative "limited"
   // signal — read it here (event-driven, once per record) instead of scraping
@@ -6654,6 +6666,10 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
   // the bound session's own trailing bytes — a switch record Claude wrote just
   // before the rotation lands here and nowhere else.
   observeModelFallbackEvents(path, result.events);
+  // Same reasoning for background-task bookkeeping: a dispatch launch-ack or a
+  // `<task-notification>` can land on the trailing bytes of a rotating path and
+  // reach the tracker nowhere else.
+  for (const ev of result.events) backgroundTaskTracker.observe(ev);
   return { offset: result.newOffset, tail: result.pendingTail };
 }
 
@@ -11475,16 +11491,18 @@ function markPromptReady(): void {
   // in the card.  This avoids a false "就绪" flash on daemon restart
   // (where the initial prompt is queued before the CLI becomes idle).
   //
-  // ALSO skip when the Grok-class busy arm is pending (spawnArgvInitialPromptBusy):
-  // for these adapters the FIRST ready is a pre-execution SessionStart edge, not a
-  // turn boundary — the argv-baked first prompt is still running. isPromptReady was
-  // just set true above, so this generic snapshot would project 'idle' and reach the
-  // daemon BEFORE the busy arm below re-publishes 'working'. Combined with the
-  // first-turn working already sent by startScreenUpdates, the daemon would then see
-  // working→idle and fire finishTurnReactions() — a premature ✅ DONE mid-turn (and a
+  // ALSO skip when the Grok-class busy arm is pending (spawnArgvInitialPromptBusy)
+  // or a background sub-agent is still in flight (backgroundTaskTracker.pending()):
+  // for these the FIRST/this ready is not a turn boundary — the argv-baked first
+  // prompt is still running, or the turn is only quiet awaiting a background
+  // <task-notification>. isPromptReady was just set true above, so this generic
+  // snapshot would project 'idle' and reach the daemon BEFORE the busy arm below
+  // re-publishes 'working'. Combined with the first-turn working already sent by
+  // startScreenUpdates, the daemon would then see working→idle and fire
+  // finishTurnReactions() — a premature ✅ DONE mid-turn (and a
   // 「工作中→等待输入→工作中」 flicker on the open card). The busy arm below owns the
-  // correct 'working' publish for this path, so this idle must not escape first.
-  if (renderer && !spawnArgvInitialPromptBusy && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
+  // correct 'working' publish for these paths, so this idle must not escape first.
+  if (renderer && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pending() === 0 && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
     const { content } = renderer.snapshot();
     send({
       type: 'screen_update',
@@ -11549,6 +11567,18 @@ function markPromptReady(): void {
       // is fine: gate allows working→limited.
       publishScreenStatus('idle');
       log('Argv-baked first prompt completed — seeded working→idle for card-off reactions');
+    } else if (backgroundTaskTracker.pending() > 0) {
+      // The main turn is only quiet because it dispatched background
+      // sub-agents and is awaiting their `<task-notification>`. Report
+      // working (not idle) so the session card is not frozen to 「已完成」
+      // mid-flight and then re-posted as 「进行中」when the notification
+      // re-wakes the turn. Stay non-ready + re-arm the detector (mirrors the
+      // spawn-argv branch above) so the genuine end-of-turn idle after the
+      // background work settles is still a real, re-fireable edge.
+      isPromptReady = false;
+      idleDetector?.reset();
+      publishScreenStatus('working');
+      log(`Idle prompt while ${backgroundTaskTracker.pending()} background task(s) pending — reporting working until their completion notification arrives`);
     } else {
       publishScreenStatus('idle');
     }
@@ -15017,9 +15047,8 @@ async function spawnCli(
         type: 'user_notify',
         turnId: currentBotmuxTurnId,
         message:
-          `⚠️  历史会话（${(cfg.cliSessionId ?? cfg.originalSessionId ?? cfg.sessionId).substring(0, 16)}…）` +
-          `无法恢复，已为你**新起一个干净会话**（原因：${reason}）。\n` +
-          `之前的上下文不会带到本轮，需要的话请简述背景。`,
+          `⚠️ 会话启动失败，正在尝试以新会话重新启动。\n` +
+          `这次重试不会恢复历史上下文；如需继续之前的任务，请补充背景。`,
       });
     }
     // Reset the counter so the fresh spawn gets a clean 2-attempt budget in
@@ -15409,110 +15438,8 @@ async function spawnCli(
   // (The tmux backend re-prepends this in its pane script after rcfile load; this covers the
   // pty/direct-spawn path, whose child inherits childEnv.PATH directly.)
   childEnv.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), childEnv.PATH);
-  // Trigger-user CLI auth: shadow the governed tools with wrappers that source
-  // the identity the daemon publishes per turn. The dir is per SESSION and
-  // prepended only for a bot that enabled the policy — a wrapper in the shared
-  // ~/.botmux/bin would shadow lark-cli for every bot on this machine, and for
-  // the operator's own shell, neither of which asked for it.
-  //
-  // The real binary is resolved from the PATH we are about to hand the child,
-  // with the wrapper dir excluded, so a wrapper can never resolve to itself.
-  const triggerUserAuthPolicy = cfg.triggerUserAuth;
-  if (triggerUserAuthPolicy?.enabled && process.env.SESSION_DATA_DIR) {
-    const wrapperDir = sessionIdentityBinDir(process.env.SESSION_DATA_DIR, cfg.sessionId);
-    // Pre-create the identity files so they survive the sandbox's
-    // existence-filter (it drops allow paths that do not exist at spawn, and a
-    // dropped path would leave the wrapper unable to read what the daemon later
-    // publishes — the session would silently run without the sender's identity).
-    // Empty is the correct initial content: no identity is published until the
-    // first turn resolves one, and the wrapper treats an empty file as "no
-    // identity", the same as absent.
-    try {
-      ensureSessionIdentityPlaceholders(
-        process.env.SESSION_DATA_DIR,
-        cfg.sessionId,
-        triggerUserAuthPolicy.tools,
-      );
-    } catch (e) {
-      log(`[trigger-user-auth] WARN could not pre-create identity files: ${(e as Error).message}`);
-    }
-    let installedAny = false;
-    for (const tool of triggerUserAuthPolicy.tools) {
-      try {
-        const real = findRealToolBinary(tool, childEnv.PATH, [wrapperDir]);
-        if (!real) {
-          log(`[trigger-user-auth] ${tool} is not installed; no wrapper written`);
-          continue;
-        }
-        installIdentityWrapper(wrapperDir, tool, real);
-        installedAny = true;
-        log(`[trigger-user-auth] wrapping ${tool} -> ${real}`);
-      } catch (e) {
-        // A missing wrapper means the tool keeps its previous behavior; it must
-        // not stop the session from starting.
-        log(`[trigger-user-auth] WARN could not wrap ${tool}: ${(e as Error).message}`);
-      }
-    }
-    // Every governed tool failed to wrap, yet the policy is on. The session
-    // then runs completely unprotected while the operator believes otherwise —
-    // the failure mode observed in production, where the agent cheerfully
-    // reported `identity: user` (the machine account) as "normal". Absence of a
-    // wrapper is invisible by nature, so it has to be said out loud.
-    if (!installedAny) {
-      log('[trigger-user-auth] WARN no tool wrapper installed — this session is NOT running under '
-        + 'trigger-user identity; calls will use whatever credentials the machine has');
-    }
-    if (installedAny) {
-      childEnv.PATH = prependBotmuxBin(wrapperDir, childEnv.PATH);
-      // A prepend alone loses to path_helper in the login shell the agent's
-      // tool calls run through — see installLoginShellPathShim. These three
-      // vars put the wrapper dir back in front after the system startup files
-      // have run, without touching the user's dotfiles.
-      try {
-        const { zdotdir, bashEnv } = installLoginShellPathShim(wrapperDir);
-        childEnv.BOTMUX_IDENTITY_BIN = wrapperDir;
-        childEnv.ZDOTDIR = zdotdir;
-        childEnv.BASH_ENV = bashEnv;
-      } catch (e) {
-        // Without the shim a login shell resolves the REAL tool, which is the
-        // silent-bypass this feature exists to prevent. Say so loudly rather
-        // than letting the session look protected while it is not.
-        log(`[trigger-user-auth] WARN login-shell PATH shim not installed (${(e as Error).message}); `
-          + `tool calls made through a login shell may bypass the identity wrapper`);
-      }
-    }
-    // Git attribution: a push over HTTPS to Codebase authenticates with a
-    // Codebase JWT, which git mints via GIT_ASKPASS and which reads none of the
-    // env vars above. Without this, work pushed on someone's behalf carries the
-    // machine's identity — and "who opened this MR" is exactly what this feature
-    // exists to fix. The helper asks the WRAPPED bytedcli, so it inherits the
-    // per-turn identity with no second credential path to keep in sync.
-    if (triggerUserAuthPolicy.tools.includes('bytedcli')
-        && identityWrapperInstalled(wrapperDir, 'bytedcli')) {
-      try {
-        const askpass = installGitAskpass(
-          wrapperDir,
-          true,
-          triggerUserAuthPolicy.gitTokenExchangeUrl,
-        );
-        if (askpass) {
-          childEnv.GIT_ASKPASS = askpass;
-          // Bind the helper to the configured code host and rewrite SSH remotes
-          // to HTTPS for it. Without the rewrite, a repo cloned over SSH keeps
-          // authenticating with the machine's key and the attribution chain
-          // breaks silently. Scoped via GIT_CONFIG_* env so the operator's own
-          // ~/.gitconfig is never touched.
-          if (triggerUserAuthPolicy.gitHost) {
-            Object.assign(childEnv, gitIdentityConfigEnv(askpass, triggerUserAuthPolicy.gitHost));
-            log(`[trigger-user-auth] git pushes to ${triggerUserAuthPolicy.gitHost} authenticate as the acting user`);
-          } else {
-            log('[trigger-user-auth] git askpass installed; set triggerUserAuth.gitHost to also force HTTPS for a code host');
-          }
-        }
-      } catch (e) {
-        log(`[trigger-user-auth] WARN could not install the git credential helper: ${(e as Error).message}`);
-      }
-    }
+  prepareTriggerUserCliEnv(childEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, cfg.triggerUserAuth, log);
+  if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {
     // Say plainly how protected the token store actually is. Without the file
     // sandbox the agent runs as the same OS user as botmux and can read every
     // person's token file directly; per-person storage fixes attribution and the

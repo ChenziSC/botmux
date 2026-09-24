@@ -41,16 +41,24 @@ export async function applyHandoffCardEvent(ds: DaemonSession, event: HandoffCar
   }
   if (event.kind === 'stage') {
     if (state.closed) throw new Error('live_stage_completed');
-    state.sequence = event.sequence;
-    state.title = event.title;
+    const previousTitle = ds.currentTurnTitle;
+    ds.session.handoffLiveCard = { ...state, sequence: event.sequence, title: event.title };
     ds.currentTurnTitle = event.title;
-    io.persist(); io.patch();
+    try { io.persist(); }
+    catch (error) {
+      ds.session.handoffLiveCard = state;
+      ds.currentTurnTitle = previousTitle;
+      throw error;
+    }
+    io.patch();
     return;
   }
-  state.sequence = event.sequence;
-  state.closed = true;
-  state.resultMessageId = event.resultMessageId;
-  io.persist();
+  ds.session.handoffLiveCard = { ...state, sequence: event.sequence, closed: true, resultMessageId: event.resultMessageId };
+  try { io.persist(); }
+  catch (error) {
+    ds.session.handoffLiveCard = state;
+    throw error;
+  }
   const cardId = ds.streamCardId;
   // Sentinel is runtime-private; a pending POST cleans itself on completion.
   if (cardId && cardId !== '__posting__') await io.remove(cardId);

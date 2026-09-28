@@ -29,6 +29,7 @@ import {
 import { MojoBackend } from '../src/adapters/backend/mojo-backend.js';
 import { backendSandboxCompatibilityError } from '../src/adapters/backend/session-backend-selector.js';
 import { buildReproduceCommand } from '../src/adapters/backend/reproduce-command.js';
+import { v3WorkerBackendType } from '../src/workflows/v3/ephemeral-pool.js';
 import {
   isRemoteBackendType,
   isRemoteCliId,
@@ -422,7 +423,7 @@ describe('every turn-starting IPC carries the mojo credential snapshot', () => {
   const EXEMPT: Record<string, { reason: string; proof: string }> = {
     'src/workflows/v3/ephemeral-pool.ts': {
       reason: 'v3 ephemeral pool only runs local tmux/PTY workers (never riff/mojo) and has no DaemonSession',
-      proof: "return daemonBackend === 'tmux' ? 'tmux' : 'pty';",
+      proof: 'backendType: v3WorkerBackendType(),',
     },
   };
 
@@ -463,6 +464,14 @@ describe('every turn-starting IPC carries the mojo credential snapshot', () => {
     for (const [file, { proof }] of Object.entries(EXEMPT)) {
       expect(readFileSync(resolve(file), 'utf8'), `${file} no longer proves its exemption`)
         .toContain(proof);
+    }
+  });
+
+  it('keeps the v3 exemption local for every daemon backend and standalone mode', () => {
+    for (const backend of ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'riff', 'mojo'] as const) {
+      for (const standalone of [true, false]) {
+        expect(['tmux', 'pty']).toContain(v3WorkerBackendType(backend, standalone));
+      }
     }
   });
 

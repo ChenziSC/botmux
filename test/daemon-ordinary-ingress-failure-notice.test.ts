@@ -1624,7 +1624,11 @@ describe('XPI cross-app human classification identity', () => {
       expect(ds.session.crossPrincipalInterruptions).toEqual([
         expect.objectContaining({ phase: 'awaiting_owner' }),
       ]);
-      expect(repliedText()).toContain('建议已暂存，将在当前任务结束后由原任务发起人确认。');
+      // Queue advancement completes before the detached proposer notification.
+      // Observe actual delivery instead of treating the driving promise as its ACK.
+      await vi.waitFor(() => {
+        expect(repliedText()).toContain('建议已暂存，将在当前任务结束后由原任务发起人确认。');
+      });
       expect(repliedText()).not.toContain('消息已暂存，不会打断当前任务。');
     } finally {
       if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);

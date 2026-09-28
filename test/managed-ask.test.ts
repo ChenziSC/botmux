@@ -36,6 +36,12 @@ function boot() {
 function answer(selected = 'yes') {
   return tryResolveAsk({ askId: sent[0].askId, nonce: sent[0].nonce, selected, by: 'owner' });
 }
+function managedRecordFile(): string {
+  const records = readdirSync(store.managed!.dir, { withFileTypes: true })
+    .filter(entry => entry.isFile() && entry.name.endsWith('.json'));
+  expect(records).toHaveLength(1);
+  return join(store.managed!.dir, records[0].name);
+}
 const flush = () => new Promise(resolve => setTimeout(resolve, 0));
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'managed-ask-'));
@@ -68,9 +74,8 @@ describe('managed Ask durable acceptance and replay', () => {
     const old = registerAsk({ ...input, waiterSignal: abort.signal });
     await flush();
     expect(() => registerAsk(input)).toThrow('waiter_attached');
-    const oldResult = expect(old).rejects.toThrow('waiter_disconnected');
     abort.abort();
-    await oldResult;
+    await expect(old).rejects.toThrow('waiter_disconnected');
     expect(lookupManagedAsk(identity)).toMatchObject({ state: 'pending', waiter: 'unknown' });
     const reconnected = registerAsk(input);
     answer();
@@ -232,7 +237,7 @@ describe('read-only queries and schema compatibility', () => {
 
   it('queries do not change record bytes and reject the wrong chat/root/app/session', async () => {
     const promise = registerAsk(input); await flush(); answer(); await promise;
-    const file = join(store.managed!.dir, readdirSync(store.managed!.dir)[0]);
+    const file = managedRecordFile();
     const before = readFileSync(file, 'utf8');
     for (let i = 0; i < 3; i++) lookupManagedAsk(identity);
     expect(readFileSync(file, 'utf8')).toBe(before);
@@ -249,7 +254,7 @@ describe('read-only queries and schema compatibility', () => {
     expect(store.list()).toEqual([]);
     expect(JSON.parse(readFileSync(join(dir, 'future.json'), 'utf8'))).toEqual({ v: 99 });
     expect(lookupManagedAsk(identity)).toMatchObject({ state: 'pending' });
-    const file = join(store.managed!.dir, readdirSync(store.managed!.dir)[0]);
+    const file = managedRecordFile();
     writeFileSync(file, '{broken');
     expect(lookupManagedAsk(identity)).toMatchObject({ state: 'unknown', reason: 'unreadable' });
     expect(readFileSync(file, 'utf8')).toBe('{broken');

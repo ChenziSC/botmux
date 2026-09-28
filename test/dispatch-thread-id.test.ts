@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { parseDispatchArgs } from '../src/cli/dispatch-args.js';
+import { normalizeBrand, threadAppLink } from '../src/im/lark/lark-hosts.js';
 import { buildDispatchCompletionBrief, buildDispatchMessages, buildProjectDispatchSyncAction,
   buildRepoPrimeText, parseDispatchBotSpec } from '../src/core/dispatch.js';
 
@@ -18,7 +19,7 @@ function extract(path: string, names: string[]): string {
   }).join('\n');
 }
 
-const cliCode = extract('src/cli.ts', ['resolveDispatchThreadId', 'cmdDispatch']);
+const cliCode = extract('src/cli.ts', ['botBrand', 'resolveDispatchThreadId', 'cmdDispatch']);
 const clientCode = extract('src/im/lark/client.ts', [
   'larkRequestDeadline', 'larkGet', 'getMessageDetail', 'getMessageThreadId',
 ]);
@@ -30,6 +31,7 @@ function harness(mode: Mode, options: {
   threadId?: unknown;
   failure?: 'permission' | 'network' | 'timeout' | 'send';
   acceptance?: 'accepted' | 'timed_out';
+  brand?: 'feishu' | 'lark';
 } = {}) {
   const root = mode === 'into' ? 'om_existing' : 'om_seed';
   const stdout: string[] = [];
@@ -83,7 +85,7 @@ function harness(mode: Mode, options: {
   });
   const state = {
     parseDispatchArgs, buildDispatchCompletionBrief, buildDispatchMessages, buildProjectDispatchSyncAction,
-    buildRepoPrimeText, parseDispatchBotSpec,
+    buildRepoPrimeText, parseDispatchBotSpec, normalizeBrand, threadAppLink,
     process: { env: { SESSION_DATA_DIR: '/isolated/data' }, exitCode: 0,
       exit: (code: number) => { throw new Error('exit:' + code); } },
     console: { log: (text: string) => stdout.push(text), error: (text: string) => stderr.push(text) },
@@ -105,7 +107,7 @@ function harness(mode: Mode, options: {
     trySyncProjectDispatch: vi.fn(async () => true),
     __import: async (path: string) => {
       if (path === './bot-registry.js') return {
-        registerBot: vi.fn(), loadBotConfigs: () => [{ larkAppId: 'cli_source' }, { larkAppId: 'cli_target' }],
+        registerBot: vi.fn(), loadBotConfigs: () => [{ larkAppId: 'cli_source', brand: options.brand }, { larkAppId: 'cli_target' }],
       };
       if (path === './im/lark/client.js') return {
         getMessageThreadId, replyMessage,
@@ -146,9 +148,14 @@ for (const chatMode of ['normal', 'topic'] as const) {
         await h.run();
         expect(h.stderr).toEqual([]);
         expect(h.stdout).toHaveLength(1);
-        const { threadId, ...oldFields } = JSON.parse(h.stdout[0]);
+        const { threadId, threadLink, ...oldFields } = JSON.parse(h.stdout[0]);
         expect(threadId).toBe(THREAD);
         expect(threadId).toMatch(/^omt_[A-Za-z0-9_-]+$/);
+        const link = new URL(threadLink);
+        expect(link.hostname).toBe('applink.feishu.cn');
+        expect(link.pathname).toBe('/client/thread/open');
+        expect(link.searchParams.get('open_thread_id')).toBe(THREAD);
+        expect(link.searchParams.get('open_chat_id')).toBe('oc_chat');
         expect(oldFields).toEqual(oldReceipt(mode));
         expect(h.steps).toEqual(mode === 'into' ? ['reply', 'lookup'] : ['seed', 'reply', 'lookup']);
         expect(h.postCurrentSessionDaemonRoute).toHaveBeenCalledTimes(mode === 'dispatch' ? 2 : 1);
@@ -161,6 +168,15 @@ for (const chatMode of ['normal', 'topic'] as const) {
     }
   });
 }
+
+it.each(['dispatch', 'standby', 'into'] as const)('%s uses the source bot brand for its topic link', async mode => {
+  const h = harness(mode, { brand: 'lark' });
+  await h.run();
+  const receipt = JSON.parse(h.stdout[0]);
+  expect(receipt.threadId).toBe(THREAD);
+  expect(new URL(receipt.threadLink).hostname).toBe('applink.larksuite.com');
+  expect(h.request).toHaveBeenCalledTimes(1);
+});
 
 for (const mode of ['dispatch', 'standby', 'into'] as const) {
   describe(mode + ' metadata failures', () => {

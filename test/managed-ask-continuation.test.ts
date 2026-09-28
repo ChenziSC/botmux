@@ -60,7 +60,9 @@ describe('managed Ask continuation admission', () => {
   });
   it('does not turn a disconnected waiter into native termination proof', async () => {
     const abort = new AbortController(); const promise = registerAsk({ ...input, waiterSignal: abort.signal });
-    await flush(); const rejected = expect(promise).rejects.toThrow('waiter_disconnected'); abort.abort(); await rejected;
+    await flush();
+    abort.abort();
+    await expect(promise).rejects.toThrow('waiter_disconnected');
     tryResolveAsk({ askId: sent[0].askId, nonce: sent[0].nonce, selected: 'yes', by: 'owner' });
     await expect(continueManagedAsk(identity, deps())).rejects.toThrow('execution_unproven');
   });

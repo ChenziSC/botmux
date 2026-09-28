@@ -1167,6 +1167,10 @@ describe('transferSession', () => {
     await vi.waitFor(() => expect(detach).toHaveBeenCalledOnce());
 
     await closeSession(ds.session.sessionId);
+    await vi.waitFor(() => expect(updateMessageMock).toHaveBeenCalledOnce());
+    const closedCard = updateMessageMock.mock.calls[0];
+    expect(closedCard.slice(0, 2)).toEqual(['cli_app_test', 'om_old_card']);
+    expect(JSON.parse(closedCard[2]).header.title.content).toBe('🛑 会话已关闭');
     releaseDetach(true);
     const result = await moving;
 
@@ -1174,7 +1178,9 @@ describe('transferSession', () => {
     expect(ds.session.status).toBe('closed');
     expect(registry.has(sourceKey)).toBe(false);
     expect(replacementFork).not.toHaveBeenCalled();
-    expect(updateMessageMock).not.toHaveBeenCalled();
+    // The late transfer may not replace the explicit-close card with a moved
+    // card or reattach the closed execution.
+    expect(updateMessageMock.mock.calls).toEqual([closedCard]);
   });
 
   it('keeps a committed transfer successful when replacement fork and replay throw', async () => {

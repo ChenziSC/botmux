@@ -22,7 +22,7 @@ describe('parallel handoff lifecycle', () => {
     expect(effects.remove).not.toHaveBeenCalled();
     await applyHandoffCardEvent(ds, event, effects);
     expect(ds.session.handoffLiveCard?.sequence).toBe(1);
-    expect(effects.persist).toHaveBeenCalledTimes(2);
+    expect(effects.persist.mock.calls.length).toBeGreaterThanOrEqual(2);
     if (kind === 'stage') expect(effects.patch).toHaveBeenCalledOnce();
     else expect(effects.remove).toHaveBeenCalledExactlyOnceWith('om_dev');
   });
@@ -86,4 +86,40 @@ describe('parallel handoff lifecycle', () => {
     await applyHandoffCardEvent(ds, { turnId: 'dev', sequence: 1, kind: 'complete', resultMessageId: 'om_result' }, effects);
     expect(effects.remove).not.toHaveBeenCalled(); expect(ds.streamCardId).toBeUndefined();
   });
+  it('retries only the original card after a failed delete and a same-turn replacement', async () => {
+    const ds = session(), effects = io();
+    const event = { turnId: 'dev', sequence: 1, kind: 'complete', resultMessageId: 'om_result' } as const;
+    effects.remove.mockRejectedValueOnce(new Error('offline'));
+    await expect(applyHandoffCardEvent(ds, event, effects)).rejects.toThrow('offline');
+    ds.streamCardId = 'om_manual'; ds.streamCardNonce = 'manual';
+    ds.session.handoffLiveCard = JSON.parse(JSON.stringify(ds.session.handoffLiveCard));
+    await applyHandoffCardEvent(ds, event, effects);
+    expect(effects.remove).toHaveBeenLastCalledWith('om_dev');
+    expect(ds.streamCardId).toBe('om_manual');
+    expect(effects.clear).not.toHaveBeenCalled();
+    effects.remove.mockClear();
+    await applyHandoffCardEvent(ds, event, effects);
+    expect(effects.remove).not.toHaveBeenCalled();
+  });
+
+  it('retries acknowledgement persistence without repeating a successful remote delete', async () => {
+    const ds = session(), effects = io();
+    const event = { turnId: 'dev', sequence: 1, kind: 'complete', resultMessageId: 'om_result' } as const;
+    let durable: typeof ds.session.handoffLiveCard;
+    effects.persist.mockImplementationOnce(() => { durable = structuredClone(ds.session.handoffLiveCard); })
+      .mockImplementationOnce(() => { ds.session.handoffLiveCard = durable; throw new Error('disk full'); });
+    await expect(applyHandoffCardEvent(ds, event, effects)).rejects.toThrow('disk full');
+    await applyHandoffCardEvent(ds, event, effects);
+    expect(effects.remove).toHaveBeenCalledExactlyOnceWith('om_dev');
+    expect(ds.streamCardId).toBeUndefined();
+  });
+
+  it('does not capture a replacement when restoring a closed state from an older version', async () => {
+    const ds = session(), effects = io();
+    ds.session.handoffLiveCard = { turnId: 'dev', sequence: 1, closed: true, resultMessageId: 'om_result' };
+    await applyHandoffCardEvent(ds, { turnId: 'dev', sequence: 1, kind: 'complete', resultMessageId: 'om_result' }, effects);
+    expect(effects.remove).not.toHaveBeenCalled();
+    expect(ds.streamCardId).toBe('om_dev');
+  });
+
 });

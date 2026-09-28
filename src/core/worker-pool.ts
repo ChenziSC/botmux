@@ -1,4 +1,4 @@
-import { handoffCardClosed, applyHandoffCardEvent, type HandoffCardEvent } from './handoff-card-lifecycle.js';
+import { handoffCardClosed, handoffCardBlocksStreaming, applyHandoffCardEvent, type HandoffCardEvent } from './handoff-card-lifecycle.js';
 import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTriggerStreamingCard } from './trigger-streaming-card.js';
 import { sessionPromptInjection } from './prompt-injection.js';
 /**
@@ -1036,7 +1036,7 @@ export function isDisposableCommandScratch(ds: DaemonSession): boolean {
 // takes effect without a daemon restart. The `/card` command can override it
 // per-session via `ds.streamingCardForced` (manually summon a live card).
 function streamingCardDisabled(ds: DaemonSession, turnId?: string): boolean {
-  if (isDocNativeSession(ds) || handoffCardClosed(ds, turnId)) return true;
+  if (isDocNativeSession(ds) || handoffCardBlocksStreaming(ds, turnId)) return true;
   if (ds.streamingCardForced) return false;
   try {
     const cfg = getBot(ds.larkAppId).config;
@@ -4078,6 +4078,8 @@ export async function postFreshStreamingCard(
   const prevNonce = ds.streamCardNonce;
   const prevReplyTargetKey = ds.streamCardReplyTargetKey;
   const prevPending = ds.streamCardPending;
+  const completedHandoffAtPost = ds.session.handoffLiveCard?.closed
+    ? ds.session.handoffLiveCard.turnId : undefined;
   const sessionAtPost = ds.session;
   const appIdAtPost = ds.larkAppId;
   const displayAnchorAtPost = sessionAnchorId(ds);
@@ -4151,6 +4153,10 @@ export async function postFreshStreamingCard(
     // duplicate (the gate above only suppresses cards when disabled+unforced;
     // /card forces them on, so a stale pending flag would otherwise re-POST).
     ds.streamCardPending = false;
+    const handoff = ds.session.handoffLiveCard;
+    if (completedHandoffAtPost && handoff?.closed && handoff.turnId === completedHandoffAtPost) {
+      ds.session.handoffLiveCard = { ...handoff, manualCard: { messageId, nonce: postingNonce } };
+    }
     ds.parkedStreamCardNonce = undefined;
     const predecessorIds = snapshotStreamingCardPredecessorIds(ds, messageId);
     persistStreamCardState(ds);

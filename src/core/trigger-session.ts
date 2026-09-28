@@ -785,15 +785,19 @@ async function triggerSessionTurnAdmitted(
   // steerable is what later allows a follow-up to steer INTO its turn (codex
   // requires both root and head positively authorized).
   const steerRequested = req.options?.steer === true;
-  const preparePresentation = (target: DaemonSession): void => {
+  const prepareTriggerPresentation = (target: DaemonSession, exactTurn: boolean): void => {
     armTriggerStreamingCard(target, req, triggerId);
+    // Standalone senders read this anchor from disk. Final-output suppression
+    // is independent: wait/async and presentation-only turns need routing too.
+    let changed = exactTurn && inheritTriggerReplyAnchor(target, triggerId);
+    if (req.presentation?.thinking === 'hidden' && !target.session.hiddenThinkingTurns?.includes(triggerId)) {
+      target.session.hiddenThinkingTurns = [...(target.session.hiddenThinkingTurns ?? []), triggerId].slice(-256);
+      changed = true;
+    }
+    const previousPolicy = target.session.turnStatusPolicies?.[triggerId];
     prepareTurnStatusPolicy(target, req, triggerId);
-    sessionStore.updateSession(target.session);
-    if (req.presentation?.thinking !== 'hidden') return;
-    target.session.hiddenThinkingTurns = [
-      ...(target.session.hiddenThinkingTurns ?? []).filter(id => id !== triggerId), triggerId,
-    ].slice(-256);
-    sessionStore.updateSession(target.session);
+    changed ||= previousPolicy !== target.session.turnStatusPolicies?.[triggerId];
+    if (changed) sessionStore.updateSession(target.session);
   };
   /** Payload shape for fork/send sites: content + the frozen steer flag. The
    *  follow-up content is already a CliTurnPayload on some paths. */
@@ -805,7 +809,8 @@ async function triggerSessionTurnAdmitted(
         : { ...content, codexAppSteerable: true };
   const prepareStableDispatch = (target: DaemonSession, willFork: boolean): number | undefined => {
     internal?.assertInputCurrent?.();
-    preparePresentation(target);
+    prepareTriggerPresentation(target, willFork || !!(stableTurnId || loudTurnId
+      || req.options?.waitForFinalOutput || req.options?.asyncReturnSessionId));
     if (!stableTurnId || !internal?.beforeDispatch) {
       bindTurnStatusDispatch(target, triggerId, willFork
         ? Math.max(target.workerGeneration ?? 0, target.session.workerGeneration ?? 0) + 1
@@ -865,13 +870,6 @@ async function triggerSessionTurnAdmitted(
   const armLoudFinalSuppression = (target: DaemonSession): void => {
     if (!suppressLoudFinal) return;
     armTriggerFinalSuppression(target, triggerId);
-    // The synthetic turn id must not cost this turn its chat-scope fold-back
-    // anchor — see inheritTriggerReplyAnchor. Persist immediately: the synthetic
-    // anchor AND the prune watermark it may raise must be on disk for the
-    // independent `botmux send` process (which reads the session file) to resolve
-    // routing and the --mention-back ambiguity window correctly.
-    inheritTriggerReplyAnchor(target, triggerId);
-    sessionStore.updateSession(target.session);
   };
   const disarmLoudFinalSuppression = (target: DaemonSession): void => {
     if (suppressLoudFinal) disarmTriggerFinalSuppression(target, triggerId);
@@ -2263,8 +2261,7 @@ export async function triggerSessionTurn(
           beforeDispatch: () => {
             beforeDispatch();
             const target = activeBySessionId(deps.activeSessions, req.target.sessionId!);
-            if (target) {
-              inheritTriggerReplyAnchor(target, triggerId);
+            if (target && inheritTriggerReplyAnchor(target, triggerId)) {
               sessionStore.updateSession(target.session);
             }
           },

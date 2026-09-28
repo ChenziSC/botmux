@@ -40,13 +40,13 @@ export interface TriggerRequest {
   /** Trusted presentation chosen by the connector owner. Undefined keeps the
    * localized default topic seed; null suppresses the seed entirely. */
   presentation?: {
+    /** Hide only this trigger's thinking bubble; business notices and HTTP results remain available. */
+    thinking?: 'hidden';
     topicMessage?: string | null;
     title?: string;
     /** Connector-owned handoff UI: replace the native live card only when this
      * exact input is committed by the worker. Never driven by group messages. */
     liveCard?: 'on-start';
-    /** Hide only this trigger's thinking bubble; business notices and HTTP results remain available. */
-    thinking?: 'hidden';
     /** Independent from thinking/final output; requires turn_status_card_policy_v1. */
     statusCard?: 'hidden';
     deliveryContext?: ManagedDeliveryContextV1;

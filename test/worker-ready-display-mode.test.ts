@@ -151,6 +151,7 @@ import {
   CARD_POSTING_SENTINEL,
   initWorkerPool,
   postTurnStartingCard,
+  postFreshStreamingCard,
   __testOnly_setupWorkerHandlers,
   __testOnly_waitForPinStreamingCardIdle,
   setActiveSessionsRegistry,
@@ -159,6 +160,7 @@ import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import { activeSessionKey, sessionKey, type DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
+import { applyHandoffCardEvent } from '../src/core/handoff-card-lifecycle.js';
 
 const getBotMock = getBot as ReturnType<typeof vi.fn>;
 
@@ -1700,19 +1702,54 @@ describe('worker-authoritative handoff live card', () => {
     return { ds, worker, reply, onStart };
   }
 
-  it('keeps a queued handoff silent, posts on commit, and recalls its predecessor after success', async () => {
+  it.each([true, false])('keeps a queued handoff silent and posts once on commit (previous card=%s)', async previous => {
     const { ds, worker, reply, onStart } = await prepare();
+    if (!previous) { ds.streamCardId = undefined; ds.streamCardNonce = undefined; }
     armTriggerStreamingCard(ds, handoff, 'trg_review');
     worker.emit('message', { type: 'ready', port: 9999, token: 'tok', turnId: 'trg_review' });
     await flush(); expect(reply).not.toHaveBeenCalled();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    worker.emit('message', { type: 'screen_update', content: 'queued', status: 'working', turnId: 'trg_review' });
+    await flush();
+    expect(reply).not.toHaveBeenCalled();
+    expect(updateMessageMock).not.toHaveBeenCalled();
     worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_review' });
     await flush(); await flush();
     expect(onStart).toHaveBeenCalledExactlyOnceWith(ds, '审查上传取消修复', 'trg_review');
     expect(reply).toHaveBeenCalledTimes(1); expect(ds.streamCardId).toBe('om_handoff_card');
-    expect(deleteMessageMock).toHaveBeenCalledWith('app_test', 'om_previous');
+    if (previous) expect(deleteMessageMock).toHaveBeenCalledWith('app_test', 'om_previous');
+    else expect(deleteMessageMock).not.toHaveBeenCalled();
     worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_review' });
     worker.emit('message', { type: 'turn_input_committed', turnId: 'om_unrelated_user' });
     await flush(); expect(reply).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a manually posted replacement live and safe from repeated completion', async () => {
+    const { ds, worker, reply } = await prepare();
+    ds.currentTurnId = 'trg_review';
+    ds.session.handoffLiveCard = { turnId: 'trg_review', sequence: 0 };
+    // A previously forced card must not authorize automatic revival.
+    ds.streamingCardForced = true;
+    const event = { kind: 'complete', turnId: 'trg_review', sequence: 1, resultMessageId: 'om_result' } as const;
+    const effects = { persist: vi.fn(), patch: vi.fn(), remove: vi.fn(async () => {}), clear: vi.fn() };
+    await applyHandoffCardEvent(ds, event, effects);
+    worker.emit('message', { type: 'ready', port: 9999, token: 'tok', turnId: 'trg_review' });
+    worker.emit('message', { type: 'screen_update', content: 'late', status: 'working', turnId: 'trg_review' });
+    await flush();
+    expect(reply).not.toHaveBeenCalled();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    let resolvePost!: (id: string) => void;
+    const manualReply = vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; }));
+    const manualPost = postFreshStreamingCard(ds, manualReply);
+    await applyHandoffCardEvent(ds, event, effects); // old retry while manual POST is pending
+    resolvePost('om_manual');
+    expect(await manualPost).toBe(true);
+    await applyHandoffCardEvent(ds, event, effects);
+    expect(effects.remove.mock.calls.every(([id]) => id === 'om_previous')).toBe(true);
+    expect(ds.streamCardId).toBe('om_manual');
+    worker.emit('message', { type: 'screen_update', content: 'manual update', status: 'idle', turnId: 'trg_review' });
+    await vi.waitFor(() => expect(updateMessageMock).toHaveBeenCalledWith('app_test', 'om_manual', expect.any(String)));
+    expect(reply).not.toHaveBeenCalled();
   });
 
   it('honors a bot that explicitly disabled its card', async () => {

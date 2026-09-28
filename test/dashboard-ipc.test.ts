@@ -10709,6 +10709,7 @@ describe('PUT /api/bot-card-prefs — tool result preference', () => {
       const url = `http://127.0.0.1:${handle.port}/api/bot-card-prefs`;
       for (const [patch, enabled] of [
         [{ thinkingCardToolResult: false }, true],
+        [{ thinkingCardToolResult: true }, true],
       ] as const) {
         const result = await fetch(url, {
           method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch),
@@ -10716,8 +10717,16 @@ describe('PUT /api/bot-card-prefs — tool result preference', () => {
         expect(result.status).toBe(200);
         expect(await result.json()).toMatchObject({ ok: true, cotEnabled: enabled });
         expect(loadBotConfigs()[0].cotEnabled !== false).toBe(enabled);
+        const stored = JSON.parse(readFileSync(configPath, 'utf8'))[0];
+        if (patch.thinkingCardToolResult === false) {
+          expect(stored.thinkingCardToolResult).toBe(false);
+          expect(loadBotConfigs()[0].thinkingCardToolResult).toBe(false);
+        } else {
+          expect(stored).not.toHaveProperty('thinkingCardToolResult');
+          expect(loadBotConfigs()[0].thinkingCardToolResult).toBeUndefined();
+        }
       }
-      expect(getBot(appId).config.thinkingCardToolResult).toBe(false);
+      expect(getBot(appId).config.thinkingCardToolResult).toBeUndefined();
     } finally {
       if (handle) await handle.close();
       handle = null;

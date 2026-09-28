@@ -1,3 +1,4 @@
+import { ServerResponse, type IncomingMessage } from 'node:http';
 import { authorizeManagedAsk } from '../src/core/managed-ask-api.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -8,7 +9,7 @@ import {
   tryResolveAsk, restorePersistedAsks, lookupManagedAsk, invalidateAll, toggleAsk, _getPending,
 } from '../src/core/ask-broker.js';
 import { createAskPersistStore, askKeyFor, HANDOFF_RETENTION_MS } from '../src/core/ask-persist-store.js';
-import { parseAskBody } from '../src/core/ask-api.js';
+import { parseAskBody, registerAskForResponse } from '../src/core/ask-api.js';
 import type { CreateAskInput, PendingAsk } from '../src/core/ask-types.js';
 import { askReplyRoute } from '../src/core/ask-types.js';
 
@@ -50,6 +51,23 @@ beforeEach(() => {
 afterEach(() => { _resetForTest(); rmSync(dir, { recursive: true, force: true }); vi.restoreAllMocks(); });
 
 describe('managed Ask durable acceptance and replay', () => {
+  it('detaches an HTTP response waiter without invalidating the durable Ask', async () => {
+    const response = new ServerResponse({ method: 'POST' } as IncomingMessage);
+    const pending = registerAskForResponse(input, response);
+    const disconnected = expect(pending).rejects.toThrow('waiter_disconnected');
+    await flush();
+    response.emit('close');
+    await disconnected;
+    expect(response.listenerCount('close')).toBe(0);
+    expect(lookupManagedAsk(identity)).toMatchObject({ state: 'pending', waiter: 'unknown' });
+    const next = new ServerResponse({ method: 'POST' } as IncomingMessage);
+    const reconnected = registerAskForResponse(input, next);
+    expect(answer()).toBe('accepted');
+    expect(await reconnected).toMatchObject({ answers: [['yes']] });
+    expect(next.listenerCount('close')).toBe(0);
+    expect(sent).toHaveLength(1);
+  });
+
   it('authenticates, persists and resumes a keyed Ask without dispatchAttempt', async () => {
     const liveOrigin = { capability: 'cap', turnId: 'keyed-turn' };
     const originalTurn = authorizeManagedAsk({

@@ -102,6 +102,31 @@ describe('parallel handoff lifecycle', () => {
     expect(effects.remove).not.toHaveBeenCalled();
   });
 
+  it('does not clear a restored card with the same id but a new nonce on completion retry', async () => {
+    const ds = session(), effects = io();
+    const event = { turnId: 'dev', sequence: 1, kind: 'complete', resultMessageId: 'om_result' } as const;
+    await applyHandoffCardEvent(ds, event, effects);
+    const restored = session(), retry = io();
+    restored.session = JSON.parse(JSON.stringify(ds.session));
+    restored.streamCardNonce = 'restored-nonce';
+    restored.streamCardPending = true;
+    restored.streamCardPendingTurnId = 'dev';
+    restored.pendingCardId = 'om_dev';
+    restored.pendingCardJson = '{"content":"restored card"}';
+    expect(restored.session.handoffLiveCard?.closedCard).toEqual({
+      messageId: 'om_dev', nonce: 'n', removed: true,
+    });
+    await applyHandoffCardEvent(restored, event, retry);
+    expect(restored.streamCardId).toBe('om_dev');
+    expect(restored.streamCardNonce).toBe('restored-nonce');
+    expect(restored.streamCardPending).toBe(true);
+    expect(restored.streamCardPendingTurnId).toBe('dev');
+    expect(restored.pendingCardId).toBe('om_dev');
+    expect(restored.pendingCardJson).toBe('{"content":"restored card"}');
+    expect(retry.remove).not.toHaveBeenCalled();
+    expect(retry.clear).not.toHaveBeenCalled();
+  });
+
   it('retries acknowledgement persistence without repeating a successful remote delete', async () => {
     const ds = session(), effects = io();
     const event = { turnId: 'dev', sequence: 1, kind: 'complete', resultMessageId: 'om_result' } as const;

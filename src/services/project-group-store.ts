@@ -42,7 +42,7 @@ export interface ProjectUserAction {
   summary: string;
   question: string;
   documentUrl?: string;
-  state: 'pending' | 'delivery_failed';
+  state: 'pending' | 'preparing' | 'processing' | 'delivery_failed';
 }
 
 export function parseProjectUserAction(raw: unknown): ProjectUserAction | undefined {
@@ -51,14 +51,14 @@ export function parseProjectUserAction(raw: unknown): ProjectUserAction | undefi
   for (const [key, limit] of [['requestId', 200], ['summary', 1000], ['question', 2000]] as const) {
     if (typeof r[key] !== 'string' || !r[key].trim() || r[key].length > limit) return;
   }
-  if (r.state !== 'pending' && r.state !== 'delivery_failed') return;
+  if (!['pending', 'preparing', 'processing', 'delivery_failed'].includes(String(r.state))) return;
   let documentUrl: string | undefined;
   if (r.documentUrl !== undefined) {
     if (typeof r.documentUrl !== 'string' || r.documentUrl.length > 2000) return;
     try { const url = new URL(r.documentUrl); if (url.protocol !== 'https:' || url.username || url.password) return; documentUrl = url.href; } catch { return; }
   }
   return { requestId: r.requestId as string, summary: r.summary as string, question: r.question as string,
-    state: r.state, ...(documentUrl ? { documentUrl } : {}) };
+    state: r.state as ProjectUserAction['state'], ...(documentUrl ? { documentUrl } : {}) };
 }
 
 export interface ProjectGroupState {

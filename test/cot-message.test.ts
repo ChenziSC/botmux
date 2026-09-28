@@ -958,3 +958,69 @@ describe('superseded turn (type-ahead: next turn starts before the previous one 
     expect(complete![0].params ?? complete![0].data).toMatchObject({ reason: 'error' });
   });
 });
+
+describe('starting work card and thinking publication order', () => {
+  it('waits for a delayed work card before creating the bubble and preserves buffered output', async () => {
+    const { trackStartingCardPublication } = await import('../src/core/starting-card-publication.js');
+    const ds = makeDs();
+    let finish!: () => void;
+    trackStartingCardPublication(ds, new Promise<void>(resolve => { finish = resolve; }));
+    handleCotThinkingUpdate(ds, upd([think('first')]));
+    handleCotThinkingUpdate(ds, upd([think('first'), say('second')]));
+    finalizeCotMessage(ds, 'om_turn1', 'completed');
+    await flush();
+    expect(request).not.toHaveBeenCalled();
+    finish(); await flush(); await flush();
+    expect(request.mock.calls.filter(([req]) => req.url === '/open-apis/im/v1/message_cot' && req.method === 'POST')).toHaveLength(1);
+    const events = pushedEvents();
+    expect(events.some(e => e.content.delta === 'second')).toBe(true);
+    expect(events.some(e => e.type === 'RUN_FINISHED')).toBe(true);
+  });
+  it('does not let a failed card POST block thinking or another session', async () => {
+    const { trackStartingCardPublication } = await import('../src/core/starting-card-publication.js');
+    const ds = makeDs(), other = makeDs({session:{sessionId:'other'}});
+    let reject!: (e: Error) => void;
+    const post = new Promise<void>((_, r) => { reject = r; });
+    trackStartingCardPublication(ds, post).catch(() => {});
+    handleCotThinkingUpdate(ds, upd([think('pending')]));
+    handleCotThinkingUpdate(other, upd([think('independent')], 'om_other'));
+    await flush(); expect(request.mock.calls.filter(([r]) => r.method === 'POST')).toHaveLength(1);
+    reject(new Error('card failed')); await flush(); await flush();
+    expect(request.mock.calls.filter(([r]) => r.method === 'POST')).toHaveLength(2);
+  });
+  it('drops a superseded not-yet-visible bubble instead of placing it below the successor card', async () => {
+    const { trackStartingCardPublication } = await import('../src/core/starting-card-publication.js');
+    const ds = makeDs(); let finish!: () => void;
+    trackStartingCardPublication(ds, new Promise<void>(resolve => { finish = resolve; }));
+    handleCotThinkingUpdate(ds, upd([think('old')], 'om_old'));
+    handleCotThinkingUpdate(ds, upd([think('new')], 'om_new'));
+    finish(); await flush(); await flush();
+    expect(request.mock.calls.filter(([r]) => r.method === 'POST')).toHaveLength(1);
+    expect(pushedEvents().some(e => e.content.delta === 'old')).toBe(false);
+    expect(pushedEvents().some(e => e.content.delta === 'new')).toBe(true);
+  });
+  it('follows a pending successor card started while the predecessor POST settles', async () => {
+    const { trackStartingCardPublication } = await import('../src/core/starting-card-publication.js');
+    const ds = makeDs(); let first!: () => void, second!: () => void;
+    const a = new Promise<void>(resolve => { first = resolve; });
+    const b = new Promise<void>(resolve => { second = resolve; });
+    trackStartingCardPublication(ds, a.then(() => { trackStartingCardPublication(ds, b); }));
+    handleCotThinkingUpdate(ds, upd([think('new')]));
+    first(); await flush(); expect(request).not.toHaveBeenCalled();
+    second(); await flush(); await flush();
+    expect(request.mock.calls.filter(([r]) => r.method === 'POST')).toHaveLength(1);
+  });
+  it('bounds a stuck card without blocking turn settlement or publishing a detached bubble', async () => {
+    const { trackStartingCardPublication } = await import('../src/core/starting-card-publication.js');
+    vi.useFakeTimers();
+    try {
+      const ds = makeDs(); let finish!: () => void;
+      trackStartingCardPublication(ds, new Promise<void>(resolve => { finish = resolve; }));
+      handleCotThinkingUpdate(ds, upd([think('buffered')]));
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(request).not.toHaveBeenCalled();
+      finish(); await flush();
+      expect(request).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+});

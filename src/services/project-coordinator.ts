@@ -51,6 +51,8 @@ export type ProjectCoordinatorAction =
     };
 
 export interface ProjectCoordinatorContext {
+  /** Internal producer guard, evaluated under the Project store mutation lock. */
+  assertCurrent?: () => void;
   dataDir: string;
   chatId: string;
   larkAppId: string;
@@ -262,6 +264,7 @@ export class ProjectCoordinator {
     action: Exclude<ProjectCoordinatorAction, { action: 'status' | 'refresh' }>,
   ): Promise<ProjectGroupState> {
     const next = await mutateProjectGroup(context.dataDir, context.chatId, current => {
+      context.assertCurrent?.();
       const now = nowIso();
       if (action.action === 'init') {
         if (current) throw new Error('project_already_exists');

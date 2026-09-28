@@ -823,7 +823,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // exceptions: a receiver that learned another session id could otherwise
   // forge readiness or an ask for that session.
   if (method === 'POST' && pathname === '/api/session-ready') return true;
-  if (method === 'POST' && (pathname === '/api/asks' || pathname === '/api/asks/lookup')) return true;
+  if (method === 'POST' && (pathname === '/api/asks' || pathname === '/api/asks/lookup' || pathname === '/api/asks/conversation')) return true;
   // botmux slash / botmux role switch（角色切换）/ botmux delete（关闭自身）：合法调用方
   // 是会话内的 CLI 自身，沙箱 / 读隔离下读不到 host secret。handler 内验证
   // 该会话的 rotating per-turn

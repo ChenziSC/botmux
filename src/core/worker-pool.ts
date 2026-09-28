@@ -1,3 +1,5 @@
+import { recordConversationInputCommitted, recordConversationExecutionChanged } from './ask-conversation.js';
+import { trackStartingCardPublication } from './starting-card-publication.js';
 import { withHandoffPreview, handoffNeedsAttachment } from './handoff-preview.js';
 import { automaticStatusCardHidden, commitTurnStatusPolicy, rejectTurnStatusPolicy, currentTurnStatusPolicy, statusCardTitle, captureStatusCardFence } from './turn-status-policy.js';
 import { assertSendTopicsAvailable } from '../cli/topic-send-guard.js';
@@ -3880,7 +3882,7 @@ export async function postTurnStartingCard(
   // durable reply card. Start both before awaiting either to preserve the
   // terminal card's synchronous generation/sentinel fence during slow POSTs.
   const statusPost = postTurnStartingStatusCard(ds, sessionReply, turnId);
-  const [replyPosted, statusPosted] = await Promise.all([replyPost, statusPost]);
+  const [replyPosted, statusPosted] = await trackStartingCardPublication(ds, Promise.all([replyPost, statusPost]));
   return replyPosted || statusPosted;
 }
 
@@ -12921,6 +12923,7 @@ function setupWorkerHandlers(
         completeOrdinaryImDelivery(ds, msg.turnId, workerGeneration);
         ds.failedIdleTurnId = undefined;
         commitTurnStatusPolicy(ds, msg.turnId, workerGeneration);
+        recordConversationInputCommitted(ds.larkAppId, ds.session.sessionId, msg.turnId, `${workerGeneration}:${msg.turnId}`);
         advanceManagedAskPresentation({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId,
           turnId: msg.turnId, workerGeneration, phase: 'running' });
         sessionStore.updateSession(ds.session);
@@ -13704,6 +13707,7 @@ function setupWorkerHandlers(
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit);
+        if (ds.lastScreenStatus === 'idle') recordConversationExecutionChanged(ds.larkAppId);
         stampIdleSinceAt(ds, prevStatus);
         bumpStreamCardStatusRevision(ds);
         if (['working', 'limited', 'stalled'].includes(msg.status)) advanceManagedAskPresentation({ larkAppId: ds.larkAppId,
@@ -14117,6 +14121,7 @@ function setupWorkerHandlers(
         const prevStatus = ds.lastScreenStatus;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit);
+        if (ds.lastScreenStatus === 'idle') recordConversationExecutionChanged(ds.larkAppId);
         stampIdleSinceAt(ds, prevStatus);
         bumpStreamCardStatusRevision(ds);
         // Same deferred-suspend checkpoint as the screen_update branch, and
@@ -16639,6 +16644,7 @@ function deliverFinalOutput(
     // (with content + usage) after a daemon restart drops the in-memory Map.
     // Stamp the owning bot for cross-bot isolation.
     asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, msg.content, completedAt, ds.larkAppId, msg.usage);
+    recordConversationExecutionChanged(ds.larkAppId);
     // This idempotent async turn produced its terminal output — drop its
     // worker-exit convergence entry so a later graceful exit of this generation
     // is not retro-failed (codex #776 round-6 finding #1). Per-triggerId delete so

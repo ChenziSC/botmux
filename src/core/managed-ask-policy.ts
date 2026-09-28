@@ -28,3 +28,13 @@ export async function loadManagedAskPolicy(configuredPath?: string | null): Prom
   }
   return policy;
 }
+
+/** Optional generic conversation contract from the same owner-pinned module. */
+export async function loadConversationPolicy(configuredPath?: string | null): Promise<import('./ask-conversation-types.js').ConversationPolicy | undefined> {
+  const modulePath = (configuredPath === undefined ? process.env.BOTMUX_MANAGED_ASK_POLICY_MODULE : configuredPath)?.trim();
+  if (!modulePath) return;
+  if (!isAbsolute(modulePath)) throw new Error('managed_ask_policy_path_must_be_absolute');
+  const module = await import(pathToFileURL(realpathSync(modulePath)).href);
+  if (module.askConversationPolicyVersion !== 1 || typeof module.inspectAskConversation !== 'function') return;
+  return module.inspectAskConversation;
+}

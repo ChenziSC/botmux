@@ -1,3 +1,11 @@
+import { conversationProjectAction } from './services/conversation-project-action.js';
+import { readProjectGroup as readConversationProject } from './services/project-group-store.js';
+import { AskConversationService, conversationReadView, setConversationInputObserver, setConversationExecutionObserver } from './core/ask-conversation.js';
+import { createConversationStore } from './core/ask-conversation-store.js';
+import { conversationLarkIO, routeConversationMessage, handleConversationCard } from './im/lark/ask-conversation.js';
+import { loadConversationPolicy } from './core/managed-ask-policy.js';
+import { conversationError, type ConversationIdentity } from './core/ask-conversation-types.js';
+let askConversations: AskConversationService | undefined;
 import { createManagedAskPresenter } from './core/managed-ask-presentation.js';
 import { setManagedAskPresenter, managedAskStore } from './core/ask-broker.js';
 import { retireManagedAskCot } from './im/lark/cot-message.js';
@@ -6745,8 +6753,41 @@ ipcRoute('GET', '/api/asks/capabilities', async (req, res) => {
   if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'core_owner_required' });
   return jsonRes(res, 200, { larkAppId: selfV3LarkAppId, capabilities: {
     managed_ask_delivery_v1: true, managed_ask_continuation_v1: !!managedAskDomainPolicy,
+    ask_conversation_v1: !!askConversations,
     turn_status_card_policy_v1: true,
   } });
+});
+
+ipcRoute('POST', '/api/asks/conversation', async (req, res) => {
+  try {
+    const raw = await readJsonBody<Record<string, any>>(req);
+    if (!raw || !['create', 'read', 'commit', 'revise', 'applied'].includes(raw.operation)) conversationError('bad_operation', 400);
+    const identity = { ...parseAskLookup(raw), policyKey: raw.policyKey, subjectRef: raw.subjectRef, subjectRevision: raw.subjectRevision } as ConversationIdentity;
+    const live = findActiveBySessionId(identity.sessionId);
+    const session = live?.session ?? sessionStore.getSession(identity.sessionId);
+    const original = authorizeManagedAsk({ identity, raw, trustedHost: isTrustedHostIpcRequest(req),
+      selfAppId: selfV3LarkAppId, registration: raw.operation !== 'read', session: session ? {
+        sessionId: session.sessionId, larkAppId: session.larkAppId ?? '', chatId: session.chatId,
+        rootMessageId: session.scope === 'chat' ? null : session.rootMessageId,
+        receiver: !!session.vcMeetingReceiver, liveOrigin: live?.managedTurnOrigin,
+        keyedTurnId: live?.managedTurnOrigin?.turnId && live.idempotentAsyncTurns?.get(live.managedTurnOrigin.turnId)
+          && !live.idempotentAsyncTurns.get(live.managedTurnOrigin.turnId)!.postBarrierFault ? live.managedTurnOrigin.turnId : undefined,
+      } : undefined });
+    if (!askConversations) conversationError('unsupported', 503);
+    if (session && !larkTransportEnabled({ chatId: session.chatId, apiOnly: getBot(identity.larkAppId).config.apiOnly })) conversationError('transport_unsupported', 400);
+    let result: unknown;
+    switch (raw.operation) {
+      case 'create': result = askConversations.create(identity, raw as any, original!.turnId); break;
+      case 'read': { const p = askConversations.read(identity); result = p ? conversationReadView(p, raw.cursor ?? 0) : { found: false }; break; }
+      case 'commit': result = askConversations.commit(identity, raw as any, original!.turnId); break;
+      case 'revise': result = askConversations.revise(identity, raw as any); break;
+      case 'applied': result = askConversations.applied(identity, raw as any, original!.turnId); break;
+    }
+    return jsonRes(res, 200, { ok: true, capabilities: { ask_conversation_v1: true }, result });
+  } catch (error) {
+    return jsonRes(res, error instanceof ManagedAskError ? error.status : 400, { ok: false,
+      error: error instanceof ManagedAskError ? error.code : 'ask_conversation_request_invalid' });
+  }
 });
 
 ipcRoute('POST', '/api/asks/continue', async (req, res) => {
@@ -6804,6 +6845,7 @@ ipcRoute('POST', '/api/asks/lookup', async (req, res) => {
     return jsonRes(res, 200, { ...lookupManagedAsk(identity), capabilities: {
       managed_ask_delivery_v1: true,
       managed_ask_continuation_v1: !!managedAskDomainPolicy,
+      ask_conversation_v1: !!askConversations,
       turn_status_card_policy_v1: true,
     } });
   } catch (error) {
@@ -26028,6 +26070,54 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }));
     try { managedAskDomainPolicy = await loadManagedAskPolicy(cfg.managedAskPolicyModule); }
     catch (error) { logger.error(`Managed Ask policy unavailable: ${error instanceof Error ? error.message : String(error)}`); }
+    let conversationPolicy: Awaited<ReturnType<typeof loadConversationPolicy>>;
+    try { conversationPolicy = await loadConversationPolicy(cfg.managedAskPolicyModule); }
+    catch (error) { logger.error(`Ask conversation policy unavailable: ${error instanceof Error ? error.message : String(error)}`); }
+    if (conversationPolicy) {
+      const conversationIO = conversationLarkIO();
+      askConversations = new AskConversationService({ store: createConversationStore(join(config.session.dataDir, 'asks')),
+        dataDir: config.session.dataDir, policy: conversationPolicy, ...conversationIO,
+        patch: async ask => {
+          await conversationIO.patch(ask);
+          const project = readConversationProject(config.session.dataDir, ask.identity.chatId);
+          if (!project) return;
+          const currentAsk = askConversations?.read(ask.identity);
+          if (!currentAsk) return;
+          const action = conversationProjectAction(currentAsk, project);
+          if (action) await projectCoordinator.run({ dataDir: config.session.dataDir, chatId: project.chatId,
+            larkAppId: project.larkAppId, coordinatorSessionId: project.coordinatorSessionId,
+            assertCurrent: () => { if (askConversations?.read(ask.identity)?.stateVersion !== currentAsk.stateVersion
+              || readConversationProject(config.session.dataDir, project.chatId)?.revision !== project.revision) throw new Error('conversation_projection_changed'); },
+          }, action);
+        },
+        canStart: ask => {
+          if (!sessionsRestored) return false;
+          const ds = findActiveBySessionId(ask.identity.sessionId);
+          if (!ds || ds.session.status !== 'active' || ds.larkAppId !== ask.identity.larkAppId
+            || ds.session.locked || ds.session.queued || ds.initialStartPending || ds.pendingRepo
+            || ds.pendingTurnId || ds.worktreeCreating || ds.pendingRawInput || ds.pendingFollowUpInput
+            || (ds.session.queuedActivationTail?.length ?? 0) > 0 || hasPendingSessionTurns(ds.session.sessionId)) return false;
+          if (ds.worker && !['idle', 'dormant'].includes(ds.lastScreenStatus ?? 'unknown')) return false;
+          const original = lookupManagedOriginalResult(ask.identity.sessionId, ask.originalTurnId);
+          return original?.ownerLarkAppId === ask.identity.larkAppId && original.result.status === 'completed';
+        },
+        lookup: request => lookupRegisteredTurn(request, cfg.larkAppId),
+        terminal: (ask, turnId) => {
+          const found = lookupManagedOriginalResult(ask.identity.sessionId, turnId);
+          if (found?.ownerLarkAppId !== cfg.larkAppId) return 'unknown';
+          return found.result.status === 'interrupted' ? 'failed' : found.result.status;
+        },
+        register: (request, assertInputCurrent) => triggerSessionTurn(request,
+          { larkAppId: cfg.larkAppId, activeSessions }, { assertInputCurrent }),
+      });
+      setConversationExecutionObserver(app => {
+        queueMicrotask(() => { try { askConversations?.tick(app); } catch (error) { logger.warn(`Ask conversation wake unavailable: ${String(error)}`); } });
+      });
+      setConversationInputObserver((app, session, turn, proof) => {
+        try { askConversations?.onInputCommitted(app, session, turn, proof); }
+        catch (error) { logger.warn(`Ask conversation input receipt unavailable: ${String(error)}`); }
+      });
+    }
     restorePersistedAsksBroker(Date.now(), cfg.larkAppId);
   } catch (e) {
     logger.warn(`[ask] restorePersistedAsks failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -26644,6 +26734,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     desc.lastHeartbeat = Date.now();
     try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
     claimOccupancy();
+    try { askConversations?.tick(cfg.larkAppId); } catch (error) { logger.warn(`Ask conversation recovery unavailable: ${String(error)}`); }
   }, 30_000);
   if (typeof descriptorHeartbeat.unref === 'function') descriptorHeartbeat.unref();
 
@@ -27007,8 +27098,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     const botEventHandlers: EventHandlers = {
       handleCardAction: (data, appId) => withBotTurnAdmission(
         appId,
-        () => cardActionPluginGateway.dispatch(data, appId),
+        () => {
+          const conversation = handleConversationCard(askConversations, data, appId,
+            (ask, by) => evaluateAskAnswerTalk(appId, ask.identity.chatId, by, 'group'));
+          return conversation ? Promise.resolve(conversation) : cardActionPluginGateway.dispatch(data, appId);
+        },
       ),
+      handleAskConversation: (data, appId) => routeConversationMessage(askConversations, data, appId),
       handleNewTopic: (data, ctx) => handleNewTopic(data, ctx),
       handleThreadReply: (data, ctx) => handleThreadReply(data, ctx),
       validateTopicHeader: (header, appId) => resolveTopicSpec(header, {

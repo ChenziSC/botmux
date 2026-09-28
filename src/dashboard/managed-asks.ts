@@ -7,7 +7,7 @@ export async function lookupAskForOwner(args: {
   ownerAuthenticated: boolean;
   sessionId: string;
   raw: unknown;
-  operation?: 'lookup' | 'continue';
+  operation?: 'lookup' | 'continue' | 'conversation';
   proxyToDaemon: (app: string, path: string, init: RequestInit) => Promise<Response>;
 }): Promise<{ status: number; body: unknown }> {
   if (!args.ownerAuthenticated) return { status: 403, body: { ok: false, error: 'core_owner_required' } };
@@ -20,7 +20,8 @@ export async function lookupAskForOwner(args: {
   }
   try {
     const response = await args.proxyToDaemon(identity.larkAppId, `/api/asks/${args.operation ?? 'lookup'}`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(identity),
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(args.operation === 'conversation' ? { ...identity, operation: 'read',
+        policyKey: (args.raw as any).policyKey, subjectRef: (args.raw as any).subjectRef, subjectRevision: (args.raw as any).subjectRevision } : identity),
       signal: AbortSignal.timeout(10000),
     });
     return { status: response.status, body: await response.json() };

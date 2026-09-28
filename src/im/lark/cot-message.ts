@@ -40,6 +40,7 @@
  * Per-bot master switch `cotEnabled` (default ON — only an explicit false
  * disables; per-chat opt-out via `/cot off`).
  */
+import { pendingStartingCardPublication } from '../../core/starting-card-publication.js';
 import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getBot, getBotClient } from '../../bot-registry.js';
@@ -586,6 +587,17 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
   try {
     while (!state.disabled) {
       if (!state.cotId) {
+        const startingCard = pendingStartingCardPublication(ds);
+        if (startingCard) {
+          await startingCard;
+          // A newer turn/stop can arrive during the POST. Never resurrect its
+          // predecessor's not-yet-visible bubble below the current work card.
+          if (state.disabled || state.settled || states.get(ds) !== state
+            || (ds.currentTurnId && ds.currentTurnId !== state.turnId)) {
+            state.disabled = true;
+            break;
+          }
+        }
         await apiCreate(ds, state);
         // Record the orphan marker the moment the bubble exists — before the
         // prologue append. If the prologue fails (or the daemon restarts

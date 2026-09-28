@@ -187,8 +187,8 @@ export function setCardDispatcher(d: AskCardDispatcher): void {
  *  Throws synchronously only if no dispatcher has been wired — that's a
  *  daemon-misconfiguration bug, not a runtime ask failure.
  */
-export function registerAsk(input: CreateAskInput): Promise<AskResult> {
-  return registerAskInternal(input, false);
+export function registerAsk(input: CreateAskInput, signal?: AbortSignal): Promise<AskResult> {
+  return registerAskInternal(input, false, signal);
 }
 
 /**
@@ -202,7 +202,8 @@ export function registerHostAsk(input: CreateAskInput): Promise<AskResult> {
   return registerAskInternal(input, true);
 }
 
-function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promise<AskResult> {
+function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal?: AbortSignal): Promise<AskResult> {
+  if (signal?.aborted) return Promise.resolve(disconnectedResult());
   if (!dispatcher) {
     throw new Error('ask-broker: cardDispatcher not wired — daemon bootstrap bug');
   }
@@ -277,7 +278,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promi
       // one result; no second ask, no second card.
       if (!existing.settled && !existing.dormant) {
         logger.info?.(`ask-broker: active replay joined ask ${existing.askId} (key=${askKey})`);
-        return new Promise<AskResult>((resolve) => { existing.waiters.push(resolve); });
+        return new Promise<AskResult>((resolve) => { attachWaiter(existing, resolve, signal); });
       }
       // recent-terminal (settled, still retained): return the same terminal result.
       if (existing.settled && existing.terminalResult && !existing.dormant) {
@@ -286,7 +287,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promi
       }
       // dormant (restored after restart): re-attach (handoff or fresh waiter).
       if (existing.dormant) {
-        return reattachByRequest(existing);
+        return reattachByRequest(existing, signal);
       }
     } else {
       // Same key, DIFFERENT immutable identity (crafted / stale-but-mutated
@@ -334,7 +335,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promi
       createdAt,
       deadlineAt,
       settled: false,
-      waiters: [resolve],
+      waiters: [],
       timeoutMs: input.timeoutMs,
       timeoutStartsAfterDelivery: hostManaged,
       selections,
@@ -355,8 +356,9 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promi
     if (!hostManaged) armAskTimeout(ask, input.timeoutMs, createdAt);
     pending.set(askId, ask);
     if (ask.managedRecord) {
-      ask.waiters = [];
       managedWaiter(ask, input.waiterSignal).then(resolve, reject);
+    } else {
+      attachWaiter(ask, resolve, signal);
     }
     // Persist ONLY resumable origins (codex P1-4). A restart before the card
     // lands still leaves a resumable record; restore/re-attach re-sends.
@@ -366,6 +368,42 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promi
     }
     void sendCardForAsk(ask);
   });
+}
+
+/** A disconnected IPC caller is no longer an answer consumer. Keep other
+ * callers alive; only restart-safe hooks may retain an unclaimed answer. */
+function disconnectedResult(): AskResult {
+  return { kind: 'invalidated', reason: 'ask caller disconnected', selected: null,
+    by: null, comment: null, timedOut: false };
+}
+
+function attachWaiter(
+  ask: InternalPending,
+  resolve: (result: AskResult) => void,
+  signal?: AbortSignal,
+): void {
+  const waiter = (result: AskResult) => {
+    signal?.removeEventListener('abort', onAbort);
+    resolve(result);
+  };
+  const onAbort = () => {
+    const index = ask.waiters.indexOf(waiter);
+    if (index < 0) return;
+    ask.waiters.splice(index, 1);
+    waiter(disconnectedResult());
+    if (ask.settled || ask.waiters.length > 0) return;
+    if (ask.resumable) {
+      // Reuse restart handoff semantics: preserve the original deadline and
+      // stash any answer until the same authenticated invocation reconnects.
+      ask.dormant = true;
+      persistFromInternal(ask);
+    } else {
+      settle(ask.askId, disconnectedResult());
+    }
+  };
+  ask.waiters.push(waiter);
+  signal?.addEventListener('abort', onAbort, { once: true });
+  if (signal?.aborted) onAbort();
 }
 
 /** Immutable-identity equality: a reattach/replay must match the ORIGINAL ask on
@@ -435,8 +473,14 @@ function sendCardForAsk(ask: InternalPending): void {
         }
         const { messageId } = await dispatcher!.send(snapshot(ask));
         const cur = pending.get(ask.askId);
-        if (cur === ask && (!cur.settled || cur.managedRecord)) {
+        if (cur === ask) {
           cur.cardMessageId = messageId;
+          // Ordinary callers can disconnect during send. Managed records keep
+          // their durable terminal result and publish their persisted status.
+          if (cur.settled && cur.terminalResult && !cur.managedRecord) {
+            notifyOnSettle(cur, cur.terminalResult);
+            return;
+          }
           if (!cur.settled && cur.timeoutStartsAfterDelivery && cur.timeoutStartedAt === undefined) {
             armAskTimeout(cur, cur.timeoutMs, Date.now());
           }
@@ -646,7 +690,7 @@ export function lookupManagedAsk(identity: AskLookupIdentity, now = Date.now()) 
  *  - still awaiting a click: install a waiter + timeout re-armed to the ORIGINAL
  *    absolute deadline; re-send the card if it was never confirmed sent.
  */
-function reattachByRequest(ask: InternalPending): Promise<AskResult> {
+function reattachByRequest(ask: InternalPending, signal?: AbortSignal): Promise<AskResult> {
   if (ask.answeredResult) {
     const result = ask.answeredResult;
     ask.dormant = false;
@@ -664,7 +708,7 @@ function reattachByRequest(ask: InternalPending): Promise<AskResult> {
 
   return new Promise<AskResult>((resolve) => {
     ask.dormant = false;
-    ask.waiters.push(resolve);
+    attachWaiter(ask, resolve, signal);
     clearTimeout(ask.timeoutHandle);
     const awaitsDelivery = ask.timeoutStartsAfterDelivery && !ask.cardMessageId;
     const remaining = awaitsDelivery ? ask.timeoutMs : Math.max(0, ask.deadlineAt - Date.now());
@@ -1193,6 +1237,9 @@ function settle(askId: string, result: AskResult): boolean {
   ask.settled = true;
   ask.settledAt = Date.now();
   ask.terminalResult = result; // retained for a same-requestId replay in the ambiguous window
+  // Terminal non-answers must replay directly instead of reattaching a waiter.
+  // The answered-stash branch above keeps dormant until its answer is claimed.
+  ask.dormant = false;
   clearTimeout(ask.timeoutHandle);
   // The durable record's job is done the moment the ask leaves the pending
   // state (delivered to live waiters, or a terminal non-answer) — drop it so a

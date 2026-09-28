@@ -657,7 +657,7 @@ import {
   submitCustomReply,
 } from './core/ask-broker.js';
 import { createAskPersistStore, dispatchUuidForKey } from './core/ask-persist-store.js';
-import { parseAskBody } from './core/ask-api.js';
+import { parseAskBody, registerAskForResponse } from './core/ask-api.js';
 import { authorizeManagedAsk, parseAskLookup } from './core/managed-ask-api.js';
 import { ManagedAskError } from './core/managed-ask-types.js';
 import { continueManagedAsk, type ManagedAskPolicy } from './core/managed-ask-continuation.js';
@@ -7236,9 +7236,6 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     logger.warn(`[ask:${boundAsk.larkAppId}] no active session for ${boundAsk.sessionId.substring(0, 8)}; chatType unknown (p2pOpen answer gate falls back to allowlist)`);
   }
   let result: import('./core/ask-types.js').AskResult;
-  const waiterAbort = new AbortController();
-  const releaseWaiter = () => waiterAbort.abort();
-  if (boundAsk.managedDelivery) res.once('close', releaseWaiter);
   try {
   const originalTurn = boundAsk.managedDelivery ? authorizeManagedAsk({
     identity: boundAsk, raw: body, trustedHost: isTrustedHostIpcRequest(req),
@@ -7253,7 +7250,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
         ? askSession.managedTurnOrigin.turnId : undefined,
     } : undefined,
   }) : undefined;
-  result = await registerAskBroker({
+  result = await registerAskForResponse({
     managedDelivery: boundAsk.managedDelivery, originalTurn,
     managedHandoffPreview: originalTurn ? askSession?.session.turnStatusPolicies?.[originalTurn.turnId]?.handoffPreview : undefined,
     originalExecution: originalTurn && askSession?.idempotentAsyncTurns?.get(originalTurn.turnId)
@@ -7262,7 +7259,6 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
           replayKey: askSession.idempotentAsyncTurns.get(originalTurn.turnId)!.key,
           replayKind: askSession.idempotentAsyncTurns.get(originalTurn.turnId)!.kind }
       : undefined,
-    waiterSignal: boundAsk.managedDelivery ? waiterAbort.signal : undefined,
     larkAppId: boundAsk.larkAppId,
     chatId: boundAsk.chatId,
     rootMessageId: boundAsk.rootMessageId,
@@ -7280,12 +7276,13 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // a restart-surviving mux backend (tmux/herdr/zellij/zmx) is resumable.
     backendSurvivesRestart:
       !!askSession && getSessionPersistentBackendType(askSession) !== undefined,
-  });
+  }, res);
   } catch (error) {
     if (res.destroyed) return;
     if (error instanceof ManagedAskError) return jsonRes(res, error.status, { ok: false, error: error.code });
     throw error;
-  } finally { res.off('close', releaseWaiter); }
+  }
+  if (res.destroyed) return;
 
   // CoCo 专属：它的 hook 不能用 directive 代答（hook 客户端永远 passthrough，CoCo 会
   // 渲染原生 picker）。这里在 ask 结算为「已作答」时，把答案翻成按键序列下发给该会话

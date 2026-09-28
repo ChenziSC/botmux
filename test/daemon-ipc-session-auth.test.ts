@@ -121,11 +121,11 @@ describe('daemon session-scoped IPC route wiring', () => {
       "ipcRoute('POST', '/api/attention'",
     );
     const bindAt = route.indexOf('boundAsk = bindSessionScopedIpcIdentity(');
-    const registerAt = route.indexOf('registerAskBroker({');
+    const registerAt = route.indexOf('registerAskForResponse({');
     expect(bindAt).toBeGreaterThanOrEqual(0);
     expect(registerAt).toBeGreaterThan(bindAt);
     expect(route).toContain('const askChatType = askSession?.chatType;');
-    const registration = route.slice(registerAt, route.indexOf('\n  });', registerAt));
+    const registration = route.slice(registerAt, route.indexOf('\n  }, res);', registerAt));
     // Managed delivery metadata may precede routing fields; every identity
     // still has to come from the server-bound session, never the raw request.
     for (const field of ['larkAppId', 'chatId', 'rootMessageId', 'sessionId']) {

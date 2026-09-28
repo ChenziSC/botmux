@@ -1010,6 +1010,42 @@ describe('starting work card and thinking publication order', () => {
     second(); await flush(); await flush();
     expect(request.mock.calls.filter(([r]) => r.method === 'POST')).toHaveLength(1);
   });
+  it('keeps waiting for another card after one publication rejects', async () => {
+    const { trackStartingCardPublication } = await import('../src/core/starting-card-publication.js');
+    const ds = makeDs();
+    let fail!: (error: Error) => void;
+    let finish!: () => void;
+    const first = trackStartingCardPublication(ds, new Promise<void>((_, reject) => { fail = reject; }));
+    trackStartingCardPublication(ds, new Promise<void>(resolve => { finish = resolve; }));
+    handleCotThinkingUpdate(ds, upd([think('buffered')]));
+    fail(new Error('first card failed'));
+    await expect(first).rejects.toThrow('first card failed');
+    await flush();
+    expect(request).not.toHaveBeenCalled();
+    finish(); await flush(); await flush();
+    expect(request.mock.calls.filter(([req]) => req.method === 'POST')).toHaveLength(1);
+    expect(pushedEvents().some(event => event.content.delta === 'buffered')).toBe(true);
+  });
+  it('does not publish a stopped turn after its pending card finishes', async () => {
+    const { trackStartingCardPublication } = await import('../src/core/starting-card-publication.js');
+    const ds = makeDs();
+    let finish!: () => void;
+    trackStartingCardPublication(ds, new Promise<void>(resolve => { finish = resolve; }));
+    handleCotThinkingUpdate(ds, upd([think('cancelled')]));
+    abortCotMessage(ds);
+    finish(); await flush(); await flush();
+    expect(request).not.toHaveBeenCalled();
+  });
+  it('drops a predecessor when the current turn changes before its next thinking update', async () => {
+    const { trackStartingCardPublication } = await import('../src/core/starting-card-publication.js');
+    const ds = makeDs({ currentTurnId: 'om_turn1' });
+    let finish!: () => void;
+    trackStartingCardPublication(ds, new Promise<void>(resolve => { finish = resolve; }));
+    handleCotThinkingUpdate(ds, upd([think('old')]));
+    ds.currentTurnId = 'om_turn2';
+    finish(); await flush(); await flush();
+    expect(request).not.toHaveBeenCalled();
+  });
   it('bounds a stuck card without blocking turn settlement or publishing a detached bubble', async () => {
     const { trackStartingCardPublication } = await import('../src/core/starting-card-publication.js');
     vi.useFakeTimers();

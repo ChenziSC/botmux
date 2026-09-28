@@ -593,6 +593,7 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
           // A newer turn/stop can arrive during the POST. Never resurrect its
           // predecessor's not-yet-visible bubble below the current work card.
           if (state.disabled || state.settled || states.get(ds) !== state
+            || state.finishStatus === 'interrupted'
             || (ds.currentTurnId && ds.currentTurnId !== state.turnId)) {
             state.disabled = true;
             break;

@@ -3926,7 +3926,10 @@ export async function postTurnStartingCard(
   // durable reply card. Start both before awaiting either to preserve the
   // terminal card's synchronous generation/sentinel fence during slow POSTs.
   const statusPost = postTurnStartingStatusCard(ds, sessionReply, turnId);
-  const [replyPosted, statusPosted] = await trackStartingCardPublication(ds, Promise.all([replyPost, statusPost]));
+  // Track each POST separately: one rejection must not release the other card.
+  trackStartingCardPublication(ds, replyPost);
+  trackStartingCardPublication(ds, statusPost);
+  const [replyPosted, statusPosted] = await Promise.all([replyPost, statusPost]);
   return replyPosted || statusPosted;
 }
 

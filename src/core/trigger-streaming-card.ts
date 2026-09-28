@@ -8,9 +8,9 @@ const pending = new WeakMap<DaemonSession, Map<string, string>>();
 export function triggerThinkingHidden(ds: DaemonSession, turnId: string): boolean {
   return ds.session.hiddenThinkingTurns?.includes(turnId) === true;
 }
-export function armTriggerStreamingCard(ds: DaemonSession, req: TriggerRequest, turnId: string): void {
+export function armTriggerStreamingCard(ds: DaemonSession, req: TriggerRequest, turnId: string, apiOnly?: boolean): void {
   if (req.presentation?.liveCard !== 'on-start' || ds.scope !== 'chat'
-    || ds.chatType !== 'group' || !larkTransportEnabled({ chatId: ds.chatId })) return;
+    || ds.chatType !== 'group' || !larkTransportEnabled({ chatId: ds.chatId, apiOnly })) return;
   const turns = pending.get(ds) ?? new Map<string, string>();
   turns.set(turnId, (req.presentation.title?.trim() || ds.session.title || '任务执行').slice(0, 50));
   pending.set(ds, turns);

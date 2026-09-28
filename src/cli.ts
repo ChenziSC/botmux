@@ -12008,7 +12008,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error(`加载 bot 配置失败: ${err?.message ?? err}`);
     process.exit(1);
   }
-  const { resolveCurrentChatBotOpenIdsByLarkAppIds, replyMessage, getMessageThreadId } = await import('./im/lark/client.js');
+  const { resolveCurrentChatBotOpenIdsByLarkAppIds, replyMessage } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
   const sourceBrand = botBrand(botConfigs.find(config => config.larkAppId === appId));
 
@@ -12163,16 +12163,16 @@ async function cmdDispatch(rest: string[]): Promise<void> {
           progress: accepted ? 20 : 0,
         }),
       });
-      const threadId = await getMessageThreadId(appId, intoRoot).catch(() => undefined);
+      const threadId = await resolveDispatchThreadId(appId, intoRoot);
       console.log(JSON.stringify({
         success: accepted, taskSent: true, mode: 'into', sourceSessionId: sid,
         targetAppIds: parsedBotApps.map(item => item.appId),
         ...receiptState, threadRootId: intoRoot,
-        threadId: await resolveDispatchThreadId(appId, intoRoot),
+        threadId,
         kickoffMessageId: kickoffId, chatId: targetChatId, bots: built.mentionedOpenIds,
         collaborationReady: parsedBotApps.length > 0,
         projectSynced,
-        ...(threadId ? { threadId, threadLink: threadAppLink(targetChatId, threadId, sourceBrand) } : {}),
+        ...(threadId ? { threadLink: threadAppLink(targetChatId, threadId, sourceBrand) } : {}),
         ...(acceptance ? {
           accepted,
           acceptedBotAppIds: acceptance.acceptedBotAppIds,
@@ -12284,7 +12284,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         progress: standby || !accepted ? 0 : 20,
       }),
     });
-    const threadId = await getMessageThreadId(appId, seedId).catch(() => undefined);
+    const threadId = await resolveDispatchThreadId(appId, seedId);
     console.log(JSON.stringify({
       success: accepted,
       sourceSessionId: sid,
@@ -12295,7 +12295,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       seedMessageId: seedId,
       threadRootId: seedId,
       // A normal-group seed may only become a topic after the prime/kickoff reply.
-      threadId: await resolveDispatchThreadId(appId, seedId),
+      threadId,
       primeMessageId: primeId,
       kickoffMessageId: kickoffId,
       repo: repo ?? null,
@@ -12303,7 +12303,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       bots: built.mentionedOpenIds,
       collaborationReady: parsedBotApps.length > 0,
       projectSynced,
-      ...(threadId ? { threadId, threadLink: threadAppLink(targetChatId, threadId, sourceBrand) } : {}),
+      ...(threadId ? { threadLink: threadAppLink(targetChatId, threadId, sourceBrand) } : {}),
       ...(acceptance ? {
         accepted,
         acceptedBotAppIds: acceptance.acceptedBotAppIds,

@@ -54,10 +54,10 @@ describe('managed Ask durable acceptance and replay', () => {
   it('detaches an HTTP response waiter without invalidating the durable Ask', async () => {
     const response = new ServerResponse({ method: 'POST' } as IncomingMessage);
     const pending = registerAskForResponse(input, response);
-    const disconnected = expect(pending).rejects.toThrow('waiter_disconnected');
     await flush();
     response.emit('close');
-    await disconnected;
+    // Bun evaluates rejects matchers eagerly; disconnect before awaiting the assertion.
+    await expect(pending).rejects.toThrow('waiter_disconnected');
     expect(response.listenerCount('close')).toBe(0);
     expect(lookupManagedAsk(identity)).toMatchObject({ state: 'pending', waiter: 'unknown' });
     const next = new ServerResponse({ method: 'POST' } as IncomingMessage);

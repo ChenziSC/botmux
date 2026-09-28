@@ -783,7 +783,7 @@ async function triggerSessionTurnAdmitted(
   // requires both root and head positively authorized).
   const steerRequested = req.options?.steer === true;
   const prepareTriggerPresentation = (target: DaemonSession, exactTurn: boolean): void => {
-    armTriggerStreamingCard(target, req, triggerId);
+    armTriggerStreamingCard(target, req, triggerId, getBot(target.larkAppId).config.apiOnly);
     // Standalone senders read this anchor from disk. Final-output suppression
     // is independent: wait/async and presentation-only turns need routing too.
     let changed = exactTurn && inheritTriggerReplyAnchor(target, triggerId);

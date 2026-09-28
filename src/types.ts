@@ -856,8 +856,6 @@ export interface Session {
   /** Whether the quote-target sender is a bot (vs a human) — drives the
    *  @ hard-gate's context-aware error text. */
   quoteTargetSenderIsBot?: boolean;
-  /** Persisted streaming-card state — allows the existing card to be PATCHed
-   *  (rather than a fresh POST) after daemon restart. */
   /** Connector-owned lifecycle, scoped to the exact committed handoff. */
   handoffLiveCard?: {
     turnId: string; sequence: number; title?: string; closed?: boolean; resultMessageId?: string;
@@ -868,6 +866,8 @@ export interface Session {
   };
   /** Exact trigger turns with hidden thinking, persisted for restore and late transcript events. */
   hiddenThinkingTurns?: string[];
+  /** Persisted streaming-card state — allows the existing card to be PATCHed
+   *  (rather than a fresh POST) after daemon restart. */
   streamCardId?: string;
   streamCardNonce?: string;
   /** Stable visible destination of the persisted live streaming card. */

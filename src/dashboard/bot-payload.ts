@@ -160,6 +160,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     groupJoinCommandEnabled: j?.groupJoinCommandEnabled === true,
     groupJoinCommand: typeof j?.groupJoinCommand === 'string' ? j.groupJoinCommand : '',
     autoStartOnNewTopic: j?.autoStartOnNewTopic === true,
+    autoStartExcludedChats: Array.isArray(j?.autoStartExcludedChats) ? j.autoStartExcludedChats : [],
     summaryRange: j?.summaryRange
       ?? summaryRangeFromLegacyContentTriggers(j?.contentTriggers)
       ?? defaultSummaryRangePrefs(),
@@ -178,6 +179,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     restrictGrantCommands: j?.restrictGrantCommands === true,
     autoGrantRequestCards: j?.autoGrantRequestCards !== false,
     p2pOpen: j?.p2pOpen === true,
+    grantRequestToOwnerDm: j?.grantRequestToOwnerDm === true,
     grantDefaultDurationMs: typeof j?.grantDefaultDurationMs === 'number'
       && GRANT_DURATION_OPTIONS.includes(j.grantDefaultDurationMs as (typeof GRANT_DURATION_OPTIONS)[number])
       ? j.grantDefaultDurationMs
@@ -187,6 +189,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     envelopeInjection: j?.envelopeInjection === 'auto' ? 'auto' : 'off',
     topicUnavailablePolicy: j?.topicUnavailablePolicy === 'stop' ? 'stop' : 'legacy',
     replyDelivery: j?.replyDelivery === 'transcript' ? 'transcript' : 'send',
+    promptInjection: j?.promptInjection === 'none' ? 'none' : 'default',
     replyDeliveryDefault: j?.replyDeliveryDefault === 'transcript' ? 'transcript' : 'send',
     replyDeliverySupported: j?.replyDeliverySupported === true,
     codexAuthSync: j?.codexAuthSync === 'isolated' ? 'isolated' : 'shared',

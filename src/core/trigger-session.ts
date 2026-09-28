@@ -1,5 +1,7 @@
 import { prepareTurnStatusPolicy, bindTurnStatusDispatch } from './turn-status-policy.js';
 import { armTriggerStreamingCard } from './trigger-streaming-card.js';
+import { zeroPromptInjectionForBot, sessionPromptInjection } from './prompt-injection.js';
+import { withLarkTurnIdempotency } from './lark-turn-idempotency.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import * as idempotencyStore from '../services/idempotency-store.js';
@@ -51,6 +53,8 @@ export interface TriggerSessionInternalOptions {
   /** Host-owned synchronous scope/answer guard, re-read at the input boundary. */
   assertInputCurrent?: () => void;
   stableTurnId?: string;
+  /** A loud idempotent relay must not be replayed by worker crash recovery. */
+  atMostOnce?: boolean;
   /** Synchronous write-ahead hook invoked immediately before worker IPC/fork.
    *  Durable receivers use it to persist DISPATCHED with the exact worker
    *  generation. Throwing aborts the dispatch. */
@@ -762,6 +766,7 @@ function buildExistingSessionContent(
     // HTTP response directives are carried separately at application priority.
     codexAppMessageContext,
     sessionBackendType: ds.session.backendType,
+    promptInjection: sessionPromptInjection(ds),
     turnId,
   });
 }
@@ -836,7 +841,7 @@ async function triggerSessionTurnAdmitted(
       if (oldest !== undefined) target.suppressedFinalOutputTurns.delete(oldest);
     }
   };
-  // Loud external triggers (no stableTurnId / no durable ledger) whose connector
+  // Loud external triggers (including keyed Lark relays) whose connector
   // opted into suppressFinalOutput. Unlike the durable path above this only drops
   // the trailing final_output — the streaming card / start notice still show. The
   // trigger turn id is stamped onto the fork so the worker echoes it back on
@@ -848,7 +853,7 @@ async function triggerSessionTurnAdmitted(
   // arming there would starve the HTTP caller until its timeout. The generic
   // /api/trigger endpoint accepts caller-supplied options without the webhook
   // route's filtering, so the guard belongs here rather than upstream.
-  const suppressLoudFinal = !stableTurnId
+  const suppressLoudFinal = (!stableTurnId || internal?.atMostOnce === true)
     && !req.options?.waitForFinalOutput
     && !req.options?.asyncReturnSessionId
     && req.options?.suppressFinalOutput === true;
@@ -933,7 +938,11 @@ async function triggerSessionTurnAdmitted(
   }
 
   const dryRun = !!req.options?.dryRun;
-  const prompt = buildUntrustedEventPrompt(req, triggerId);
+  const promptForSession = (target?: DaemonSession) => zeroPromptInjectionForBot(larkAppId, undefined,
+    target ? sessionPromptInjection(target) : undefined)
+    ? [req.instruction, req.envelope.rawText ?? JSON.stringify(req.envelope.payload ?? {})].filter(Boolean).join('\n\n')
+    : buildUntrustedEventPrompt(req, triggerId);
+  const prompt = promptForSession();
   const topicMessage = buildExternalEventTopicMessage(req, larkAppId);
   const hasExplicitTopicMessage = typeof req.presentation?.topicMessage === 'string'
     && req.presentation.topicMessage.trim().length > 0;
@@ -1226,6 +1235,7 @@ async function triggerSessionTurnAdmitted(
   }
 
   const deliverToExisting = async (target: DaemonSession): Promise<TriggerResponse> => {
+    const prompt = promptForSession(target);
     // Ownership guard (PR #597): the target must still be the live, registered
     // occupant before we dispatch. Validate by object identity at its canonical
     // key AND — because a session can legitimately be reached via a non-canonical
@@ -1534,6 +1544,7 @@ async function triggerSessionTurnAdmitted(
       armLoudFinalSuppression(target);
       const accepted = sendWorkerInput(target, content, stableTurnId ? triggerId : loudTurnId, {
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+        ...(internal?.atMostOnce ? { atMostOnce: true } : {}),
         ...(steerRequested ? { codexAppSteerable: true as const } : {}),
       });
       if (!accepted) {
@@ -1658,6 +1669,7 @@ async function triggerSessionTurnAdmitted(
     forkWorker(target, withSteer(content), {
       resume: target.hasHistory,
       turnId: triggerId,
+      ...(internal?.atMostOnce ? { atMostOnce: true } : {}),
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     });
     return {
@@ -2237,7 +2249,27 @@ export async function triggerSessionTurn(
   }
   const result = await withBotTurnAdmission(
     deps.larkAppId,
-    () => triggerSessionTurnAdmitted(req, deps, internal),
+    () => {
+      if (!req.options?.turnIdempotencyKey || req.options.asyncReturnSessionId) {
+        return triggerSessionTurnAdmitted(req, deps, internal);
+      }
+      if (!req.target.sessionId || req.options.waitForFinalOutput || req.options.dryRun || internal) {
+        return Promise.resolve<TriggerResponse>({ ok: false, errorCode: 'bad_request', error: 'Lark turn idempotency requires an existing session without wait/dryRun/internal dispatch controls' });
+      }
+      const { turnIdempotencyKey: _key, ...options } = req.options;
+      return withLarkTurnIdempotency(req, deps.larkAppId, (triggerId, beforeDispatch) =>
+        triggerSessionTurnAdmitted({ ...req, options }, deps, {
+          stableTurnId: triggerId, atMostOnce: true,
+          beforeDispatch: () => {
+            beforeDispatch();
+            const target = activeBySessionId(deps.activeSessions, req.target.sessionId!);
+            if (target) {
+              inheritTriggerReplyAnchor(target, triggerId);
+              sessionStore.updateSession(target.session);
+            }
+          },
+        }));
+    },
   );
   // Echo the steer AUTHORIZATION at the single response chokepoint (the many
   // buildAsyncQueuedResponse sites stay untouched). Skip an idempotent REUSE:

@@ -116,6 +116,7 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
+  normalizeUsageDisplay: (cfg: { usageDisplay?: string }) => cfg.usageDisplay ?? 'streaming',
   getBot: vi.fn((id: string = 'app-1') => ({
     botName: id === 'app-2' ? 'Codex' : 'Claude',
     config: {
@@ -276,6 +277,8 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
 }));
 
 vi.mock('../src/im/lark/client.js', () => ({
+  updateMessage: vi.fn(async () => {}),
+  MessageWithdrawnError: class extends Error {},
   UserTokenMissingError: class UserTokenMissingError extends Error {
     constructor(message: string) {
       super(message);
@@ -8610,6 +8613,50 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     expect(ds.cotForced).toBe(true);
     expect(handleCotThinkingUpdate).not.toHaveBeenCalled();
     expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('下个 turn');
+  });
+
+  it('/cot show unified mid-turn does not restore hidden results to disk', async () => {
+    const fs = await import('node:fs');
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const { tmpdir } = await vi.importActual<typeof import('node:os')>('node:os');
+    const { join } = await import('node:path');
+    const { config } = await import('../src/config.js');
+    const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+    const { updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools } = await import('../src/core/turn-reply-card.js');
+    const restore = (['existsSync', 'statSync', 'mkdirSync'] as const).map(key => {
+      const mock = vi.mocked(fs[key]);
+      const previous = mock.getMockImplementation();
+      mock.mockImplementation(realFs[key] as any);
+      return () => mock.mockImplementation(previous as any);
+    });
+    const dir = realFs.mkdtempSync(join(tmpdir(), 'cot-show-unified-'));
+    const previousDir = config.session.dataDir;
+    config.session.dataDir = dir;
+    try {
+      botWith({ cotEnabled: true, thinkingCardToolResult: false, replyCardMode: 'unified', usageDisplay: 'off' });
+      const ds = makeDaemonSession();
+      ds.currentTurnId = 'om_cot_hidden';
+      ds.lastThinkingUpdate = { turnId: ds.currentTurnId, entries: [
+        { kind: 'tool_call', id: 'read', name: 'Read', args: '{}', subject: 'README.md' },
+        { kind: 'tool_result', id: 'read', result: 'HIDDEN_RESULT_BODY' },
+      ] };
+      const deps = makeDeps(ds);
+      const send = vi.fn(async () => 'om_unified');
+      await updateTurnReplyCard(ds, ds.currentTurnId, { kind: 'start' }, send);
+      queueTurnReplyTools(ds, ds.lastThinkingUpdate, send, () => true);
+      await flushTurnReplyTools(ds, ds.currentTurnId);
+      const disk = () => new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId! });
+      expect(disk()?.tools).toHaveLength(1);
+      expect(disk()?.tools[0]).not.toHaveProperty('result');
+      await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot show', deps);
+      expect(ds.cotForced).toBe(true);
+      expect(disk()?.tools).toHaveLength(1);
+      expect(disk()?.tools[0]).not.toHaveProperty('result');
+    } finally {
+      config.session.dataDir = previousDir;
+      restore.forEach(reset => reset());
+      realFs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

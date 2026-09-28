@@ -1662,7 +1662,7 @@ export async function handleCotCommand(
       if (replyCardModeFor(ds, ds.lastThinkingUpdate.turnId) !== 'legacy') {
         const update = ds.lastThinkingUpdate;
         await updateTurnReplyCard(ds, update.turnId, {
-          kind: 'tools', tools: publicReplyCardTools(update.entries, true),
+          kind: 'tools', tools: publicReplyCardTools(update.entries, getBot(larkAppId).config.thinkingCardToolResult !== false),
           activity: publicReplyCardActivity(update.entries),
         }, (body, type, uuid) => deps.sessionReply(rootId, body, type, larkAppId, update.turnId, { uuid }),
         { dispatchAttempt: update.dispatchAttempt, forceVisible: true });

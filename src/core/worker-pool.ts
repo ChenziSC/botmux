@@ -19,7 +19,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, ensureWorkflowSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
 import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
-import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
+import { cliSupportsNativeUsage, resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
 import { readStatuslineSnapshot, toCardQuota } from '../services/statusline-snapshot.js';
 import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
 import { hookCommandFor } from '../adapters/hook-command.js';
@@ -6976,9 +6976,19 @@ export function setSessionReasoningEffort(ds: DaemonSession, effort: unknown): '
     // missing/partial history is uncertainty, never permission to interrupt.
     try {
       const binding = ds.session.cliInstanceBinding ?? ds.initConfig?.cliInstanceBinding;
-      const path = findCodexRolloutBySessionId(ds.session.cliSessionId, binding
-        ? { codexHome: binding.codexHome, noFollow: binding.source !== 'legacy' }
-        : undefined);
+      // A bound instance must never fall back to another instance's history.
+      // Unbound workers may use a bot-local home (isolated authentication);
+      // share the resolver's home lookup and fresh miss handling with usage.
+      const path = binding
+        ? findCodexRolloutBySessionId(ds.session.cliSessionId, {
+          codexHome: binding.codexHome, noFollow: binding.source !== 'legacy',
+        })
+        : resolveSessionTranscriptPath({
+          cliId: 'codex', sessionId: ds.session.sessionId,
+          cliSessionId: ds.session.cliSessionId,
+          cwd: ds.workingDir ?? ds.session.workingDir,
+          larkAppId: ds.larkAppId, fresh: true,
+        })?.path;
       if (!path) return 'busy';
       const tail = drainCodexRollout(path, Math.max(0, statSync(path).size - 1024 * 1024));
       const last = tail.events.filter(event => event.kind !== 'cot').at(-1);

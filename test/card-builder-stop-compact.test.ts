@@ -391,6 +391,15 @@ describe('buildStreamingCard: signature stability', () => {
 
 
 describe('session reasoning selector', () => {
+  it.each([undefined, 'unrecognized'])('falls back to the saved choice when reported effort is %s', reasoningEffort => {
+    const card = build({ cliId: 'codex', usage: {
+      context: null, tokens: null, reasoningEffort,
+      reasoningControl: { choices: ['low', 'high', 'xhigh'], selected: 'high', pending: true },
+    } });
+    const select = card.elements.flatMap((e: any) => e.actions ?? []).find((a: any) => a.tag === 'select_static');
+    expect(select.initial_option).toBe('high');
+    expect(select.value.expected_effort).toBe('high');
+  });
   it('renders a session-bound selector and distinguishes saved settings from executed effort', () => {
     const card = build({ cliId: 'codex', usage: {
       context: null, tokens: null, model: 'gpt-5.6-sol', reasoningEffort: 'ultra',

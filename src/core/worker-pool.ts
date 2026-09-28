@@ -5,7 +5,7 @@ import { automaticStatusCardHidden, commitTurnStatusPolicy, rejectTurnStatusPoli
 import { assertSendTopicsAvailable } from '../cli/topic-send-guard.js';
 import { recordManagedAskTerminal, advanceManagedAskPresentation } from './ask-broker.js';
 import { getMessageDetail as getTopicMessageDetail } from '../im/lark/client.js';
-import { handoffCardClosed, applyHandoffCardEvent, type HandoffCardEvent } from './handoff-card-lifecycle.js';
+import { handoffCardClosed, handoffCardBlocksStreaming, applyHandoffCardEvent, type HandoffCardEvent } from './handoff-card-lifecycle.js';
 import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTriggerStreamingCard } from './trigger-streaming-card.js';
 import { sessionPromptInjection } from './prompt-injection.js';
 /**
@@ -21,7 +21,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, ensureWorkflowSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
 import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
-import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
+import { cliSupportsNativeUsage, resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
 import { readStatuslineSnapshot, toCardQuota } from '../services/statusline-snapshot.js';
 import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
 import { hookCommandFor } from '../adapters/hook-command.js';
@@ -1048,7 +1048,7 @@ export function isDisposableCommandScratch(ds: DaemonSession): boolean {
 // takes effect without a daemon restart. The `/card` command can override it
 // per-session via `ds.streamingCardForced` (manually summon a live card).
 function streamingCardDisabled(ds: DaemonSession, turnId?: string): boolean {
-  if (isDocNativeSession(ds) || handoffCardClosed(ds, turnId) || automaticStatusCardHidden(ds, turnId)) return true;
+  if (isDocNativeSession(ds) || handoffCardBlocksStreaming(ds, turnId) || automaticStatusCardHidden(ds, turnId)) return true;
   if (ds.streamingCardForced) return false;
   try {
     const cfg = getBot(ds.larkAppId).config;
@@ -4096,6 +4096,8 @@ export async function postFreshStreamingCard(
   const prevNonce = ds.streamCardNonce;
   const prevReplyTargetKey = ds.streamCardReplyTargetKey;
   const prevPending = ds.streamCardPending;
+  const completedHandoffAtPost = ds.session.handoffLiveCard?.closed
+    ? ds.session.handoffLiveCard.turnId : undefined;
   const sessionAtPost = ds.session;
   const appIdAtPost = ds.larkAppId;
   const displayAnchorAtPost = sessionAnchorId(ds);
@@ -4169,6 +4171,10 @@ export async function postFreshStreamingCard(
     // duplicate (the gate above only suppresses cards when disabled+unforced;
     // /card forces them on, so a stale pending flag would otherwise re-POST).
     ds.streamCardPending = false;
+    const handoff = ds.session.handoffLiveCard;
+    if (completedHandoffAtPost && handoff?.closed && handoff.turnId === completedHandoffAtPost) {
+      ds.session.handoffLiveCard = { ...handoff, manualCard: { messageId, nonce: postingNonce } };
+    }
     ds.parkedStreamCardNonce = undefined;
     const predecessorIds = snapshotStreamingCardPredecessorIds(ds, messageId);
     persistStreamCardState(ds);
@@ -6978,9 +6984,19 @@ export function setSessionReasoningEffort(ds: DaemonSession, effort: unknown): '
     // missing/partial history is uncertainty, never permission to interrupt.
     try {
       const binding = ds.session.cliInstanceBinding ?? ds.initConfig?.cliInstanceBinding;
-      const path = findCodexRolloutBySessionId(ds.session.cliSessionId, binding
-        ? { codexHome: binding.codexHome, noFollow: binding.source !== 'legacy' }
-        : undefined);
+      // A bound instance must never fall back to another instance's history.
+      // Unbound workers may use a bot-local home (isolated authentication);
+      // share the resolver's home lookup and fresh miss handling with usage.
+      const path = binding
+        ? findCodexRolloutBySessionId(ds.session.cliSessionId, {
+          codexHome: binding.codexHome, noFollow: binding.source !== 'legacy',
+        })
+        : resolveSessionTranscriptPath({
+          cliId: 'codex', sessionId: ds.session.sessionId,
+          cliSessionId: ds.session.cliSessionId,
+          cwd: ds.workingDir ?? ds.session.workingDir,
+          larkAppId: ds.larkAppId, fresh: true,
+        })?.path;
       if (!path) return 'busy';
       const tail = drainCodexRollout(path, Math.max(0, statSync(path).size - 1024 * 1024));
       const last = tail.events.filter(event => event.kind !== 'cot').at(-1);

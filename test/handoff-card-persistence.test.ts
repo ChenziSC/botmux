@@ -64,4 +64,20 @@ describe('handoff card completion through native SQLite persistence', () => {
     expect(ds.session.handoffLiveCard?.turnId).toBe('turn_two');
     expect(effects.clear).not.toHaveBeenCalled();
   });
+  it('remembers the removed identity across SQLite reopen and preserves a manual replacement', async () => {
+    const ds = session();
+    const effects = { persist: () => sessionStore.updateSession(ds.session), patch: vi.fn(),
+      remove: vi.fn(async () => {}), clear: vi.fn() };
+    const event = { kind: 'complete', turnId: 'turn_one', sequence: 1, resultMessageId: 'om_result' } as const;
+    await applyHandoffCardEvent(ds, event, effects);
+    sessionStore.init('app_handoff_sqlite');
+    ds.session = sessionStore.getOwnedSession(ds.session.sessionId)!;
+    ds.streamCardId = 'om_manual'; ds.streamCardNonce = 'manual';
+    effects.remove.mockClear();
+    await applyHandoffCardEvent(ds, event, effects);
+    expect(effects.remove).not.toHaveBeenCalled();
+    expect(ds.streamCardId).toBe('om_manual');
+    expect(ds.session.handoffLiveCard?.closedCard).toMatchObject({ messageId: 'om_live', removed: true });
+  });
+
 });

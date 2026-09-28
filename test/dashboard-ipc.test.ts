@@ -3819,6 +3819,57 @@ describe('GET /api/sessions/:sessionId/usage', () => {
   });
 });
 
+describe('POST /api/sessions/:sessionId/live-stage', () => {
+  const path = '/api/sessions/handoff-fixture/live-stage';
+  const event = { turnId: 'trg_fixture', sequence: 1, kind: 'stage', title: '等待验证' };
+
+  it('requires host authentication before forwarding a validated event', async () => {
+    const ds = { session: { status: 'active' }, chatId: 'oc_fixture', scope: 'chat', chatType: 'group' } as any;
+    const find = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const update = vi.spyOn(workerPool, 'updateHandoffLiveCard').mockResolvedValue();
+    try {
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const body = JSON.stringify(event);
+      const denied = await requestJson(handle.port, path, { method: 'POST', body });
+      expect(denied.status).toBe(401);
+      expect(update).not.toHaveBeenCalled();
+      const accepted = await requestJson(handle.port, path, {
+        method: 'POST', body, headers: trustedHostHeaders('POST', path, handle.port),
+      });
+      expect(accepted.status).toBe(200);
+      expect(update).toHaveBeenCalledExactlyOnceWith(ds, event);
+    } finally { find.mockRestore(); update.mockRestore(); }
+  });
+
+  it('rejects malformed, missing and API-only targets without card effects', async () => {
+    const find = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(undefined);
+    const update = vi.spyOn(workerPool, 'updateHandoffLiveCard').mockResolvedValue();
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const post = (value: unknown) => requestJson(handle!.port, path, { method: 'POST', body: JSON.stringify(value) });
+      expect((await post({ ...event, kind: 'complete' })).status).toBe(400);
+      expect((await post(event)).json.error).toBe('session_not_active');
+      find.mockReturnValue({ session: { status: 'active' }, chatId: 'http_async_fixture', scope: 'chat', chatType: 'group' } as any);
+      expect((await post(event)).json.error).toBe('live_stage_unavailable');
+      expect(update).not.toHaveBeenCalled();
+    } finally { find.mockRestore(); update.mockRestore(); }
+  });
+
+  it('returns a conflict when a delayed connector event belongs to an old turn', async () => {
+    const find = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { status: 'active' }, chatId: 'oc_fixture', scope: 'chat', chatType: 'group',
+    } as any);
+    const update = vi.spyOn(workerPool, 'updateHandoffLiveCard').mockRejectedValue(new Error('stale_live_stage'));
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await requestJson(handle.port, path, { method: 'POST', body: JSON.stringify(event) });
+      expect(res.status).toBe(409);
+      expect(res.json).toEqual({ ok: false, error: 'stale_live_stage' });
+    } finally { find.mockRestore(); update.mockRestore(); }
+  });
+});
+
 describe('POST /api/sessions/:sessionId/rename', () => {
   it.each([
     ['codex', '/bin/codex'],
@@ -10709,6 +10760,7 @@ describe('PUT /api/bot-card-prefs — tool result preference', () => {
       const url = `http://127.0.0.1:${handle.port}/api/bot-card-prefs`;
       for (const [patch, enabled] of [
         [{ thinkingCardToolResult: false }, true],
+        [{ thinkingCardToolResult: true }, true],
       ] as const) {
         const result = await fetch(url, {
           method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch),
@@ -10716,8 +10768,16 @@ describe('PUT /api/bot-card-prefs — tool result preference', () => {
         expect(result.status).toBe(200);
         expect(await result.json()).toMatchObject({ ok: true, cotEnabled: enabled });
         expect(loadBotConfigs()[0].cotEnabled !== false).toBe(enabled);
+        const stored = JSON.parse(readFileSync(configPath, 'utf8'))[0];
+        if (patch.thinkingCardToolResult === false) {
+          expect(stored.thinkingCardToolResult).toBe(false);
+          expect(loadBotConfigs()[0].thinkingCardToolResult).toBe(false);
+        } else {
+          expect(stored).not.toHaveProperty('thinkingCardToolResult');
+          expect(loadBotConfigs()[0].thinkingCardToolResult).toBeUndefined();
+        }
       }
-      expect(getBot(appId).config.thinkingCardToolResult).toBe(false);
+      expect(getBot(appId).config.thinkingCardToolResult).toBeUndefined();
     } finally {
       if (handle) await handle.close();
       handle = null;

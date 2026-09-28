@@ -93,6 +93,9 @@ import * as asyncTriggerStore from '../src/services/async-trigger-store.js';
 import * as idempotencyStore from '../src/services/idempotency-store.js';
 import { sessionKey } from '../src/core/types.js';
 import { commitTriggerStreamingCard } from '../src/core/trigger-streaming-card.js';
+import { resolveSessionReplyTarget } from '../src/core/reply-target.js';
+import * as sessionStore from '../src/services/session-store.js';
+import { config } from '../src/config.js';
 
 const APP = 'local_riff';
 const SID = 'sess_existing';
@@ -607,8 +610,27 @@ describe('visible handoff dispatch to a reused session', () => {
   });
 });
 
-
 describe('recovery thinking presentation', () => {
+  it('validates the explicit thinking option and retains normal requests', () => {
+    const req = followUpReq('presentation');
+    expect(validateTriggerRequest(req).ok).toBe(true);
+    expect(validateTriggerRequest({ ...req, presentation: { thinking: 'hidden' } }).ok).toBe(true);
+    expect(validateTriggerRequest({ ...req, presentation: { thinking: true } }).ok).toBe(false);
+  });
+
+  it('bounds restored hidden turns while recording the exact new worker input', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    ds.session.hiddenThinkingTurns = Array.from({ length: 256 }, (_, i) => `old_${i}`);
+    const req = followUpReq(undefined);
+    req.presentation = { thinking: 'hidden' };
+    const res = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: activeWith(ds) });
+    expect(res.ok).toBe(true);
+    expect(ds.session.hiddenThinkingTurns).toHaveLength(256);
+    expect(ds.session.hiddenThinkingTurns).not.toContain('old_0');
+    expect(ds.session.hiddenThinkingTurns.at(-1)).toBe(res.triggerId);
+    expect(mockSendWorkerInput.mock.calls.at(-1)?.[2]).toBe(res.triggerId);
+  });
+
   it.each([true, false])('preserves async receipts and ordinary turns with live worker=%s', async live => {
     const ds = existingDs({ worker: live ? { killed: false, send: vi.fn() } as any : null });
     const active = activeWith(ds);
@@ -663,4 +685,61 @@ it('recovers only the matching turn lease through a read-only key lookup', async
   expect(idempotencyStore.lookup(APP, `${SID}\0ask-read-only-key`, 'turn')).toEqual(leaseBefore);
   expect(() => lookupRegisteredTurn({ ...request, instruction: 'changed' }, APP)).toThrow('registered_trigger_conflict');
   expect(mockForkWorker).toHaveBeenCalledTimes(1);
+});
+
+
+describe('exact trigger presentation keeps the persisted reply destination', () => {
+  const cases = [true, false].flatMap(live => ['ordinary', 'wait', 'async'].flatMap(mode =>
+    ['live', 'hidden', 'both', 'suppressed', 'plain', 'default'].map(presentation => ({ live, mode, presentation }))));
+  it.each(cases)('$mode / $presentation / live=$live', async ({ live, mode, presentation }) => {
+    const nativeStore = await vi.importActual<typeof import('../src/services/session-store.js')>('../src/services/session-store.js');
+    const previousDir = config.session.dataDir;
+    config.session.dataDir = tempDir;
+    nativeStore.init(APP);
+    vi.mocked(sessionStore.updateSession).mockImplementation(nativeStore.updateSession);
+    const ds = existingDs({ chatId: 'oc_shared', worker: live ? { killed: false, send: vi.fn() } as any : null });
+    ds.session.chatId = ds.chatId;
+    if (presentation !== 'plain') ds.session.currentReplyTarget = ds.currentReplyTarget = {
+      turnId: 'om_origin', rootMessageId: 'om_shared', updatedAt: new Date().toISOString(),
+    };
+    mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: false } });
+    const req = followUpReq(undefined);
+    req.options = mode === 'wait' ? { waitForFinalOutput: true } : mode === 'async' ? { asyncReturnSessionId: true } : {};
+    if (presentation !== 'default') req.presentation = presentation === 'hidden' ? { thinking: 'hidden' }
+      : presentation === 'both' ? { thinking: 'hidden', liveCard: 'on-start' } : { liveCard: 'on-start' };
+    if (presentation === 'suppressed') req.options.suppressFinalOutput = true;
+    try {
+      const pending = triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map([[sessionKey(ds.chatId, APP), ds]]) });
+      if (mode === 'wait') {
+        await vi.waitFor(() => expect(ds.pendingWaitPromises?.size).toBe(1));
+        for (const waiter of ds.pendingWaitPromises!.values()) waiter.resolve('HTTP result');
+      }
+      const result = await pending;
+      expect(result.ok).toBe(true);
+      const input = live ? mockSendWorkerInput.mock.calls[0][2] : mockForkWorker.mock.calls[0][2];
+      const turnId = typeof input === 'string' ? input : input?.turnId;
+      if (mode === 'ordinary' && presentation === 'default' && live) {
+        expect(turnId).toBeUndefined();
+        expect(ds.session.replyTargets).toBeUndefined();
+        return;
+      }
+      expect(turnId).toBe(result.triggerId);
+      const expected = presentation === 'plain' ? { mode: 'plain', chatId: ds.chatId }
+        : { mode: 'thread', rootMessageId: 'om_shared' };
+      expect(resolveSessionReplyTarget(ds, turnId)).toEqual(expected);
+      // Reopen SQLite to prove the standalone sender sees the same exact-turn anchor.
+      nativeStore.init(APP);
+      const persisted = nativeStore.getOwnedSession(ds.session.sessionId)!;
+      expect(persisted).toBeDefined();
+      expect(resolveSessionReplyTarget({ ...ds, currentReplyTarget: undefined, session: persisted }, turnId)).toEqual(expected);
+      expect(persisted.hiddenThinkingTurns?.includes(turnId)).toBe(['hidden', 'both'].includes(presentation) ? true : undefined);
+      expect(ds.suppressedTriggerFinalTurns?.has(turnId) === true).toBe(presentation === 'suppressed' && mode === 'ordinary');
+      if (mode === 'wait') expect(result.output?.content).toBe('HTTP result');
+      if (mode === 'async') expect(ds.asyncTriggerResults?.has(turnId)).toBe(true);
+    } finally {
+      vi.mocked(sessionStore.updateSession).mockReset();
+      nativeStore.init(undefined, { owner: false });
+      config.session.dataDir = previousDir;
+    }
+  });
 });

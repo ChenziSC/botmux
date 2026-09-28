@@ -7,7 +7,7 @@ import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { once } from 'node:events';
 import { spawnTsEval } from './helpers/ts-runner.js';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 vi.mock('../src/services/session-store.js', () => ({
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
@@ -15,6 +15,7 @@ vi.mock('../src/services/session-store.js', () => ({
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
   updateSessionPid: vi.fn(),
   updateSession: vi.fn(),
+  getSession: vi.fn(),
 }));
 vi.mock('../src/core/dashboard-events.js', () => ({
   dashboardEventBus: { publish: vi.fn() },
@@ -32,6 +33,8 @@ import {
   __testOnly_runPendingSuspendIfSettled as runPendingSuspendIfSettled,
   suspendWorker,
   setSessionReasoningEffort,
+  sendWorkerInput,
+  __testOnly_resetOrdinaryImDeliveries,
   sessionReasoningControl,
   __testOnly_sessionAgentConfig as sessionAgentConfig,
 } from '../src/core/worker-pool.js';
@@ -287,6 +290,77 @@ describe('session reasoning effort changes', () => {
     Object.assign(pair.ds, { workerReady: true, activeReasoningEffort: 'ultra' });
     return pair;
   }
+
+  it('finds an isolated Codex rollout in bot home without falling back from a bound instance', async () => {
+    const native = await vi.importActual<typeof import('../src/services/codex-transcript.js')>('../src/services/codex-transcript.js');
+    const { ds } = session();
+    ds.larkAppId = 'app_effort_isolated';
+    ds.session.sessionId = 'sid-isolated-effort';
+    ds.session.cliSessionId = 'isolated-native';
+    ds.initConfig.codexAuthSync = 'isolated';
+    delete ds.initConfig.wrapperCli;
+    const botHome = join(dirname(process.env.SESSION_DATA_DIR!), 'bots', ds.larkAppId, 'codex');
+    mkdirSync(join(botHome, 'sessions'), { recursive: true });
+    const rollout = join(botHome, 'sessions', 'rollout-isolated-native.jsonl');
+    writeFileSync(rollout, JSON.stringify({ type: 'event_msg', timestamp: '2026-01-01T00:00:00Z',
+      payload: { type: 'task_complete', turn_id: 'turn', last_agent_message: 'Done' } }) + '\n');
+    vi.mocked(findCodexRolloutBySessionId).mockImplementation((_sid, opts) => opts?.codexHome === botHome ? rollout : undefined);
+    vi.mocked(drainCodexRollout).mockImplementationOnce(native.drainCodexRollout);
+    try {
+      expect(sessionReasoningControl(ds)).toBeDefined();
+      expect(setSessionReasoningEffort(ds, 'high')).toBe('saved');
+      expect(findCodexRolloutBySessionId).toHaveBeenCalledWith('isolated-native', { codexHome: botHome, noFollow: true });
+      expect(ds.session.reasoningEffort).toBe('high');
+    } finally {
+      vi.mocked(findCodexRolloutBySessionId).mockImplementation(() => new URL('../package.json', import.meta.url).pathname);
+      rmSync(botHome, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['no-worker', 'not-ready', 'inactive', 'raw-input', 'follow-up'])('preserves in-flight work at the %s boundary', boundary => {
+    const { ds, worker } = session();
+    if (boundary === 'no-worker') ds.worker = null;
+    if (boundary === 'not-ready') ds.workerReady = false;
+    if (boundary === 'inactive') ds.session.status = 'closed';
+    if (boundary === 'raw-input') ds.pendingRawInput = { content: 'queued' };
+    if (boundary === 'follow-up') ds.pendingFollowUpInput = { content: 'queued' };
+    expect(setSessionReasoningEffort(ds, 'high')).toBe('busy');
+    expect(ds.session.reasoningEffort).toBe('ultra');
+    expect(worker.send).not.toHaveBeenCalled();
+  });
+
+  it('waits while the native transcript has a partially written next event', () => {
+    const { ds, worker } = session();
+    vi.mocked(drainCodexRollout).mockReturnValueOnce({ events: [{ kind: 'assistant_final', text: 'done', timestampMs: 1 }], newOffset: 1, pendingTail: '{"type":' });
+    expect(setSessionReasoningEffort(ds, 'high')).toBe('busy');
+    expect(ds.session.reasoningEffort).toBe('ultra');
+    expect(worker.send).not.toHaveBeenCalled();
+  });
+
+  it('waits for an ordinary IM input to commit even when the last screen and transcript are idle', async () => {
+    const registry = await import('../src/bot-registry.js');
+    const bot = vi.spyOn(registry, 'getBot').mockReturnValue({ config: { cliId: 'codex' } } as any);
+    const { ds, worker } = session();
+    Object.assign(ds, { larkAppId: 'app_pending_effort', chatId: 'oc_pending', scope: 'chat', workerGeneration: 1 });
+    Object.assign(ds.session, { workerGeneration: 1, chatId: ds.chatId });
+    try {
+      expect(sendWorkerInput(ds, 'next task', 'om_pending_effort')).toBe(true);
+      worker.send.mockClear();
+      expect(setSessionReasoningEffort(ds, 'high')).toBe('busy');
+      expect(ds.session.reasoningEffort).toBe('ultra');
+      expect(worker.send).not.toHaveBeenCalled();
+    } finally {
+      __testOnly_resetOrdinaryImDeliveries();
+      bot.mockRestore();
+    }
+  });
+
+  it('does not offer an Aiden control with an instance binding', () => {
+    const { ds } = session();
+    ds.session.cliInstanceBinding = { source: 'pool', codexHome: '/unused-bound-home' };
+    expect(sessionReasoningControl(ds)).toBeUndefined();
+    expect(setSessionReasoningEffort(ds, 'high')).toBe('unsupported');
+  });
 
   it('saves without retiring the worker and clears pending only after the new effort is observed', () => {
     const { ds, worker } = session();

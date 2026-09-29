@@ -212,6 +212,12 @@ export interface BridgeSendMarker {
   previewText?: string;
 }
 
+/** Only an explicit final response proves completion; progress, auxiliary,
+ *  and legacy markers without responseKind must not retire a pending turn. */
+export function isFinalBridgeSendMarker(marker: Pick<BridgeSendMarker, 'responseKind'>): boolean {
+  return marker.responseKind === 'final';
+}
+
 export interface BridgeGateInput {
   /** When the user message was queued — defines the lower bound of the
    *  send window. Undefined for legacy turns; the gate degrades to
@@ -373,7 +379,7 @@ export function shouldSuppressBridgeEmit(
   // terminal-transcription fallback in both cases, otherwise the same answer
   // is double-posted (e.g. Chinese answer sent, then an English summary).
   // Managed-card progress/auxiliary markers are not final deliveries.
-  if (inWindow.some(m => m.responseKind === 'final'
+  if (inWindow.some(m => isFinalBridgeSendMarker(m)
       && (m.replyCardResponseKind === undefined || m.replyCardResponseKind === 'final'))) {
     return true;
   }

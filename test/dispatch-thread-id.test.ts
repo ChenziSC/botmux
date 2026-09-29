@@ -91,7 +91,10 @@ function harness(mode: Mode, options: {
     console: { log: (text: string) => stdout.push(text), error: (text: string) => stderr.push(text) },
     AbortSignal: { timeout },
     assertTurnTransportOrExit: vi.fn(), assertSessionTransportOrExit: vi.fn(),
-    loadSessions: () => new Map([['source', { chatId: 'oc_chat', larkAppId: 'cli_source' }]]),
+    loadSessions: () => new Map([['source', { sessionId: 'source', chatId: 'oc_chat', larkAppId: 'cli_source' }]]),
+    requireSessionById: async (sid: string) => ({
+      sessionId: sid, chatId: 'oc_chat', larkAppId: 'cli_source',
+    }),
     envPinnedRiffBot: undefined,
     assertProjectDispatchPolicy: vi.fn(async () => {}),
     ensureLocalBotCollaboration: vi.fn(async () => {}),

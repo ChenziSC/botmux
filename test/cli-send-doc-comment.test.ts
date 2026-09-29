@@ -22,6 +22,8 @@ function runSend(options: {
   responseKind?: 'progress' | 'final' | 'auxiliary';
   previousSend?: { turnId: string; responseKind?: 'progress' | 'final' | 'auxiliary' };
   sendHistory?: Record<string, unknown>[];
+  env?: NodeJS.ProcessEnv;
+  repeat?: boolean;
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-send-doc-'));
   const dataDir = join(root, 'data');
@@ -60,6 +62,7 @@ function runSend(options: {
         BOTS_CONFIG: join(root, 'bots.json'), BOTMUX_SESSION_ID: 'sid_doc',
         // A spawn-time turn can be stale; it must never pick the reply target.
         BOTMUX_TURN_ID: 'stale_turn', BOTMUX_LARK_APP_ID: 'cli_test',
+        ...options.env,
       },
       encoding: 'utf8', timeout: 30_000,
     });
@@ -69,6 +72,11 @@ function runSend(options: {
         sessionId: 'sid_doc', turnId: options.previousSend.turnId,
       }));
       previous = send(options.previousSend.responseKind);
+    } else if (options.repeat) {
+      writeFileSync(pidMarkerPath, JSON.stringify({
+        sessionId: 'sid_doc', turnId: target.turnId,
+      }));
+      previous = send(options.responseKind);
     }
     // A restart removes the old worker marker or reattaches with only a session.
     if (options.marker === false) {
@@ -78,7 +86,7 @@ function runSend(options: {
         sessionId: 'sid_doc', turnId: options.markerTurn ?? null,
       }));
     }
-    const result = send(options.responseKind ?? 'final', options.args);
+    const result = send(options.responseKind, options.args);
     const requests = String(result.stdout).split('\n')
       .filter(line => line.startsWith('CAPTURE_REQUEST='))
       .map(line => JSON.parse(line.slice('CAPTURE_REQUEST='.length)));
@@ -108,6 +116,47 @@ describe('real CLI document-comment reply routing', () => {
     expect(result.stdout).toContain('"kind":"doc-comment"');
   }, 35_000);
 
+  it('treats an omitted response kind as the one final document reply', () => {
+    const result = runSend({ responseKind: undefined });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.requests).toHaveLength(1);
+    expect(result.sends).toEqual([expect.objectContaining({
+      turnId: target.turnId,
+      responseKind: 'final',
+    })]);
+    expect(result.stdout).toContain('"kind":"doc-comment"');
+  }, 35_000);
+
+  it.each(['progress', 'auxiliary'] as const)(
+    'rejects an explicit %s reply with actionable guidance before any provider request',
+    responseKind => {
+    const result = runSend({ responseKind });
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('文档评论轮只允许一条 final 回复');
+    expect(result.stderr).not.toContain('Non-idempotent delivery sequences require a final response');
+    expect(result.requests).toEqual([]);
+    expect(result.sends).toEqual([]);
+    },
+    35_000,
+  );
+
+  it('retries after a provider business response proves the first request was not delivered', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-send-doc-reject-'));
+    const rejectOnceMarker = join(root, 'reject-once');
+    try {
+      const result = runSend({
+        env: { BOTMUX_TEST_DOC_REJECT_ONCE: rejectOnceMarker },
+        repeat: true,
+      });
+      expect(result.previous?.status).toBe(1);
+      expect(String(result.previous?.stderr)).toContain('User Token');
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.requests).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 70_000);
+
   it.each([true, false])('recovers the second turn after a real final reply and restart (reattached=%s)', marker => {
     const result = runSend({
       marker,
@@ -133,35 +182,10 @@ describe('real CLI document-comment reply routing', () => {
     ]);
   }, 70_000);
 
-  it('keeps a turn recoverable after a real default progress send and restart', () => {
-    const result = runSend({ previousSend: { turnId: target.turnId } });
-    expect(result.previous?.status, String(result.previous?.stderr)).toBe(0);
-    expect(result.status, result.stderr).toBe(0);
-    expect(result.requests[0]?.path).toBe('/open-apis/drive/v1/files/doc_test/comments/comment_test/replies');
-    expect(result.sends.map(({ turnId, responseKind }) => ({ turnId, responseKind }))).toEqual([
-      { turnId: 'reply_user', responseKind: 'progress' },
-      { turnId: 'reply_user', responseKind: 'final' },
-    ]);
-  }, 70_000);
-
-  it.each([undefined, 'auxiliary'] as const)('keeps two turns ambiguous after a real %s send', responseKind => {
-    const result = runSend({
-      previousSend: { turnId: target.turnId, responseKind },
-      session: { docCommentTargets: {
-        [target.turnId]: target, next_reply: { ...target, turnId: 'next_reply' },
-      } },
-    });
-    expect(result.previous?.status, String(result.previous?.stderr)).toBe(0);
-    expect(result.status, result.stderr).toBe(2);
-    expect(result.stderr).toContain('cannot resolve the exact document-comment reply target');
-    expect(result.requests).toEqual([]);
-    expect(result.sends).toEqual([expect.objectContaining({
-      turnId: target.turnId, responseKind: responseKind ?? 'progress',
-    })]);
-  }, 70_000);
-
   it.each([
     { sentAtMs: 1, turnId: target.turnId },
+    { sentAtMs: 1, responseKind: 'progress', turnId: target.turnId },
+    { sentAtMs: 1, responseKind: 'auxiliary', turnId: target.turnId },
     { sentAtMs: 1, responseKind: 'final' },
     { sentAtMs: 1, responseKind: 'final', turnId: 'unrelated_turn' },
     { sentAtMs: 1, responseKind: 'FINAL', turnId: target.turnId },

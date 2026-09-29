@@ -4870,6 +4870,9 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
   if (entries.length === 0) return;
   const key = `${turn.turnId}|${turn.dispatchAttempt ?? ''}`;
   if (key !== thinkingTurnKey) {
+    // Preserve the previous turn's trailing update before a steer/new turn
+    // replaces the accumulator inside the throttle window.
+    flushThinkingUpdate();
     thinkingTurnKey = key;
     thinkingTurn = { turnId: turn.turnId, dispatchAttempt: turn.dispatchAttempt };
     thinkingEntries = [];
@@ -4911,18 +4914,25 @@ function observeThinkingAttribution(ev: TranscriptEvent, turn: BridgePendingTurn
 function scheduleThinkingEmit(): void {
   if (thinkingEmitTimer) return;
   const wait = Math.max(0, THINKING_EMIT_INTERVAL_MS - (Date.now() - thinkingLastEmitMs));
-  thinkingEmitTimer = setTimeout(() => {
-    thinkingEmitTimer = null;
-    if (!thinkingTurn || thinkingEntries.length === 0) return;
-    thinkingLastEmitMs = Date.now();
-    send({
-      type: 'thinking_update',
-      ...(sessionId ? { sessionId } : {}),
-      entries: thinkingEntries.slice(),
-      turnId: thinkingTurn.turnId,
-      ...(thinkingTurn.dispatchAttempt !== undefined ? { dispatchAttempt: thinkingTurn.dispatchAttempt } : {}),
-    });
-  }, wait);
+  thinkingEmitTimer = setTimeout(flushThinkingUpdate, wait);
+}
+
+/** Drain a pending update synchronously before its terminal IPC. A short turn
+ * can be read in one batch; emitting after turn_terminal would open a bubble
+ * that never receives its completion. */
+function flushThinkingUpdate(): void {
+  if (!thinkingEmitTimer) return;
+  clearTimeout(thinkingEmitTimer);
+  thinkingEmitTimer = null;
+  if (!thinkingTurn || thinkingEntries.length === 0) return;
+  thinkingLastEmitMs = Date.now();
+  send({
+    type: 'thinking_update',
+    ...(sessionId ? { sessionId } : {}),
+    entries: thinkingEntries.slice(),
+    turnId: thinkingTurn.turnId,
+    ...(thinkingTurn.dispatchAttempt !== undefined ? { dispatchAttempt: thinkingTurn.dispatchAttempt } : {}),
+  });
 }
 
 function resetThinkingChannel(): void {
@@ -4952,15 +4962,27 @@ let codexBridgeBaselineDone = false;
 let publishedActiveRuntime: TraexRuntimeSnapshot = {};
 let activeRuntimePublished = false;
 const codexBridgeQueue = new CodexBridgeQueue(Date.now, notifyTerminalTurnStarted);
-// Structured rollout CoT: Codex response items and TraeX history mutations emit
+// Structured rollout CoT: Codex/Pi messages and TraeX history mutations emit
 // rollout reasoning/tool events attributed to the collecting turn, feeding
-// the same thinking channel as Claude's transcript attribution. Other
-// structured bridges (cursor/pi/…) never emit 'cot' events, so this observer
-// is inert for them. Local (adopt) turns are skipped for the same reason as
+// the same thinking channel as Claude's transcript attribution. The observer
+// is inert for bridges without 'cot' events. Local (adopt) turns are skipped for the same reason as
 // Claude's: no Lark turn to anchor the bubble to.
 codexBridgeQueue.setCotObserver((entries, turn) => {
   if (turn.isLocal) return;
   observeCotEntries(entries, turn);
+});
+codexBridgeQueue.setCotSupersededObserver((turn) => {
+  if (!sessionId || turn.isLocal || thinkingTurn?.turnId !== turn.turnId
+    || thinkingTurn.dispatchAttempt !== turn.dispatchAttempt) return;
+  // A successor may answer without ever producing CoT. Flush and close the
+  // retired timeline at the queue's confirmed steer edge, not its successor's
+  // first update/terminal. Never synthesize a durable terminal for this UI.
+  flushThinkingUpdate();
+  send({
+    type: 'thinking_superseded', sessionId, turnId: turn.turnId,
+    ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+  });
+  resetThinkingChannel();
 });
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
@@ -20567,6 +20589,9 @@ function emitTurnTerminal(
   // Revoke before publishing terminal. A stale terminal from a superseded
   // same-principal steer must not clear the newer turn's authority.
   releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });
+  if (thinkingTurn?.turnId === turnId && thinkingTurn.dispatchAttempt === dispatchAttempt) {
+    flushThinkingUpdate();
+  }
   send({
     type: 'turn_terminal',
     sessionId,

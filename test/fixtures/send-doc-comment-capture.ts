@@ -1,4 +1,5 @@
 import { defaultHttpInstance } from '@larksuiteoapi/node-sdk';
+import { existsSync, writeFileSync } from 'node:fs';
 
 // Exercise the real CLI and SDK routing without making any network requests.
 (defaultHttpInstance as any).defaults.adapter = async (config: any) => {
@@ -11,7 +12,13 @@ import { defaultHttpInstance } from '@larksuiteoapi/node-sdk';
     const body = typeof config.data === 'string' ? JSON.parse(config.data) : config.data;
     console.log('CAPTURE_REQUEST=' + JSON.stringify({ method, path: url.pathname, body }));
     if (method === 'POST' && url.pathname.endsWith('/replies')) {
-      data = { code: 0, data: { reply_id: 'reply_bot' } };
+      const rejectOnceMarker = process.env.BOTMUX_TEST_DOC_REJECT_ONCE;
+      if (rejectOnceMarker && !existsSync(rejectOnceMarker)) {
+        writeFileSync(rejectOnceMarker, 'rejected');
+        data = { code: 99991663, msg: 'invalid parameter' };
+      } else {
+        data = { code: 0, data: { reply_id: 'reply_bot' } };
+      }
     } else if (method === 'POST' && url.pathname === '/open-apis/im/v1/messages') {
       data = { code: 0, data: { message_id: 'om_sent' } };
     } else {

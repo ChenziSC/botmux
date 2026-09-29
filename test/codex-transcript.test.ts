@@ -1601,9 +1601,10 @@ describe('codexCotEntriesFromResponseItem (CoT thinking timeline)', () => {
   });
 });
 
- describe('gateway quota classification', () => {
+describe('gateway quota classification', () => {
   it.each([
     'unexpected status 403 Forbidden: 该业务方请求o系列模型触发azure安全拦截报错数达到上限：1000',
+    '403 Forbidden: 请求数达到上限',
     '403 Forbidden: insufficient_quota',
     'quota exhausted',
   ])('does not confuse a quota counter with login failure: %s', error => {

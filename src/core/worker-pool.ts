@@ -13121,6 +13121,7 @@ function setupWorkerHandlers(
         // receipt ACK was delayed or dropped on the reverse IPC channel.
         completeOrdinaryImDelivery(ds, msg.turnId, workerGeneration);
         ds.failedIdleTurnId = undefined;
+        ds.settledHttpTerminalTurns?.delete(msg.turnId);
         commitTurnStatusPolicy(ds, msg.turnId, workerGeneration);
         advanceManagedAskPresentation({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId,
           turnId: msg.turnId, workerGeneration, phase: 'running' });
@@ -15375,11 +15376,13 @@ function setupWorkerHandlers(
           );
         }
         let nonLarkFailureHandled = false;
-        if ((isClaudeProviderFailure || msg.status === 'failed' || msg.status === 'ambiguous') && !ds.session.vcMeetingReceiver) {
+        if ((isClaudeProviderFailure || msg.status === 'failed' || msg.status === 'ambiguous')
+          && !ds.session.vcMeetingReceiver) {
           const failureCode = msg.errorCode ?? msg.status;
           const waitPromise = ds.pendingWaitPromises?.get(msg.turnId);
           if (waitPromise) {
             nonLarkFailureHandled = true;
+            rememberHttpTerminal(ds, msg.turnId);
             ds.pendingWaitPromises?.delete(msg.turnId);
             const failure = new Error(`${isClaudeProviderFailure ? 'Claude' : 'Worker'} turn failed: ${failureCode}`);
             if (waitPromise.reject) waitPromise.reject(failure);
@@ -15395,6 +15398,7 @@ function setupWorkerHandlers(
             || virtualDeliverySinkForChatId(ds.chatId) === 'http_async';
           if (asyncSink) {
             nonLarkFailureHandled = true;
+            rememberHttpTerminal(ds, msg.turnId);
             const failedAt = Date.now();
             if (asyncResult?.status === 'completed') {
               // final_output is stronger and may have settled immediately before
@@ -16815,6 +16819,20 @@ function markTurnReplyDelivered(
   if (ds.lastScreenStatus === 'idle') scheduleActiveRuntimePatch(ds);
 }
 
+function rememberHttpTerminal(ds: DaemonSession, turnId: string): void {
+  const turns = ds.settledHttpTerminalTurns ??= new Set<string>();
+  turns.add(turnId);
+  while (turns.size > 256) turns.delete(turns.values().next().value!);
+}
+
+function markFailedTurnIdle(ds: DaemonSession, turnId: string): void {
+  const latestTurn = ds.replyCardRunningTurnId ?? ds.currentTurnId;
+  if (latestTurn && latestTurn !== turnId) return;
+  ds.failedIdleTurnId = turnId;
+  ds.completedIdleTurnId = undefined;
+  if (ds.lastScreenStatus === 'idle') scheduleActiveRuntimePatch(ds);
+}
+
 function deliverFinalOutput(
   ds: DaemonSession,
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
@@ -16851,42 +16869,54 @@ function deliverFinalOutput(
   // output, resolve the Promise immediately, and DO NOT send it to Lark.
   // Dedicated receivers are structurally pinned to their audited listener
   // action and may never be diverted into these generic host-side sinks.
-  if (msg.turnFailed && msg.turnFailureCode && !managedReceiver) {
-    const latestTurn = ds.replyCardRunningTurnId ?? ds.currentTurnId;
-    if (!latestTurn || latestTurn === msg.turnId) {
-      ds.failedIdleTurnId = msg.turnId;
-      ds.completedIdleTurnId = undefined;
-      if (ds.lastScreenStatus === 'idle') scheduleActiveRuntimePatch(ds);
-    }
+  if (!managedReceiver && ds.settledHttpTerminalTurns?.has(msg.turnId)) {
+    onComplete?.(true);
+    return;
+  }
+  if (msg.turnFailed && !managedReceiver) {
+    // Older workers mark failed fallbacks without a structured provider code.
+    const failureCode = msg.turnFailureCode || 'worker_turn_failed';
     const failedWait = ds.pendingWaitPromises?.get(msg.turnId);
     const failedAsync = ds.asyncTriggerResults?.get(msg.turnId);
+    if (failedAsync?.status === 'completed' || failedAsync?.status === 'interrupted') {
+      rememberHttpTerminal(ds, msg.turnId);
+      onComplete?.(true);
+      return;
+    }
     if (failedWait || failedAsync) {
+      let completedAlready = false;
       if (failedWait) {
         ds.pendingWaitPromises?.delete(msg.turnId);
-        const error = new Error(`Worker turn failed: ${msg.turnFailureCode}`);
+        const error = new Error(`Worker turn failed: ${failureCode}`);
         if (failedWait.reject) failedWait.reject(error);
         else failedWait.resolve(`ERROR: ${error.message}`);
       }
-      if (failedAsync && failedAsync.status !== 'completed' && failedAsync.status !== 'interrupted') {
+      if (failedAsync) {
         const failedAt = Date.now();
         failedAsync.status = 'failed';
         failedAsync.failedAt = failedAt;
         failedAsync.errorCode = 'trigger_failed';
-        failedAsync.terminalErrorCode = msg.turnFailureCode;
+        failedAsync.terminalErrorCode = failureCode;
         try {
           const outcome = asyncTriggerStore.recordTerminalFailureStrict(
-            ds.session.sessionId, msg.turnId, failedAt, ds.larkAppId, msg.turnFailureCode,
+            ds.session.sessionId, msg.turnId, failedAt, ds.larkAppId, failureCode,
           );
-          if (outcome === 'already_completed') ds.asyncTriggerResults?.delete(msg.turnId);
+          if (outcome === 'already_completed') {
+            completedAlready = true;
+            ds.asyncTriggerResults?.delete(msg.turnId);
+          }
         } catch (error) {
           logger.error(`[${t}] Failed to persist structured failure: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
+      if (!completedAlready) markFailedTurnIdle(ds, msg.turnId);
+      rememberHttpTerminal(ds, msg.turnId);
       ds.idempotentAsyncTurns?.delete(msg.turnId);
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
       onComplete?.(true);
       return;
     }
+    if (ds.completedIdleTurnId !== msg.turnId) markFailedTurnIdle(ds, msg.turnId);
   }
   const waitPromise = managedReceiver ? undefined : ds.pendingWaitPromises?.get(msg.turnId);
   if (waitPromise) {
@@ -16905,7 +16935,7 @@ function deliverFinalOutput(
     // interrupted record during trigger-result resolution).
     if (asyncResult.status === 'interrupted' || asyncResult.status === 'failed') {
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
-      logger.info(`[${t}] Ignored final_output for interrupted Async HTTP turn (turn ${msg.turnId.substring(0, 8)})`);
+      logger.info(`[${t}] Ignored final_output for terminal Async HTTP turn (turn ${msg.turnId.substring(0, 8)})`);
       onComplete?.(true);
       return;
     }

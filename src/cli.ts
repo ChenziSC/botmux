@@ -29,7 +29,7 @@
 import { authorizeOwnerlessScheduleCreator, requireScheduleCreatorUnionId } from './core/schedule-creator-authorization.js';
 import { readSchedulePromptUpdate, SCHEDULE_UPDATE_USAGE } from './cli/schedule-update.js';
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, symlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync, chmodSync } from 'node:fs';
+import { existsSync, mkdirSync, copyFileSync, createReadStream, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, symlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync, chmodSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
@@ -38,7 +38,9 @@ import { homedir, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { StringDecoder } from 'node:string_decoder';
+import { canonicalJson } from './utils/canonical-input-hash.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import { closeResidualClause, describeCloseResidual, parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import {
@@ -179,6 +181,7 @@ import { parseCardRuntimeStatusArgs } from './cli/card-runtime-status-dispatch.j
 import { readCardStreamUsageSnapshot } from './cli/card-stream-usage.js';
 import { CardStreamStore } from './services/card-stream-store.js';
 import { TurnReplyCardStore } from './services/turn-reply-card.js';
+import { TurnSendLedger, type TurnSendKind } from './services/turn-send-ledger.js';
 import { buildTurnReplyCard, replyCardPresentation } from './im/lark/turn-reply-card.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
 import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
@@ -328,6 +331,7 @@ import {
 import { loadAllSessionsSnapshot, type SessionsSnapshot } from './services/session-store.js';
 import { sqliteEngineAvailable } from './services/sqlite-compat.js';
 import {
+  SESSION_ROW_MISSING_APP_ID,
   formatStoreHoldMessage,
   formatUnmigratedMessage,
   isSessionScopedCliProcess,
@@ -3980,9 +3984,10 @@ async function requireSessionById(sid: string): Promise<SessionData> {
  * the store's write exclusion (so a stale CLI snapshot can never be written
  * back), re-evaluates occupancy inside that exclusion, and runs the ONE
  * command apply the daemon also uses (services/session-commands.ts). */
-function hostTarget(session: SessionData): { sessionId: string; larkAppId?: string } {
+function hostTarget(session: SessionData): { sessionId: string; larkAppId: string } | undefined {
   const larkAppId = session.larkAppId;
-  return { sessionId: session.sessionId, ...(larkAppId ? { larkAppId } : {}) };
+  if (!larkAppId) return undefined;
+  return { sessionId: session.sessionId, larkAppId };
 }
 
 type OfflineRowRead =
@@ -4003,7 +4008,9 @@ function offlineBlockedError(blocked: { outcome: 'owned' | 'missing' | 'unmigrat
 
 /** Exclusion-ordered fresh read that yields while a daemon holds the store. */
 function readSessionOffline(session: SessionData): OfflineRowRead {
-  const read = readSessionRowAsHost(hostTarget(session), { dataDir: resolveDataDir() });
+  const target = hostTarget(session);
+  if (!target) return { ok: false, error: SESSION_ROW_MISSING_APP_ID };
+  const read = readSessionRowAsHost(target, { dataDir: resolveDataDir() });
   if (read.outcome === 'ok') return { ok: true, current: read.row as unknown as SessionData };
   return { ok: false, error: offlineBlockedError(read) };
 }
@@ -4013,7 +4020,12 @@ function applySessionOffline(
   command: HostSessionCommand,
   options: { expectAdopted?: boolean } = {},
 ): UnownedRowApply {
-  return applySessionCommandAsHost(hostTarget(session), command, { dataDir: resolveDataDir(), ...options });
+  const target = hostTarget(session);
+  // No `larkAppId` means no store to act on. Folded into `missing` because the
+  // callers of this path (prune / whiteboard) only distinguish applied vs not;
+  // the delete path reports SESSION_ROW_MISSING_APP_ID explicitly.
+  if (!target) return { outcome: 'missing' };
+  return applySessionCommandAsHost(target, command, { dataDir: resolveDataDir(), ...options });
 }
 
 /** True inside a sandboxed / read-isolated / credential-only pane: such a
@@ -4230,52 +4242,50 @@ async function abandonSessionAuthoritatively(
   session: SessionData,
   online: DaemonDescriptorLite[] = listOnlineDaemons(),
 ): Promise<AuthoritativeAbandonResult> {
-  // Legacy larkAppId-less rows live in sessions.json; a per-bot daemon writes
-  // only its own sessions-<appId>.json and silently no-ops on close, so keep
-  // them on the offline path (which persists to the legacy file correctly).
-  if (session.larkAppId) {
-    const daemon = online.find(d => d.larkAppId === session.larkAppId);
-    const isCurrentSession = process.env.BOTMUX_SESSION_ID === session.sessionId;
-    const injectedPort = isCurrentSession
-      ? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT)
-      : undefined;
-    const ipcPort = daemon?.ipcPort ?? injectedPort;
-    if (ipcPort) {
-      try {
-        // Explicit abandon boundary: route through the owning daemon so the
-        // ledger FIFO is cleared atomically with close. postSessionCliIpc carries
-        // the trusted-host HMAC (non-isolated) OR this session's rotating origin
-        // capability (sandboxed/read-isolated) so a sandboxed `delete <other-id>`
-        // stays fail-closed at the daemon's sessionCliIpcAuth check.
-        const res = await postSessionCliIpc(ipcPort, session.sessionId, 'close', {});
-        const body = await res.json().catch(() => ({} as Record<string, unknown>));
-        if (res.ok && (body as { ok?: unknown }).ok) {
-          // Shared parser: a body that DECLARES a residual must warn even when the
-          // `residual` object is missing/malformed, or a bad payload silently
-          // becomes an ordinary success again.
-          const residual = parseCloseResidual(body);
-          return residual
-            ? { ok: true, mode: 'daemon', residual }
-            : { ok: true, mode: 'daemon' };
-        }
-        // Surface the daemon's own rejection reason (e.g. origin_unproven) and
-        // never fall back to a partial local kill: a daemon that answered is
-        // alive and holds authoritative in-memory state, whatever the lease
-        // or heartbeat file say.
-        return { ok: false, error: (body as { error?: string }).error ?? `HTTP ${res.status}` };
-      } catch (err) {
-        if (isolatedCliProcess()) return { ok: false, error: ISOLATED_CLI_OFFLINE_ERROR };
-        // No answer. Only when nothing holds the store (no live lease, no fresh
-        // heartbeat) is the descriptor/injected port a leftover we may bypass.
-        const held = occupancyHeld(session.larkAppId);
-        if (held) {
-          return {
-            ok: false,
-            error: formatStoreHoldMessage(held, {
-              sessionScoped: isSessionScopedCliProcess() || isolatedCliProcess(),
-            }),
-          };
-        }
+  if (!session.larkAppId) {
+    return { ok: false, error: SESSION_ROW_MISSING_APP_ID };
+  }
+  const daemon = online.find(d => d.larkAppId === session.larkAppId);
+  const isCurrentSession = process.env.BOTMUX_SESSION_ID === session.sessionId;
+  const injectedPort = isCurrentSession
+    ? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT)
+    : undefined;
+  const ipcPort = daemon?.ipcPort ?? injectedPort;
+  if (ipcPort) {
+    try {
+      // Explicit abandon boundary: route through the owning daemon so the
+      // ledger FIFO is cleared atomically with close. postSessionCliIpc carries
+      // the trusted-host HMAC (non-isolated) OR this session's rotating origin
+      // capability (sandboxed/read-isolated) so a sandboxed `delete <other-id>`
+      // stays fail-closed at the daemon's sessionCliIpcAuth check.
+      const res = await postSessionCliIpc(ipcPort, session.sessionId, 'close', {});
+      const body = await res.json().catch(() => ({} as Record<string, unknown>));
+      if (res.ok && (body as { ok?: unknown }).ok) {
+        // Shared parser: a body that DECLARES a residual must warn even when the
+        // `residual` object is missing/malformed, or a bad payload silently
+        // becomes an ordinary success again.
+        const residual = parseCloseResidual(body);
+        return residual
+          ? { ok: true, mode: 'daemon', residual }
+          : { ok: true, mode: 'daemon' };
+      }
+      // Surface the daemon's own rejection reason (e.g. origin_unproven) and
+      // never fall back to a partial local kill: a daemon that answered is
+      // alive and holds authoritative in-memory state, whatever the lease
+      // or heartbeat file say.
+      return { ok: false, error: (body as { error?: string }).error ?? `HTTP ${res.status}` };
+    } catch (err) {
+      if (isolatedCliProcess()) return { ok: false, error: ISOLATED_CLI_OFFLINE_ERROR };
+      // No answer. Only when nothing holds the store (no live lease, no fresh
+      // heartbeat) is the descriptor/injected port a leftover we may bypass.
+      const held = occupancyHeld(session.larkAppId);
+      if (held) {
+        return {
+          ok: false,
+          error: formatStoreHoldMessage(held, {
+            sessionScoped: isSessionScopedCliProcess() || isolatedCliProcess(),
+          }),
+        };
       }
     }
   }
@@ -6703,6 +6713,7 @@ const SEND_HELP_BODY = [
   '       --layout result|progress|risk|blocked|handoff',
   '                                       可选回复卡卡头薄壳；只在关键结果/进度/风险/阻塞/交接节点显式使用',
   '       --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈',
+  '       --expected-link <url>           要求最终渲染正文原样包含该 URL（可重复）；缺失时在任何外部副作用前拒发',
   '       --as independent|suggestion     对方任务正在跑时声明处理方式：另开任务 / 留给当前任务',
   '       --mention <id:name>             @提及（可重复）。id 默认是 open_id；bot 配置开启',
   '                                       allowArbitraryMention 后也可传完整邮箱/手机号/union_id，',
@@ -6766,6 +6777,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   mojo-containment list|revoke
               查看 / 显式撤销无法自证静止的 mojo containment handle（设备隔离
               blocker 的可审计操作员出口；revoke 需 --yes，存活证据需 --force）
+  turn-send-ledger inspect|resolve
+              查看文档评论分块投递账本；人工核实 provider 响应未知的分块后，
+              用 resolve --outcome delivered|not-delivered --yes 恢复后续重试
   list        列出活跃会话（交互式选择并连接 tmux）
               --plain  纯文本表格输出（管道/脚本场景）
   observe [--session <id>] [--lark-app <appId>] [--include-raw]
@@ -8307,6 +8321,47 @@ function extractCardText(content: string): string {
   }
 }
 
+async function inspectFileOnlyAttachment(
+  path: string,
+  expectedLinks: readonly string[],
+  computeSha256: boolean,
+): Promise<{ missingExpectedLinks: string[]; sha256?: string }> {
+  const remainingLinks = new Set(expectedLinks);
+  const hash = computeSha256 ? createHash('sha256') : undefined;
+  const decoder = remainingLinks.size > 0 ? new StringDecoder('utf8') : undefined;
+  const overlapLength = Math.max(0, ...expectedLinks.map(link => link.length - 1));
+  let overlap = '';
+  const inspectDecodedText = (decoded: string): void => {
+    const window = overlap + decoded;
+    for (const expectedLink of remainingLinks) {
+      if (window.includes(expectedLink)) remainingLinks.delete(expectedLink);
+    }
+    overlap = overlapLength > 0 ? window.slice(-overlapLength) : '';
+  };
+
+  for await (const chunk of createReadStream(path)) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    hash?.update(bytes);
+    if (decoder && remainingLinks.size > 0) inspectDecodedText(decoder.write(bytes));
+    if (!hash && remainingLinks.size === 0) break;
+  }
+  if (decoder && remainingLinks.size > 0) inspectDecodedText(decoder.end());
+
+  return {
+    missingExpectedLinks: expectedLinks.filter(link => remainingLinks.has(link)),
+    ...(hash ? { sha256: hash.digest('hex') } : {}),
+  };
+}
+
+function sendAttachmentIdentity(path: string): {
+  path: string;
+  size: number;
+  mtimeMs: number;
+} {
+  const stat = statSync(path);
+  return { path: resolve(path), size: stat.size, mtimeMs: stat.mtimeMs };
+}
+
 // decodeStdinBytes lives in ./cli/stdin-encoding.ts (imported above) so it
 // can be unit-tested with an explicit platform argument.
 
@@ -8533,7 +8588,7 @@ async function relaySend(
   // routing (--chat-id/--into/--top-level) and --session-id flags are dropped —
   // content/attachments come from the outbox and session-id is forced host-side.
   const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent']);
-  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--as', '--plugin-card-action']);
+  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--expected-link', '--as', '--plugin-card-action']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
@@ -9395,7 +9450,25 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Only an explicit `final` may opt into feedback controls and indexing;
   // `progress` and `auxiliary` (interim / supplementary output) both deliver
   // normally without a feedback region, matching the requirement's three roles.
-  const effectiveResponseKind = responseKind ?? 'progress';
+  let effectiveResponseKind: TurnSendKind = responseKind ?? 'progress';
+  const expectedLinks = argValues(rest, '--expected-link');
+  if (rest.some((token, index) => token === '--expected-link='
+    || (token === '--expected-link'
+      && (rest[index + 1] === undefined || rest[index + 1]!.startsWith('--'))))) {
+    console.error('botmux send: --expected-link 需要 URL 参数');
+    process.exit(2);
+  }
+  for (const expectedLink of expectedLinks) {
+    let url: URL;
+    try { url = new URL(expectedLink); } catch {
+      console.error(`botmux send: --expected-link 仅支持完整 http(s) URL: ${expectedLink}`);
+      process.exit(2);
+    }
+    if (!['http:', 'https:'].includes(url.protocol)) {
+      console.error(`botmux send: --expected-link 仅支持完整 http(s) URL: ${expectedLink}`);
+      process.exit(2);
+    }
+  }
   const managedCustomCardError = managedVcCustomCardError(
     !!vcMeetingManagedSendOrigin,
     customCardRequested,
@@ -9810,12 +9883,20 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.exit(2);
   }
   if (isOriginDocCommentTurn) {
+    // A document-comment turn has exactly one authoritative answer. Preserve an
+    // explicit kind for validation, but make the ordinary unclassified send the
+    // natural final operation for this sink.
+    if (responseKind === undefined) effectiveResponseKind = 'final';
     if (replyLayout) {
       console.error('botmux send: --layout 不作用于文档评论回复，本次已忽略');
       replyLayout = undefined;
     }
     if (!docTarget || !originSession?.larkAppId) {
       console.error('botmux send refused: this turn is bound to a document comment, but its exact origin target is no longer available');
+      process.exit(2);
+    }
+    if (effectiveResponseKind !== 'final') {
+      console.error('botmux send: 文档评论轮只允许一条 final 回复，请使用 --response-kind final');
       process.exit(2);
     }
     if (sid !== originSessionId
@@ -9929,6 +10010,65 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Keep memory attribution in the model's rollout, but never render the
   // complete internal suffix into Lark or count it in send markers.
   content = stripTrailingOaiMemoryCitation(content);
+  // File-only final inspection happens before the common validation block below
+  // so validate every attachment here. This preserves the established Chinese
+  // error instead of leaking createReadStream's raw ENOENT stack.
+  for (const path of [...images, ...files, ...videos, ...videoCovers]) {
+    if (!existsSync(path)) { console.error(`文件不存在: ${path}`); process.exit(1); }
+  }
+  for (const path of [...videos, ...videoCovers]) {
+    if (!statSync(path).isFile()) { console.error(`不是普通文件: ${path}`); process.exit(1); }
+  }
+  // Validate the exact presentation text before any TTS, upload, contact
+  // lookup, or message-provider effect. A sandbox relay may provide a
+  // host-private prepared Markdown copy, so use the same precedence as the
+  // eventual card renderer rather than trusting the raw source alone.
+  let expectedLinkRenderedContent = extractCardText(content);
+  if (customCard) {
+    const { extractCardContent } = await import('./im/lark/message-parser.js');
+    expectedLinkRenderedContent = extractCardContent(JSON.stringify(customCard));
+  }
+  const expectedLinkPreparedFile = process.env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
+  if (!customCard && expectedLinkPreparedFile) {
+    try { expectedLinkRenderedContent = readFileSync(expectedLinkPreparedFile, 'utf-8'); }
+    catch { /* the ordinary renderer will use the same safe raw-content fallback */ }
+  }
+  const fileOnlyPrimaryRequested = !customCard
+    && !expectedLinkRenderedContent.trim()
+    && !asChoice
+    && images.length === 0
+    && files.length === 1
+    && videoAttachments.length === 0
+    && mentionArgs.length === 0
+    && !mentionBack;
+  // A file-only final intentionally has no card body. Its attachment is the
+  // user-visible primary content, so inspect it only when link validation or a
+  // durable final-answer fingerprint needs the bytes. The bounded streaming
+  // pass avoids materializing either a full UTF-8 string or a second Buffer.
+  if (fileOnlyPrimaryRequested) {
+    const needsTurnFingerprint = !!currentTurnId && effectiveResponseKind === 'final';
+    if (expectedLinks.length > 0 || needsTurnFingerprint) {
+      const inspection = await inspectFileOnlyAttachment(
+        files[0],
+        expectedLinks,
+        needsTurnFingerprint,
+      );
+      if (inspection.missingExpectedLinks.length > 0) {
+        console.error(`botmux send: expected link missing from rendered content: ${inspection.missingExpectedLinks[0]}`);
+        process.exit(2);
+      }
+      if (inspection.sha256) {
+        expectedLinkRenderedContent = `file-only:sha256:${inspection.sha256}`;
+      }
+    }
+  } else {
+    for (const expectedLink of expectedLinks) {
+      if (!expectedLinkRenderedContent.includes(expectedLink)) {
+        console.error(`botmux send: expected link missing from rendered content: ${expectedLink}`);
+        process.exit(2);
+      }
+    }
+  }
   if (!contentFile && !customCardRequested) rejectLikelyWindowsStdinMojibake(content);
   if (asChoice) {
     content = embedCrossPrincipalAsToken(
@@ -9979,6 +10119,115 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   const appId = s.larkAppId!;
   const dataDir = resolveDataDir();
+  const turnSendKey = currentTurnId
+    ? {
+        larkAppId: originSession?.larkAppId ?? appId,
+        sessionId: originSessionId ?? sid,
+        turnId: currentTurnId,
+        dispatchAttempt: originDispatchAttempt,
+      }
+    : undefined;
+  const turnRequestIdentity = canonicalJson({
+    version: 1,
+    content: expectedLinkRenderedContent,
+    destination: isOriginDocCommentTurn
+      ? {
+          mode: 'doc-comment',
+          larkAppId: originSession?.larkAppId,
+          fileToken: docTarget?.fileToken,
+          fileType: docTarget?.fileType,
+          commentId: docTarget?.commentId,
+        }
+      : {
+          mode: 'lark-im',
+          larkAppId: appId,
+          sessionId: sid,
+          chatId: overrideChatId ?? s.chatId,
+          sessionRootMessageId: s.rootMessageId,
+          sessionScope: s.scope,
+          topLevel: sendTopLevel,
+          into: sendInto,
+          explicitQuote,
+          noQuote,
+          quoteTargetId: explicitQuote
+            ?? frozenTurnDispatch?.quoteTargetId
+            ?? s.quoteTargetId,
+          frozenReplyTarget: frozenTurnReplyTarget,
+          turnReplyTarget: turnReplyTarget
+            ? {
+                rootMessageId: turnReplyTarget.rootMessageId,
+                turnId: turnReplyTarget.turnId,
+                quoteOnly: turnReplyTarget.quoteOnly,
+              }
+            : undefined,
+        },
+    addressing: {
+      mentions: mentionArgs,
+      mentionBack,
+      noMention,
+      replyTargetSenderOpenId: explicitVcMeetingImOrigin?.replyTargetSenderOpenId
+        ?? frozenTurnDispatch?.replyTargetSenderOpenId
+        ?? turnReplyTarget?.senderOpenId
+        ?? (currentTurnId ? undefined : s.quoteTargetSenderOpenId),
+    },
+    presentation: {
+      voice: asVoice,
+      slash: isSlashSend,
+      layout: replyLayout,
+      imageMode,
+      customCard,
+      as: asChoice,
+    },
+    controls: {
+      attention: attention.requested ? attention.kind : undefined,
+      urgent: urgent.requested ? urgent.mode : undefined,
+    },
+    attachments: {
+      images: images.map(sendAttachmentIdentity),
+      files: fileOnlyPrimaryRequested && expectedLinkRenderedContent.startsWith('file-only:sha256:')
+        ? [{ sha256: expectedLinkRenderedContent.slice('file-only:sha256:'.length) }]
+        : files.map(sendAttachmentIdentity),
+      videos: videoAttachments.map(({ videoPath, coverPath, durationMs }) => ({
+        video: sendAttachmentIdentity(videoPath),
+        cover: sendAttachmentIdentity(coverPath),
+        durationMs,
+      })),
+    },
+  });
+  const turnSendLedger = new TurnSendLedger(dataDir);
+  try {
+    await turnSendLedger.pruneCompletedIfDue();
+  } catch (error) {
+    // Retention is maintenance, never part of send correctness. Keep the
+    // completed/in-flight records fail-closed and let this send proceed.
+    logger.warn(`[turn-send-ledger] completed-record prune skipped: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const executeTurnPrimary = async (
+    renderedContent: string,
+    dispatch: (providerUuid?: string) => Promise<string>,
+  ): Promise<{ messageId: string; replayed: boolean }> => turnSendKey
+    ? turnSendLedger.execute(turnSendKey, effectiveResponseKind, renderedContent, dispatch)
+    : { messageId: await dispatch(), replayed: false };
+  let existingTurnPrimary: { messageId: string; replayed: boolean } | undefined;
+  try {
+    existingTurnPrimary = turnSendKey
+      ? await turnSendLedger.replayOrThrow(turnSendKey, effectiveResponseKind, turnRequestIdentity)
+      : undefined;
+  } catch (error) {
+    console.error(`botmux send refused: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(2);
+  }
+  if (existingTurnPrimary) {
+    console.error(`✓ 已复用本轮最终回答 ${existingTurnPrimary.messageId}`);
+    console.log(JSON.stringify({
+      success: true,
+      messageId: existingTurnPrimary.messageId,
+      sessionId: sid,
+      turnId: currentTurnId,
+      replayed: true,
+    }));
+    return;
+  }
   // Resolve sender-scoped bot identities before the early voice return. Voice
   // used to skip the text path's XPI gate entirely, so an explicitly addressed
   // bot received an unclassified bot message that the receiver then dropped.
@@ -10033,107 +10282,105 @@ async function cmdSend(rest: string[]): Promise<void> {
     const { synthesizeVoiceOpus } = await import('./services/voice/index.js');
     const { rmSync } = await import('node:fs');
     const targetChatId = overrideChatId ?? s.chatId;
+    let voicePrimaryOutputChatId = targetChatId;
     let dir: string | undefined;
+    let voiceDurationMs: number | undefined;
     try {
-      await revalidateIsolatedOriginBeforeEffect();
-      const out = await synthesizeVoiceOpus(appId, content, {
-        beforeProviderEffect: fenceIsolatedOriginBeforeEffect,
-      });
-      dir = out.dir;
-      await revalidateIsolatedOriginBeforeEffect();
-      const fileKey = await uploadFile(appId, out.path, { duration: out.durationMs });
-      const sentAtMs = Date.now();
-      const proposedOutput = {
-        targetChatId,
-        msgType: 'audio',
-        content: JSON.stringify({ file_key: fileKey }),
-      };
-      const prepared = prepareVcMeetingListenerReply(proposedOutput);
-      if (prepared?.kind === 'conflict') {
-        throw new Error(`VC listener assistant reply refused (${prepared.reason}): ${prepared.detail}`);
-      }
-      const canonicalOutput = prepared?.canonicalOutput ?? proposedOutput;
-      if (prepared?.outputMismatch) {
-        console.error(
-          `⚠️ VC listener voice reply output_mismatch action=${prepared.ref.actionId}; `
-          + 'reusing first canonical output',
-        );
-      }
-      let messageId: string;
-      if (prepared?.kind === 'succeeded' && prepared.messageId) {
-        messageId = prepared.messageId;
-      } else {
-        revalidateVcMeetingManagedSend();
-        const managedProviderOptions = outboundMessageOptions(!!prepared);
-        const deferred = !sendInto && (!overrideChatId || overrideChatId === s.chatId)
-          ? await dispatchDeferredTopicSend({
-              dataDir: resolveDataDir(),
-              session: s as SessionData & { larkAppId: string },
-              currentTurnId,
-              explicitTopLevel: sendTopLevel,
-              reuseBoundRootWhenTopLevel: deferredMaterializedByThisCommand,
-              content: canonicalOutput.content,
-              msgType: canonicalOutput.msgType,
-              uuid: prepared?.providerKey,
-              sendRoot: async (body, type, uuid) => {
-                await revalidateIsolatedOriginBeforeEffect();
-                return sendMessage(appId, targetChatId, body, type, uuid, undefined, managedProviderOptions);
-              },
-              sendTitleSeed: async (title, uuid) => {
-                await revalidateIsolatedOriginBeforeEffect();
-                return sendMessage(appId, targetChatId, title, 'text', uuid);
-              },
-              replyRoot: async (root, body, type, uuid) => {
-                await revalidateIsolatedOriginBeforeEffect();
-                return replyMessage(appId, root, body, type, true, uuid, undefined, managedProviderOptions);
-              },
-            })
-          : { handled: false };
-        if (deferred.handled && deferred.messageId) {
-          deferredMaterializedByThisCommand ||= deferred.materializedNow === true;
-          deferredTopicRootMessageIdForOutput = deferred.rootMessageId;
-          messageId = deferred.messageId;
+      const voiceDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
+        await revalidateIsolatedOriginBeforeEffect();
+        const out = await synthesizeVoiceOpus(appId, content, {
+          beforeProviderEffect: fenceIsolatedOriginBeforeEffect,
+        });
+        dir = out.dir;
+        voiceDurationMs = out.durationMs;
+        await revalidateIsolatedOriginBeforeEffect();
+        const fileKey = await uploadFile(appId, out.path, { duration: out.durationMs });
+        const proposedOutput = {
+          targetChatId,
+          msgType: 'audio',
+          content: JSON.stringify({ file_key: fileKey }),
+        };
+        const prepared = prepareVcMeetingListenerReply(proposedOutput);
+        if (prepared?.kind === 'conflict') {
+          throw new Error(`VC listener assistant reply refused (${prepared.reason}): ${prepared.detail}`);
+        }
+        const canonicalOutput = prepared?.canonicalOutput ?? proposedOutput;
+        voicePrimaryOutputChatId = canonicalOutput.targetChatId;
+        if (prepared?.outputMismatch) {
+          console.error(
+            `⚠️ VC listener voice reply output_mismatch action=${prepared.ref.actionId}; `
+            + 'reusing first canonical output',
+          );
+        }
+        let deliveredMessageId: string;
+        if (prepared?.kind === 'succeeded' && prepared.messageId) {
+          deliveredMessageId = prepared.messageId;
         } else {
-          const canonicalTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
-            ? frozenTurnReplyTarget
-            : resolveSendTarget({
-                into: sendInto,
-                topLevel: sendTopLevel,
-                chatScope: s.scope === 'chat',
-                chatId: canonicalOutput.targetChatId,
-                rootMessageId: s.rootMessageId,
-                replyTargetRootId: turnReplyTarget?.rootMessageId,
-                replyTargetTurnId: turnReplyTarget?.turnId,
-                replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
+          revalidateVcMeetingManagedSend();
+          const managedProviderOptions = outboundMessageOptions(!!prepared);
+          const deliveryUuid = prepared?.providerKey ?? providerUuid;
+          const deferred = !sendInto && (!overrideChatId || overrideChatId === s.chatId)
+            ? await dispatchDeferredTopicSend({
+                dataDir: resolveDataDir(),
+                session: s as SessionData & { larkAppId: string },
                 currentTurnId,
-              });
-          await revalidateIsolatedOriginBeforeEffect();
-          messageId = canonicalTarget.mode === 'plain'
-            ? await sendMessage(
-                appId,
-                canonicalTarget.chatId,
-                canonicalOutput.content,
-                canonicalOutput.msgType,
-                prepared?.providerKey,
-                undefined,
-                managedProviderOptions,
-              )
-            : await replyMessage(
-                appId,
-                canonicalTarget.rootMessageId,
-                canonicalOutput.content,
-                canonicalOutput.msgType,
-                canonicalTarget.mode === 'thread',
-                prepared?.providerKey,
-                undefined,
-                managedProviderOptions,
-              );
+                explicitTopLevel: sendTopLevel,
+                reuseBoundRootWhenTopLevel: deferredMaterializedByThisCommand,
+                content: canonicalOutput.content,
+                msgType: canonicalOutput.msgType,
+                uuid: deliveryUuid,
+                sendRoot: async (body, type, uuid) => {
+                  await revalidateIsolatedOriginBeforeEffect();
+                  return sendMessage(appId, targetChatId, body, type, uuid, undefined, managedProviderOptions);
+                },
+                sendTitleSeed: async (title, uuid) => {
+                  await revalidateIsolatedOriginBeforeEffect();
+                  return sendMessage(appId, targetChatId, title, 'text', uuid);
+                },
+                replyRoot: async (root, body, type, uuid) => {
+                  await revalidateIsolatedOriginBeforeEffect();
+                  return replyMessage(appId, root, body, type, true, uuid, undefined, managedProviderOptions);
+                },
+              })
+            : { handled: false };
+          if (deferred.handled && deferred.messageId) {
+            deferredMaterializedByThisCommand ||= deferred.materializedNow === true;
+            deferredTopicRootMessageIdForOutput = deferred.rootMessageId;
+            deliveredMessageId = deferred.messageId;
+          } else {
+            const canonicalTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
+              ? frozenTurnReplyTarget
+              : resolveSendTarget({
+                  into: sendInto,
+                  topLevel: sendTopLevel,
+                  chatScope: s.scope === 'chat',
+                  chatId: canonicalOutput.targetChatId,
+                  rootMessageId: s.rootMessageId,
+                  replyTargetRootId: turnReplyTarget?.rootMessageId,
+                  replyTargetTurnId: turnReplyTarget?.turnId,
+                  replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
+                  currentTurnId,
+                });
+            await revalidateIsolatedOriginBeforeEffect();
+            deliveredMessageId = canonicalTarget.mode === 'plain'
+              ? await sendMessage(
+                  appId, canonicalTarget.chatId, canonicalOutput.content, canonicalOutput.msgType,
+                  deliveryUuid, undefined, managedProviderOptions,
+                )
+              : await replyMessage(
+                  appId, canonicalTarget.rootMessageId, canonicalOutput.content, canonicalOutput.msgType,
+                  canonicalTarget.mode === 'thread', deliveryUuid, undefined, managedProviderOptions,
+                );
+          }
+          if (prepared?.kind === 'send' || prepared?.kind === 'succeeded') {
+            finishVcMeetingImReply(resolveDataDir(), prepared.ref, deliveredMessageId);
+          }
         }
-        if (prepared?.kind === 'send' || prepared?.kind === 'succeeded') {
-          finishVcMeetingImReply(resolveDataDir(), prepared.ref, messageId);
-        }
-      }
-      recordVcMeetingPrimaryOutput(messageId, canonicalOutput.targetChatId);
+        return deliveredMessageId;
+      });
+      const messageId = voiceDelivery.messageId;
+      const sentAtMs = Date.now();
+      recordVcMeetingPrimaryOutput(messageId, voicePrimaryOutputChatId);
       // 语音也是一次回复：写 bridge fallback marker，否则本轮会被判为"没发 botmux send"
       // 而触发兜底，多补一张文本卡。与文本/卡片路径同口径：仅同话题回复才记。
       if ((!sendTopLevel || !!deferredTopicRootMessageIdForOutput)
@@ -10154,13 +10401,16 @@ async function cmdSend(rest: string[]): Promise<void> {
           appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify(marker) + '\n');
         } catch { /* best-effort：漏记只多一条兜底，不致命 */ }
       }
-      console.error(`✓ 已发送语音 ${messageId} ｜ ${Math.round(out.durationMs / 1000)}s`);
+      console.error(voiceDelivery.replayed
+        ? `✓ 已复用本轮已发送语音 ${messageId}`
+        : `✓ 已发送语音 ${messageId} ｜ ${Math.round((voiceDurationMs ?? 0) / 1000)}s`);
       console.log(JSON.stringify({
         success: true,
         messageId,
         sessionId: sid,
         kind: 'voice',
-        durationMs: out.durationMs,
+        durationMs: voiceDurationMs,
+        replayed: voiceDelivery.replayed,
         ...(deferredTopicRootMessageIdForOutput
           ? { deferredTopicRootMessageId: deferredTopicRootMessageIdForOutput, turnId: currentTurnId }
           : {}),
@@ -10204,17 +10454,44 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
       // 嵌套回复到用户那条评论 thread（已挂其下，无需 ↪ 前缀）。
       const chunks = chunkCommentText(content);
-      for (let i = 0; i < chunks.length; i++) {
-        await replyToDocComment(
-          appId,
-          { fileToken: exactDocTarget.fileToken, fileType: exactDocTarget.fileType },
-          exactDocTarget.commentId,
-          chunks[i],
-          i === 0 ? docMentionOpenId : undefined,
-          { beforeProviderEffect: fenceIsolatedOriginBeforeEffect },
-        );
-      }
-      // 清理 "Typing" reaction（bot 已回复完毕）。
+      const docMessageId = `doc:${exactDocTarget.commentId}`;
+      const docDelivery = turnSendKey
+        ? await turnSendLedger.executeNonIdempotentSequence(
+            turnSendKey,
+            effectiveResponseKind,
+            turnRequestIdentity,
+            chunks.length,
+            async (i, effects) => {
+              await replyToDocComment(
+                appId,
+                { fileToken: exactDocTarget.fileToken, fileType: exactDocTarget.fileType },
+                exactDocTarget.commentId,
+                chunks[i],
+                i === 0 ? docMentionOpenId : undefined,
+                {
+                  beforeProviderEffect: fenceIsolatedOriginBeforeEffect,
+                  providerRequestStarted: effects.providerRequestStarted,
+                  providerRequestNotDelivered: effects.providerRequestNotDelivered,
+                },
+              );
+            },
+            docMessageId,
+          )
+        : await (async () => {
+            for (let i = 0; i < chunks.length; i++) {
+              await replyToDocComment(
+                appId,
+                { fileToken: exactDocTarget.fileToken, fileType: exactDocTarget.fileType },
+                exactDocTarget.commentId,
+                chunks[i],
+                i === 0 ? docMentionOpenId : undefined,
+                { beforeProviderEffect: fenceIsolatedOriginBeforeEffect },
+              );
+            }
+            return { messageId: docMessageId, replayed: false };
+          })();
+      // 清理 "Typing" reaction（bot 已回复完毕）。未知分块会在上方 fail closed，
+      // 不会误删指示器并把一份可能不完整的回复伪装成完成。
       if (exactDocTarget.reactionId && exactDocTarget.replyId) {
         await removeCommentReaction(appId,
           { fileToken: exactDocTarget.fileToken, fileType: exactDocTarget.fileType },
@@ -10227,7 +10504,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
         const marker: Record<string, unknown> = {
           sentAtMs: Date.now(),
-          messageId: `doc:${exactDocTarget.commentId}`,
+          messageId: docDelivery.messageId,
           responseKind: effectiveResponseKind,
           turnId: originTurnId ?? exactDocTarget.turnId,
           ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
@@ -10241,7 +10518,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       // the daemon may have advanced the dispatch ledger or accepted another
       // turn in the meantime.  Daemon settlement owns exact target retirement.
       console.error(`✓ 已回复文档评论 ${exactDocTarget.commentId.slice(0, 12)}（${chunks.length} 条）`);
-      console.log(JSON.stringify({ success: true, commentId: exactDocTarget.commentId, sessionId: originSessionId, kind: 'doc-comment', chunks: chunks.length }));
+      console.log(JSON.stringify({ success: true, commentId: exactDocTarget.commentId, sessionId: originSessionId, kind: 'doc-comment', chunks: chunks.length, replayed: docDelivery.replayed }));
     } catch (e: any) {
       console.error(`文档评论发送失败：${describeSendFailure(e)}`);
       process.exit(1);
@@ -10469,14 +10746,6 @@ async function cmdSend(rest: string[]): Promise<void> {
   if (mentionBack && replyTargetSenderOpenId
       && !mentions.some(m => m.open_id === replyTargetSenderOpenId)) {
     mentions.push({ open_id: replyTargetSenderOpenId, name: '' });
-  }
-
-  // Validate file paths
-  for (const p of [...images, ...files, ...videos, ...videoCovers]) {
-    if (!existsSync(p)) { console.error(`文件不存在: ${p}`); process.exit(1); }
-  }
-  for (const p of [...videos, ...videoCovers]) {
-    if (!statSync(p).isFile()) { console.error(`不是普通文件: ${p}`); process.exit(1); }
   }
 
   const { sendMessage, replyMessage, urgentMessage, uploadImage, uploadFile, MessageWithdrawnError, getChatModeStrict, getMessageThreadId } = await import('./im/lark/client.js');
@@ -10742,7 +11011,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
   let primaryQuotedId: string | null = null;
   let vcMeetingListenerReplyReplay = false;
-  const dispatchPrimary = async (
+  const dispatchPrimaryUnlocked = async (
     content: string,
     msgType: string,
     originAlreadyRevalidated = false,
@@ -10836,6 +11105,25 @@ async function cmdSend(rest: string[]): Promise<void> {
       finishVcMeetingImReply(resolveDataDir(), prepared.ref, result.messageId);
     }
     recordVcMeetingPrimaryOutput(result.messageId, canonicalOutput.targetChatId);
+    return result.messageId;
+  };
+  let turnPrimaryReplayed = false;
+  const dispatchPrimary = async (
+    primaryContent: string,
+    msgType: string,
+    originAlreadyRevalidated = false,
+    uuid?: string,
+  ): Promise<string> => {
+    const result = await executeTurnPrimary(
+      turnRequestIdentity,
+      providerUuid => dispatchPrimaryUnlocked(
+        primaryContent,
+        msgType,
+        originAlreadyRevalidated,
+        uuid ?? providerUuid,
+      ),
+    );
+    turnPrimaryReplayed ||= result.replayed;
     return result.messageId;
   };
 
@@ -11061,6 +11349,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     // assert "one id per requested attachment" instead of guessing.
     let attachmentMessageIds: string[] = [];
     let videoMessageIds: string[] = [];
+    const pureFileSend = fileOnlyPrimaryRequested
+      && !text.trim()
+      && imageKeys.length === 0
+      && mentions.length === 0;
     const pureVideoSend = customCard
       ? false
       : shouldSendAsPureVideo({
@@ -11070,8 +11362,8 @@ async function cmdSend(rest: string[]): Promise<void> {
           videoCount: videoAttachments.length,
           mentionCount: mentions.length,
         });
-    if (pureVideoSend && replyLayout) {
-      console.error('botmux send: --layout 不作用于纯视频消息，本次已忽略');
+    if ((pureFileSend || pureVideoSend) && replyLayout) {
+      console.error(`botmux send: --layout 不作用于纯${pureFileSend ? '文件' : '视频'}消息，本次已忽略`);
       replyLayout = undefined;
     }
     if (customCard) {
@@ -11089,6 +11381,23 @@ async function cmdSend(rest: string[]): Promise<void> {
       const atPrefix = mentions.map(m => `<at user_id="${m.open_id}"></at>`).join(' ');
       const slashText = atPrefix ? `${atPrefix} ${slash.command}` : slash.command;
       messageId = await dispatchPrimary(slashText, 'text');
+    } else if (pureFileSend) {
+      // The single attachment IS the primary message. Keep upload + send under
+      // the turn ledger lock so a concurrent final cannot upload or post a
+      // duplicate, and never emit an empty interactive card first.
+      const fileDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
+        await revalidateIsolatedOriginBeforeEffect();
+        const fileKey = await uploadFile(appId, files[0]);
+        return dispatchPrimaryUnlocked(
+          JSON.stringify({ file_key: fileKey }),
+          'file',
+          false,
+          providerUuid,
+        );
+      });
+      turnPrimaryReplayed ||= fileDelivery.replayed;
+      messageId = fileDelivery.messageId;
+      attachmentMessageIds = [messageId];
     } else if (pureVideoSend) {
       // Pure-video fast path: send the preview as a standalone media message.
       // A send that also carries mentions is deliberately excluded (media messages
@@ -11261,40 +11570,62 @@ async function cmdSend(rest: string[]): Promise<void> {
       const replyRecord = canUseReplyCard ? replyStore.read(replyKey) : undefined;
       if (replyRecord && replyKey) {
         if (replyRecord.chatId !== targetChatId) throw new Error('Reply-card destination changed; send refused');
-        const delivered = await replyStore.update(replyKey, effectiveResponseKind === 'final'
-          ? { kind: 'final', text, card: replyCardJson, source: 'explicit',
-              ...(feedbackPolicy ? { feedback: { policy: feedbackPolicy, requesterSubjectId: feedbackRequesterSubjectId } } : {}) }
-          : { kind: 'progress', text }, {
-          beforeEffect: async () => { await revalidateIsolatedOriginBeforeEffect(); revalidateVcMeetingManagedSend(); },
-          send: (body, uuid) => dispatchPrimary(body, 'interactive', undefined, uuid),
-          patch: async (id, body) => {
-            const { updateMessage } = await import('./im/lark/client.js');
-            await updateMessage(appId, id, body);
-          },
-          isWithdrawn: error => error instanceof MessageWithdrawnError,
-          render: record => buildTurnReplyCard(record, {
-            ...replyCardPresentation(getBot(appId).config, targetChatId), locale: localeForBot(appId), workingDir: s.workingDir,
-            showLiveUsage: resolveUsageDisplay(appId) === 'streaming',
-            canStop: replyCardPresentation(getBot(appId).config, targetChatId).canStop && getBot(appId).config.codexRpcInput !== true,
-          }),
-          sendOverflow: async (fullText, uuid) => {
-            const path = join(replyStore.directory, `${replyStore.id(replyKey)}-reply.md`);
-            writeFileSync(path, fullText, { mode: 0o600 });
-            await revalidateIsolatedOriginBeforeEffect();
-            const fileKey = await uploadFile(appId, path);
-            return dispatchAfterOriginGate(JSON.stringify({ file_key: fileKey }), 'file', uuid);
-          },
+        let delivered: Awaited<ReturnType<typeof replyStore.update>> | undefined;
+        const replyDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
+          delivered = await replyStore.update(replyKey, effectiveResponseKind === 'final'
+            ? { kind: 'final', text, card: replyCardJson, source: 'explicit',
+                ...(feedbackPolicy ? { feedback: { policy: feedbackPolicy, requesterSubjectId: feedbackRequesterSubjectId } } : {}) }
+            : { kind: 'progress', text }, {
+            beforeEffect: async () => { await revalidateIsolatedOriginBeforeEffect(); revalidateVcMeetingManagedSend(); },
+            send: (body, uuid) => dispatchPrimaryUnlocked(body, 'interactive', undefined, uuid ?? providerUuid),
+            patch: async (id, body) => {
+              const { updateMessage } = await import('./im/lark/client.js');
+              await updateMessage(appId, id, body);
+            },
+            isWithdrawn: error => error instanceof MessageWithdrawnError,
+            render: record => buildTurnReplyCard(record, {
+              ...replyCardPresentation(getBot(appId).config, targetChatId), locale: localeForBot(appId), workingDir: s.workingDir,
+              showLiveUsage: resolveUsageDisplay(appId) === 'streaming',
+              canStop: replyCardPresentation(getBot(appId).config, targetChatId).canStop && getBot(appId).config.codexRpcInput !== true,
+            }),
+            sendOverflow: async (fullText, uuid) => {
+              const path = join(replyStore.directory, `${replyStore.id(replyKey)}-reply.md`);
+              writeFileSync(path, fullText, { mode: 0o600 });
+              await revalidateIsolatedOriginBeforeEffect();
+              const fileKey = await uploadFile(appId, path);
+              return dispatchAfterOriginGate(JSON.stringify({ file_key: fileKey }), 'file', uuid);
+            },
+          });
+          return delivered.messageId ?? '';
         });
+        turnPrimaryReplayed ||= replyDelivery.replayed;
         unifiedReplyUsed = true;
-        if (!delivered.delivered || !delivered.messageId) {
+        if (!replyDelivery.messageId) {
           console.error('进度已保存到本轮记录；请用 botmux send --response-kind final 发送完整答复。');
           console.log(JSON.stringify({ success: true, accepted: true, delivered: false, sessionId: sid, turnId: currentTurnId }));
           return;
         }
-        messageId = delivered.messageId;
+        messageId = replyDelivery.messageId;
       } else {
         messageId = await dispatchPrimary(replyCardJson, 'interactive');
       }
+    }
+
+    // The cheap preflight above catches ordinary retries. A concurrent retry
+    // can still reach the publication lock before the first sender records its
+    // result; in that case executeTurnPrimary returns the canonical message id
+    // after waiting. Stop here so the losing process cannot repeat indexing,
+    // attachments, urgency, bridge markers, or attention side effects.
+    if (turnPrimaryReplayed) {
+      console.error(`✓ 已复用本轮最终回答 ${messageId}`);
+      console.log(JSON.stringify({
+        success: true,
+        messageId,
+        sessionId: sid,
+        turnId: currentTurnId,
+        replayed: true,
+      }));
+      return;
     }
 
     if (oncallGroupCard && messageId) {
@@ -11313,7 +11644,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     // canonical final-answer cards — and they are exactly the shapes the
     // feedback gate above rejects outright, so the recorded set stays identical
     // whether feedback is on or off.
-    if (effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {
+    if (effectiveResponseKind === 'final' && !customCard && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {
       const carriesFeedbackControl = !!feedbackPolicy;
       const deliveryTurnId = currentTurnId ?? `send:${messageId}`;
       const correlationDiscriminator = currentTurnId ? messageId : undefined;
@@ -11388,7 +11719,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     // the success JSON. Pure-video sends have no text/card primary, so the media
     // message above is the primary and failures before any media is sent still
     // surface as command failure.
-    if (!pureVideoSend && !vcMeetingListenerReplyReplay) {
+    if (!pureFileSend && !pureVideoSend && !vcMeetingListenerReplyReplay && !turnPrimaryReplayed) {
       ({ sent: attachmentMessageIds, failed: failedAttachments } = await sendFileAttachments(
         { uploadFile, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect }, appId, files,
       ));
@@ -16160,6 +16491,11 @@ switch (command) {
     // never self-release (weak handles on non-cgroup hosts, unprovable handles).
     const { runMojoContainmentCommand } = await import('./core/mojo-containment-command.js');
     process.exitCode = await runMojoContainmentCommand(process.argv.slice(3));
+    break;
+  }
+  case 'turn-send-ledger': {
+    const { runTurnSendLedgerCommand } = await import('./core/turn-send-ledger-command.js');
+    process.exitCode = await runTurnSendLedgerCommand(process.argv.slice(3));
     break;
   }
   case 'list':

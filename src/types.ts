@@ -1998,6 +1998,9 @@ export type WorkerToDaemon =
    * bridges. Cosmetic channel: it must never influence turn
    * settlement, final_output attribution, or durable receipts. */
   | { type: 'thinking_update'; sessionId?: string; entries: CotEntry[]; turnId: string; dispatchAttempt?: number }
+  /** A confirmed steer retired this exact timeline. Cosmetic only: this is
+   * not a turn_terminal or a successful durable-delivery receipt. */
+  | { type: 'thinking_superseded'; sessionId: string; turnId: string; dispatchAttempt?: number }
   /** Executor-observed Codex tier, bound to this worker + rollout generation.
    * `null` explicitly clears any previous generation's snapshot. */
   | { type: 'codex_service_tier'; snapshot: CodexServiceTierSnapshot | null }

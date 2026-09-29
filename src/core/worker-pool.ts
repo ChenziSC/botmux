@@ -95,7 +95,7 @@ import {
 } from '../im/lark/md-card.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
-import { handleCotThinkingUpdate, finalizeCotMessage, abortCotMessage } from '../im/lark/cot-message.js';
+import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, abortCotMessage } from '../im/lark/cot-message.js';
 import { replyCardModeFor, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards } from './turn-reply-card.js';
 import { captureTerminalReplyContext } from './terminal-reply-context.js';
 import { ReplyCardWithdrawnError } from '../services/turn-reply-card.js';
@@ -13806,6 +13806,13 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'thinking_superseded': {
+        if (!ownsLifecycleMutation()) break;
+        if (msg.sessionId !== ds.session.sessionId) break;
+        handleCotThinkingSuperseded(ds, msg);
+        break;
+      }
+
       case 'thinking_update': {
         // Cosmetic CoT channel — never touches settlement. Same stale-worker
         // guard as screen_update; sessionId echo is validated when present.
@@ -15620,7 +15627,18 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Dropped managed_turn_origin_revoked with mismatched sessionId`);
           break;
         }
-        forgetScheduledTurnCaller(ds, msg.turnId);
+        // Keep the daemon-authenticated schedule creator until the exact
+        // turn_terminal edge. A fresh TUI can report its initial idle prompt
+        // before the opening scheduled input is written; the worker then
+        // revokes this provisional live capability and republishes a new one
+        // for the same turn at the real write boundary. Dropping the caller at
+        // this intermediate revoke makes that second publication anonymous and
+        // causes `actor current` to fail throughout the actual scheduled turn.
+        //
+        // This does not retain live authority: the exact capability below is
+        // still revoked immediately. Only the caller tuple remains available
+        // for a same-worker, same-turn republication, and turn_terminal or
+        // worker teardown clears it.
         // Same-generation exact-turn revocation is positive idle evidence for
         // daemon-side pre-routing. Never let historical caller/session fields
         // keep this optimistic hint alive after the worker released authority.

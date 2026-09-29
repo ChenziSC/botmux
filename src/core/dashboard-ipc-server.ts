@@ -1,3 +1,4 @@
+import { readTurnRegistration } from './trigger-registration.js';
 // src/core/dashboard-ipc-server.ts
 import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
 import { updateHandoffLiveCard } from './worker-pool.js';
@@ -3554,6 +3555,14 @@ ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => 
   } catch (err: any) {
     jsonRes(res, 502, { ok: false, error: String(err?.message ?? err) });
   }
+});
+
+// Authenticated host API; deliberately outside the core-only public allowlist.
+ipcRoute('GET', '/api/sessions/:sessionId/trigger-registration', (req, res, params) => {
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const keys = url.searchParams.getAll('turnIdempotencyKey');
+  const result = readTurnRegistration(cachedLarkAppId, params.sessionId, keys.length === 1 ? keys[0] : null);
+  jsonRes(res, result.status, result.body);
 });
 
 ipcRoute('GET', '/api/sessions/:sessionId/trigger-result', (req, res, params) => {

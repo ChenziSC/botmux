@@ -95,7 +95,7 @@ import {
 } from '../im/lark/md-card.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
-import { handleCotThinkingUpdate, finalizeCotMessage, abortCotMessage } from '../im/lark/cot-message.js';
+import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, abortCotMessage } from '../im/lark/cot-message.js';
 import { replyCardModeFor, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards } from './turn-reply-card.js';
 import { captureTerminalReplyContext } from './terminal-reply-context.js';
 import { ReplyCardWithdrawnError } from '../services/turn-reply-card.js';
@@ -13803,6 +13803,13 @@ function setupWorkerHandlers(
         // emitted in many sessions, could clobber the good value with a stale
         // one.
         scheduleCodexServiceTierPatch(ds);
+        break;
+      }
+
+      case 'thinking_superseded': {
+        if (!ownsLifecycleMutation()) break;
+        if (msg.sessionId !== ds.session.sessionId) break;
+        handleCotThinkingSuperseded(ds, msg);
         break;
       }
 

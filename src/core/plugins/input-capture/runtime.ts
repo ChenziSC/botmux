@@ -1,4 +1,5 @@
 import { captureDigest, createInputCaptureStore, type CapturedInput, type InputBinding } from './store.js';
+import { parseInputCaptureConditions } from './conditions.js';
 
 export interface CaptureSession {
   sessionId: string; larkAppId: string; chatId: string; anchor: string;
@@ -88,6 +89,24 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
         if (!binding || binding.revision !== expectedRevision) throw new Error('input_capture_revision_conflict');
         if (binding.active) { binding.active = false; binding.revision++; }
         return binding;
+      });
+    },
+    revokeSet(sessionId: string, value: unknown) {
+      const conditions = parseInputCaptureConditions(value);
+      return store.transact(state => {
+        // Check every stream before changing any of them. A new input does not
+        // increment the binding revision, so both preconditions are necessary.
+        const entries = conditions.map(condition => {
+          const binding = state.bindings.find(b => b.id === condition.bindingId && b.sessionId === sessionId);
+          if (!binding || binding.revision !== condition.expectedRevision) throw new Error('input_capture_revision_conflict');
+          const inputCount = state.inputs.filter(input => input.bindingId === binding.id).length;
+          if (inputCount !== condition.expectedInputCount) throw new Error('input_capture_inputs_conflict');
+          return { binding, inputCount };
+        });
+        for (const { binding } of entries) {
+          if (binding.active) { binding.active = false; binding.revision++; }
+        }
+        return { bindings: entries };
       });
     },
     capture(event: { messageId: string; chatId: string; anchor: string; senderOpenId: string;

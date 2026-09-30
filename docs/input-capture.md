@@ -6,9 +6,20 @@
 botmux input-capture register --bot <app> --session <session> --plugin <installed-plugin> --request <stable-key> --ref <opaque-ref>
 botmux input-capture inspect --bot <app> --session <session> --binding <binding-id>
 botmux input-capture revoke --bot <app> --session <session> --binding <binding-id> --revision <revision>
+botmux input-capture revoke-set --bot <app> --session <session> --bindings '<conditions-json>'
 ```
 
 对应 `POST /api/sessions/:sessionId/input-capture`，body 包含 larkAppId、operation 与命令字段。路由必须通过当前宿主 HMAC；不加入 session relay allowlist。register 同一身份幂等；同一 bot/chat/anchor/owner 的第二个活动绑定冲突。撤销后保留墓碑，同一个 request 不会重新激活。
+
+`revoke-set` 的 `conditions-json` 是 1–32 个 `{bindingId, expectedRevision, expectedInputCount}` 对象。
+宿主在同一个日志事务内核验所有绑定都属于原 session、revision 匹配且已接收输入总数等于预期，然后一起撤销。
+任一入口在检查后新收了消息，整个操作返回 409，所有绑定保持原状；非法条件返回 400。
+已接收数量包括尚未收到插件 ACK 的输入，ACK 的保存不会改变这个数量。
+返回 `result.bindings[]`，每项包含撤销后的 `binding` 和 `inputCount`，没有删除输入或消费回执。
+响应丢失时先 inspect 原绑定；墓碑和输入仍在，不能换 request 重新激活。
+
+消费者应先核对 inspect 返回的全部原 input ID、内容和连续序号已经持久化，再用它们的数量发起条件撤销。
+这个接口只建立输入接管的结束边界；它不证明插件已处理输入、业务已完成或下一步已获授权。
 
 接管在飞书 SDK 回调返回 ACK 之前同步执行，并排除 slash/回调命令、话题控制头与附件；不会经过先 ACK 再异步执行的普通消息调度队列。附件、workflow grill、机器人和其他答复者继续走现有路由。命中后重新检查当前原生 talk 权限及会话身份，再将完整文字、真实 messageId、sender 和单调序号 fsync 到宿主日志，才返回已接收。持久化失败不返回成功，也不转投普通 Worker；需要排查保存故障，不能假定上游一定重投。
 

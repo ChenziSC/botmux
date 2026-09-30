@@ -1291,6 +1291,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/input-capture', async (req, res, para
   try {
     let result: unknown;
     if (body.operation === 'register') result = runtime.register(params.sessionId, body);
+    else if (body.operation === 'revoke-set') result = runtime.revokeSet(params.sessionId, body.bindings);
     else if (typeof body.bindingId === 'string' && /^[a-f0-9]{64}$/.test(body.bindingId)) {
       if (body.operation === 'inspect') result = runtime.inspect(params.sessionId, body.bindingId);
       else if (body.operation === 'revoke' && Number.isSafeInteger(body.expectedRevision) && Number(body.expectedRevision) > 0) {
@@ -1300,8 +1301,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/input-capture', async (req, res, para
     return jsonRes(res, result ? 200 : 404, { ok: !!result, schemaVersion: 1, result });
   } catch (error) {
     const message = error instanceof Error ? error.message : '';
-    const conflict = /^input_capture_(?:identity|anchor|revision)_conflict$/.test(message);
-    return jsonRes(res, conflict ? 409 : 503, { ok: false, error: conflict ? message : 'input_capture_unavailable' });
+    const conflict = /^input_capture_(?:identity|anchor|revision|inputs)_conflict$/.test(message);
+    const invalid = message === 'invalid_input_capture_conditions';
+    return jsonRes(res, invalid ? 400 : conflict ? 409 : 503, { ok: false, error: invalid || conflict ? message : 'input_capture_unavailable' });
   }
 });
 

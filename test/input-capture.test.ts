@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { createInputCaptureStore } from '../src/core/plugins/input-capture/store.js';
 import { createInputCaptureRuntime, type InputCaptureOptions } from '../src/core/plugins/input-capture/runtime.js';
 import { parseInputCaptureCommand } from '../src/cli/input-capture.js';
+import { parseInputCaptureConditions } from '../src/core/plugins/input-capture/conditions.js';
 const cleanups: (() => void | Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 function fixture(overrides: Partial<InputCaptureOptions> = {}) {
@@ -72,6 +73,90 @@ describe('exact plugin input capture', () => {
     f.runtime.capture(f.event); await f.runtime.drain();
     expect(() => f.runtime.capture({ ...f.event, text: 'different' })).toThrow('message_conflict');
     expect(f.store.read().inputs[0].text).toBe(f.event.text);
+  });
+  it('closes both routes only if neither has accepted another input since inspection', async () => {
+    for (const anchor of ['om_root', 'om_card']) {
+      const f = fixture();
+      const card = f.runtime.register('s', { pluginId: 'example', requestId: 'card', providerRef: 'opaque', inputAnchor: 'om_card' });
+      const conditions = [f.binding, card].map(binding => ({ bindingId: binding.id, expectedRevision: 1, expectedInputCount: 0 }));
+      f.runtime.capture({ ...f.event, anchor }); await f.runtime.drain();
+      const before = f.store.read();
+      expect(() => f.runtime.revokeSet('s', conditions)).toThrow('input_capture_inputs_conflict');
+      expect(f.store.read()).toEqual(before);
+      const current = conditions.map(condition => ({ ...condition,
+        expectedInputCount: f.runtime.inspect('s', condition.bindingId)!.inputs.length }));
+      const result = f.runtime.revokeSet('s', current);
+      expect(result.bindings.map(row => [row.binding.active, row.binding.revision])).toEqual([[false, 2], [false, 2]]);
+      expect(result.bindings.reduce((total, row) => total + row.inputCount, 0)).toBe(1);
+      for (const inputAnchor of ['om_root', 'om_card']) {
+        expect(f.runtime.capture({ ...f.event, anchor: inputAnchor, messageId: 'om_later' })).toBe(false);
+      }
+      // A lost response is reconciled from the original IDs, without reactivation.
+      expect(() => f.runtime.revokeSet('s', current)).toThrow('input_capture_revision_conflict');
+      for (const binding of [f.binding, card]) expect(f.runtime.inspect('s', binding.id)?.binding.active).toBe(false);
+    }
+  });
+  it('does not partially revoke on a stale revision, missing binding or wrong session', () => {
+    const f = fixture();
+    const card = f.runtime.register('s', { pluginId: 'example', requestId: 'card', providerRef: 'opaque', inputAnchor: 'om_card' });
+    const conditions = [f.binding, card].map(binding => ({ bindingId: binding.id, expectedRevision: 1, expectedInputCount: 0 }));
+    const before = f.store.read();
+    for (const patch of [{ expectedRevision: 2 }, { bindingId: 'a'.repeat(64) }]) {
+      expect(() => f.runtime.revokeSet('s', [conditions[0], { ...conditions[1], ...patch }])).toThrow('revision_conflict');
+      expect(f.store.read()).toEqual(before);
+    }
+    expect(() => f.runtime.revokeSet('other', conditions)).toThrow('revision_conflict');
+    expect(f.store.read()).toEqual(before);
+  });
+  it('keeps unacknowledged inputs and deduplication after batch revocation and restart', async () => {
+    const accepted = new Set<string>();
+    const f = fixture({ deliver: async (_binding, input) => { accepted.add(input.id); throw new Error('lost ack'); } });
+    const card = f.runtime.register('s', { pluginId: 'example', requestId: 'card', providerRef: 'opaque', inputAnchor: 'om_card' });
+    const events = [f.event, { ...f.event, anchor: 'om_card', messageId: 'om_card_reply' }];
+    for (const event of events) f.runtime.capture(event);
+    await f.runtime.drain(); await f.runtime.drain();
+    expect(accepted.size).toBe(2);
+    f.runtime.revokeSet('s', [f.binding, card].map(binding => ({ bindingId: binding.id, expectedRevision: 1, expectedInputCount: 1 })));
+    await f.runtime.stop();
+    expect(f.store.read().inputs.map(input => input.delivery)).toEqual(['pending', 'pending']);
+    const replayed: string[] = [];
+    const resumed = createInputCaptureRuntime({ ...f.options, deliver: async (binding, input) => {
+      expect(binding.active).toBe(false); expect(accepted.has(input.id)).toBe(true); replayed.push(input.id);
+    } });
+    cleanups.push(() => resumed.stop()); await resumed.drain();
+    expect(replayed).toEqual(f.store.read().inputs.map(input => input.id));
+    expect(f.store.read().inputs.map(input => input.delivery)).toEqual(['acknowledged', 'acknowledged']);
+    for (const event of events) expect(resumed.capture(event)).toBe(true);
+    await resumed.drain(); expect(replayed).toHaveLength(2);
+  });
+  it('rejects ambiguous and oversized conditions without changing any binding', () => {
+    const f = fixture();
+    const condition = { bindingId: f.binding.id, expectedRevision: 1, expectedInputCount: 0 };
+    const before = f.store.read();
+    const invalid = [null, {}, [], [condition, condition], Array(33).fill(condition),
+      [null], [[condition]], [{ ...condition, bindingId: [f.binding.id] }],
+      [{ ...condition, bindingId: 123 }], [{ ...condition, bindingId: 'bad' }],
+      ...[0, -1, 1.5, '1', Number.MAX_SAFE_INTEGER + 1].map(expectedRevision => [{ ...condition, expectedRevision }]),
+      ...[-1, 0.5, '0', Number.MAX_SAFE_INTEGER + 1].map(expectedInputCount => [{ ...condition, expectedInputCount }]),
+      [{ ...condition, extra: true }], [{ bindingId: f.binding.id, expectedRevision: 1 }]];
+    for (const value of invalid) {
+      expect(() => f.runtime.revokeSet('s', value)).toThrow('invalid_input_capture_conditions');
+      expect(f.store.read()).toEqual(before);
+    }
+    expect(parseInputCaptureConditions([condition])).toEqual([condition]);
+  });
+  it('parses batch revoke conditions and rejects conflicting CLI flags before contacting the host', () => {
+    const conditions = [{ bindingId: 'a'.repeat(64), expectedRevision: 2, expectedInputCount: 3 }];
+    const args = ['revoke-set', '--bot', 'cli_example', '--session', 's', '--bindings', JSON.stringify(conditions)];
+    const command = parseInputCaptureCommand(args);
+    expect(command.path).toBe('/api/sessions/s/input-capture');
+    expect(JSON.parse(command.init.body)).toEqual({ larkAppId: 'cli_example', operation: 'revoke-set', bindings: conditions });
+    for (const extra of [['--binding', 'a'.repeat(64)], ['--revision', '2'], ['--bindings', '[]']]) {
+      expect(() => parseInputCaptureCommand([...args, ...extra])).toThrow();
+    }
+    for (const value of ['[]', 'not-json', JSON.stringify([{ ...conditions[0], approved: true }])]) {
+      expect(() => parseInputCaptureCommand([...args.slice(0, -1), value])).toThrow();
+    }
   });
   it('parses explicit host identities and rejects missing, duplicate and unsafe flags', () => {
     const command = parseInputCaptureCommand(['register', '--bot', 'cli_example', '--session', 's', '--plugin', 'example', '--request', 'r', '--ref', 'opaque']);

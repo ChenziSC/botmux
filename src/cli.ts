@@ -6708,6 +6708,11 @@ const SEND_HELP_BODY = [
   '       --video-covers <path>           视频封面图片（可重复，按顺序对应 --videos）',
   '       --card-file <path>              直接发送飞书/Lark interactive 卡片 JSON',
   '       --card-json <json>              直接发送飞书/Lark interactive 卡片 JSON 字符串',
+  '       --dry-run                       不发送：把正文按卡片渲染后输出 JSON 与告警，用于发送前自查',
+  '                                      （只渲染正文；不上传图片/附件、不解析 @、不加页脚）',
+  '    图表：正文里的 ```vega-lite 代码块会渲染成飞书原生图表（柱/条/折线/面积/散点/饼）。',
+  '      只接受 data.values 内联数据（≤500 行）；url/transform/expr/params 等会被拒绝。',
+  '      不支持的写法降级为一行说明 + 原始数据表，并在 stderr 给出原因。',
   '       --plugin-card-action <plugin-id>',
   '                                       显式允许该已启用插件声明的 callback action',
   '       --layout result|progress|risk|blocked|handoff',
@@ -8404,9 +8409,13 @@ import {
   appendReplyCardFooterToV2Card,
   buildImageCardElements,
   buildReplyCardFooter,
+  buildCardBodyElements,
+  CARD_LATE_CHROME_RESERVE_BYTES,
   createReplyCard,
+  fitChartsToCardBudget,
   extractFirstReplyCardHeading,
   prepareCardMarkdown,
+  type CardRenderDiagnostic,
   type CardUsageSnapshot,
   type LocalHomeLinkMode,
 } from './im/lark/md-card.js';
@@ -9053,6 +9062,48 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
   return { session, botConfig };
 }
 
+function reportCardRenderDiagnostics(diagnostics: CardRenderDiagnostic[]): void {
+  for (const diagnostic of diagnostics) {
+    const label = diagnostic.title ? `「${diagnostic.title}」` : '';
+    console.error(`botmux send: 图表${label}已降级为数据表（${diagnostic.reason}）`);
+  }
+}
+
+async function sendDryRun(rest: string[]): Promise<void> {
+  if (argValue(rest, '--card-file') !== undefined || argValue(rest, '--card-json') !== undefined) {
+    console.error('botmux send --dry-run 只渲染 markdown 正文，不能与 --card-file/--card-json 混用');
+    process.exit(2);
+  }
+  for (const flag of ['--images', '--files', '--videos', '--voice']) {
+    if (rest.includes(flag)) console.error(`botmux send --dry-run: 已忽略 ${flag}（dry-run 只渲染正文）`);
+  }
+  const contentFile = argValue(rest, '--content-file');
+  let content: string;
+  if (contentFile) {
+    if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
+    content = readFileSync(contentFile, 'utf-8');
+  } else {
+    const pos = positionals(rest, ['--dry-run', '--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash']);
+    content = pos.length > 0 ? pos.join(' ') : await readStdin();
+  }
+  content = extractCardText(stripTrailingOaiMemoryCitation(content));
+  if (!content.trim()) {
+    console.error('botmux send --dry-run: 正文为空');
+    process.exit(2);
+  }
+  const diagnostics: CardRenderDiagnostic[] = [];
+  const configuredLinkMode = process.env.BOTMUX_CARD_LOCAL_LINK_MODE;
+  const localHomeLinkMode: LocalHomeLinkMode = configuredLinkMode === 'disabled'
+    ? 'disabled'
+    : configuredLinkMode === 'lexical' ? 'lexical' : 'filesystem';
+  const card = createReplyCard(buildCardBodyElements(content, process.cwd(), localHomeLinkMode, undefined, diagnostics));
+  // Same sizing as a real send: Feishu request body incl. envelope.
+  const budget = fitChartsToCardBudget(card, { reserveBytes: CARD_LATE_CHROME_RESERVE_BYTES, diagnostics });
+  reportCardRenderDiagnostics(diagnostics);
+  if (!budget.fits) console.error(`botmux send --dry-run: 卡片请求体约 ${budget.bytes} 字节，超过飞书 30KB 上限，发送时可能被拒收`);
+  console.log(JSON.stringify({ dryRun: true, bytes: budget.bytes, fits: budget.fits, diagnostics, card }, null, 2));
+}
+
 async function cmdSend(rest: string[]): Promise<void> {
   // `--help` wins over every other flag and over all content resolution.
   // It must stay the FIRST statement in cmdSend: content resolution below
@@ -9064,6 +9115,12 @@ async function cmdSend(rest: string[]): Promise<void> {
   // success, so this exits 0 rather than falling into the usage error.
   if (rest.includes('--help') || rest.includes('-h')) {
     console.log(SEND_HELP_BODY);
+    return;
+  }
+  // `--dry-run` renders locally and exits before any session, relay or
+  // transport resolution: it must never be able to deliver anything.
+  if (rest.includes('--dry-run')) {
+    await sendDryRun(rest);
     return;
   }
   const ancestorCtx = findAncestorSessionContext();
@@ -11465,9 +11522,11 @@ async function cmdSend(rest: string[]): Promise<void> {
         : configuredLinkMode === 'lexical'
           ? 'lexical'
           : 'filesystem';
+      const renderDiagnostics: CardRenderDiagnostic[] = [];
       const elements = (md || imageKeys.length > 0)
-        ? buildImageCardElements(md, imageKeys, process.cwd(), localHomeLinkMode, imageMode)
+        ? buildImageCardElements(md, imageKeys, process.cwd(), localHomeLinkMode, imageMode, renderDiagnostics)
         : [];
+
 
       // Footer: de-emphasized markdown (v2 dropped the `note` tag). Use small
       // text size + grey font tag so it reads like a footnote below the hr.
@@ -11552,6 +11611,16 @@ async function cmdSend(rest: string[]): Promise<void> {
         canonicalCard.body.elements.splice(footerIndex >= 0 ? footerIndex : canonicalCard.body.elements.length, 0, feedbackElement);
         feedbackBaseCard = canonicalCard as unknown as Record<string, unknown>;
       }
+      // Fit charts to Feishu's 30KB request limit on the fully assembled card;
+      // the reserve covers the on-call button attached below. Degradation never
+      // blocks delivery — the sender learns why on stderr.
+      const budget = fitChartsToCardBudget(canonicalCard, {
+        chatId: targetChatId,
+        reserveBytes: CARD_LATE_CHROME_RESERVE_BYTES,
+        diagnostics: renderDiagnostics,
+      });
+      reportCardRenderDiagnostics(renderDiagnostics);
+      if (!budget.fits) console.error(`botmux send: 卡片请求体约 ${budget.bytes} 字节，超过飞书 30KB 上限，可能被拒收`);
       const replyCardJson = withOncallGroup(JSON.stringify(canonicalCard));
       if (feedbackBaseCard && oncallGroupCard) feedbackBaseCard = oncallGroupCard;
       const replyStore = new TurnReplyCardStore(resolveDataDir());

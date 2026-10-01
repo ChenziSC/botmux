@@ -107,3 +107,20 @@ it('authenticates batch revocation and reports atomic conflicts through the real
   ]);
   expect(f.store.read().inputs).toHaveLength(1);
 });
+
+it.each([
+  'Task /th inspect', 'Task /tw inspect', 'Task /t here inspect',
+  'Task /topic worktree inspect', 'Task /t /repo wt demo feature/fix inspect',
+  'Task /t /repo wt', 'Task /t /model',
+])('leaves titled topic commands and invalid headers with the native router: %s', async text => {
+  const f = setup(); f.runtime.register('s', { pluginId: 'example', requestId: 'r', providerRef: 'opaque', inputAnchor: 'om_card', captureAttachments: true });
+  const event = (messageId: string, messageType: string, content: unknown) => ({ sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+    message: { message_id: messageId, chat_id: 'oc_chat', chat_type: 'group', root_id: 'om_card', message_type: messageType, content: JSON.stringify(content) } });
+  expect(captureInboundText(event('om_text', 'text', { text }), f.runtime, () => false)).toBe(false);
+  expect(captureInboundText(event('om_post', 'post', { content: [[{ tag: 'text', text }, { tag: 'img', image_key: 'img_example' }]] }), f.runtime, () => false)).toBe(false);
+  expect(f.store.read().inputs).toHaveLength(0);
+  expect(captureInboundText(event('om_answer', 'text', { text: 'Inspect only after Review passes' }), f.runtime, () => false)).toBe(true);
+  expect(f.store.read().inputs).toHaveLength(1);
+  expect(f.store.read().inputs[0].text).toBe('Inspect only after Review passes');
+  await f.runtime.drain();
+});

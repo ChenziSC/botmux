@@ -1,6 +1,6 @@
 import { extractAuthoredMessageText, parseEventMessage, resolvePostBody, stripLeadingMentions } from './message-parser.js';
 import { isCallbackUrl } from '../../utils/user-token.js';
-import { isTopicHeader, parseTopicHeaderWithLifecycleAliases } from '../../core/topic-header.js';
+import { parseTopicHeader } from '../../core/topic-header.js';
 import type { InputCaptureRuntime } from '../../core/plugins/input-capture/runtime.js';
 import type { CaptureAttachment } from '../../core/plugins/input-capture/attachments.js';
 
@@ -39,7 +39,7 @@ export function captureInboundText(data: any, runtime: InputCaptureRuntime,
   const text = attachments.length ? extractAuthoredMessageText(message.message_type, message.content, message.mentions) : parsed.content;
   const command = stripLeadingMentions(text.trim(), parsed.mentions).trim();
   if (!command && !attachments.length || command.startsWith('/') || isCallbackUrl(command)
-    || isTopicHeader(parseTopicHeaderWithLifecycleAliases(command))) return false;
+    || parseTopicHeader(command) !== null) return false;
   const anchor = message.root_id || (message.thread_id ? runtime.resolveThreadAnchor({
     messageId: parsed.messageId, chatId: message.chat_id, senderOpenId: parsed.senderId, threadId: message.thread_id,
   }) : message.chat_id);

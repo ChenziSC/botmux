@@ -204,7 +204,7 @@ describe('v3 ephemeral pool', () => {
     const factory = factoryFor(worker);
     const req = request();
     req.botSnapshot.cliId = 'codex';
-    req.botSnapshot.wrapperCli = 'aiden x codex';
+    req.botSnapshot.wrapperCli = 'wrapper codex';
     const pool = createEphemeralPool({
       factory,
       workerPath: '/tmp/worker.js',
@@ -214,7 +214,7 @@ describe('v3 ephemeral pool', () => {
 
     const promise = pool.runNode(req);
     await worker.waitForInit();
-    expect(worker.init?.wrapperCli).toBe('aiden x codex');
+    expect(worker.init?.wrapperCli).toBe('wrapper codex');
     worker.emitExit(0);
     await promise;
   });

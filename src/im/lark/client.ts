@@ -323,7 +323,7 @@ export async function sendMessage(
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendMessage');
   return executeWithLarkGate(larkAppId, 'sendMessage', async () => {
-    await options?.beforeWrite?.();
+    if (options?.beforeWrite) await options.beforeWrite();
     const c = getBotClient(larkAppId);
     const body = msgType === 'text'
       ? JSON.stringify({ text: content })
@@ -389,7 +389,7 @@ export async function replyMessage(
   return executeWithLarkGate(larkAppId, 'replyMessage', async () => {
     await assertMessageWriteAllowed(larkAppId, messageId);
     // The source/authority fence follows the awaited destination lookup.
-    await options?.beforeWrite?.();
+    if (options?.beforeWrite) await options.beforeWrite();
     const c = getBotClient(larkAppId);
     const body = msgType === 'text'
       ? JSON.stringify({ text: content })

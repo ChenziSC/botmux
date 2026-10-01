@@ -70,20 +70,16 @@ afterEach(async () => {
 });
 
 describe('v3WorkerBackendType', () => {
-  it('keeps standalone Bun workers on the disposable tmux pipe backend', () => {
-    expect(v3WorkerBackendType('pty', true)).toBe('tmux');
-    expect(v3WorkerBackendType('mojo', true)).toBe('tmux');
-  });
   it('follows a tmux daemon and keeps PTY for every other backend, never a remote one', () => {
-    expect(v3WorkerBackendType('tmux', false)).toBe('tmux');
+    expect(v3WorkerBackendType('tmux')).toBe('tmux');
     for (const backend of ['pty', 'herdr', 'zellij', 'zmx', 'riff', 'mojo'] as const) {
-      expect(v3WorkerBackendType(backend, false), backend).toBe('pty');
+      expect(v3WorkerBackendType(backend), backend).toBe('pty');
     }
   });
 });
 
 describe('v3 ephemeral pool', () => {
-  it('persists the explicit default instance and replays it into the workflow tmux worker after config changes', async () => {
+  it('persists the explicit default instance and replays it into the selected worker after config changes', async () => {
     const home = join(dir, 'codex-a');
     mkdirSync(home, { mode: 0o700 });
     writeFileSync(join(home, 'config.toml'), 'cli_auth_credentials_store = "file"\n', { mode: 0o600 });
@@ -219,7 +215,7 @@ describe('v3 ephemeral pool', () => {
     await promise;
   });
 
-  it('uses the disposable tmux pipe backend and requests worker cleanup on completion', async () => {
+  it('uses the selected local backend and waits for worker exit after requesting cleanup', async () => {
     const worker = new ScriptedWorker({ autoReadyAfterInit: true });
     const factory = factoryFor(worker);
     const req = request();

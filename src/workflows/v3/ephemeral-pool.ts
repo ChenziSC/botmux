@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import type { WorkerToDaemon } from '../../types.js';
 import type { BackendType } from '../../adapters/backend/types.js';
 import { config } from '../../config.js';
-import { spawnWorker, isStandaloneBinary } from '../../core/self-spawn.js';
+import { spawnWorker } from '../../core/self-spawn.js';
 import {
   expandWorkflowWorkingDir,
   syntheticSessionUuid,
@@ -562,9 +562,8 @@ export const spawnWorkerFactory: WorkerProcessFactory = {
  * test/mojo-wiring.test.ts), and the other multiplexers are not exercised by
  * goal-mode workers.
  */
-export function v3WorkerBackendType(daemonBackend: BackendType = config.daemon.backendType, standalone = isStandaloneBinary()): 'tmux' | 'pty' {
-  // Standalone Bun cannot reliably host node-pty; retain the pipe backend.
-  return standalone || daemonBackend === 'tmux' ? 'tmux' : 'pty';
+export function v3WorkerBackendType(daemonBackend: BackendType = config.daemon.backendType): 'tmux' | 'pty' {
+  return daemonBackend === 'tmux' ? 'tmux' : 'pty';
 }
 
 /**

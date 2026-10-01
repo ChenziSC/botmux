@@ -27830,6 +27830,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         input.content,
         input.sequence,
         input.uuid,
+        input.messageId,
       ),
       patchElement: input => patchCardStreamElement(
         input.larkAppId,
@@ -27838,6 +27839,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         input.partialElement,
         input.sequence,
         input.uuid,
+        input.messageId,
       ),
     },
   );

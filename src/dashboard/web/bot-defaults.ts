@@ -94,6 +94,16 @@ export type BotDefaultsRow = {
   /** Per-bot ask option layout; null means the built-in compact default. */
   askOptionLayout?: AskOptionLayout | null;
   sandbox?: boolean;
+  /** Tri-state sandbox selection ('off' absent historically → derive from sandbox). */
+  sandboxMode?: 'off' | 'oncall' | 'scratch' | null;
+  scratchStorage?: 'tmpfs' | 'disk' | null;
+  /** Whether the tmpfs/disk storage segmented control applies (Linux only;
+   *  macOS scratch is always APFS-clonefile backed). */
+  scratchStorageSelectable?: boolean;
+  scratchTmpfsSizeMb?: number | null;
+  scratchDenyPaths?: string[] | null;
+  /** Whether the scratch mode is available on this platform (Linux only). */
+  scratchSupported?: boolean;
   codexAuthSync?: 'shared' | 'isolated';
   /** Trigger-user CLI auth: null / absent = off (the historical behavior, where
    *  CLI calls use whatever identity is logged in on the machine).

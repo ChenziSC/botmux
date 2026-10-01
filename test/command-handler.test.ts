@@ -1826,6 +1826,16 @@ describe('handleCommand', () => {
       expect(replyMessage).toHaveBeenCalledTimes(2); expect(writes).toEqual(['send']);
       expect(getMessageDetail).not.toHaveBeenCalled();
     });
+    it.each([ROOT_ID, CHAT_ID])('preserves legacy chat fallback for anchor %s', async rootId => {
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+      vi.mocked(replyMessage).mockRejectedValueOnce(new Error('preferred reply failed'));
+      const ds = parent('chat'); ds.session.rootMessageId = rootId;
+      await handleCommand('/forklist', ROOT_ID, makeLarkMessage('/forklist'), makeDeps(ds), LARK_APP_ID);
+      expect(vi.mocked(replyMessage).mock.calls.map(([, id]) => id))
+        .toEqual(rootId === ROOT_ID ? ['msg_001', ROOT_ID] : ['msg_001']);
+      expect(writes).toEqual([rootId === ROOT_ID ? 'reply' : 'send']);
+      expect(getMessageDetail).not.toHaveBeenCalled();
+    });
     it.each(['codex', 'claude-code'] as const)('freezes the %s command source before attachment preparation', async cliId => {
       const ds = parent(); ds.session.cliId = cliId;
       const message = makeLarkMessage('/fork image', { msgType: 'post', threadId: 'omt_parent',

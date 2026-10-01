@@ -6542,7 +6542,7 @@ async function upsertForkPanelCard(
   const cardBody = buildForkPanelCard(children, loc);
   // Legacy may try another reply target or a flat send. Stop keeps the original
   // target and error, including inconclusive provider/network failures.
-  const rootId = (parentDs.session.scope ?? parentDs.scope ?? 'thread') === 'chat'
+  const rootId = parentDs.session.rootMessageId?.startsWith('oc_')
     ? undefined : parentDs.session.rootMessageId;
   const replyTargets: string[] = [];
   if (opts?.preferredReplyToMessageId) replyTargets.push(opts.preferredReplyToMessageId);

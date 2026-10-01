@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
+import { createBinding, updateBinding } from '../src/services/issue-board-store.js';
 
 const APP_ID = 'cli_report_worker';
 const REVIEWER = 'ou_report_reviewer';
@@ -28,6 +29,7 @@ async function runReport(options: {
   unavailableMessage?: string;
   unavailableState?: 'deleted' | 'unknown' | 'missing';
   retryThenWithdraw?: boolean;
+  issueInReview?: boolean;
   recipientRoot?: string;
   source?: Record<string, unknown>;
   current?: Record<string, unknown>;
@@ -70,6 +72,14 @@ async function runReport(options: {
     [current.sessionId]: { ...current, ...options.current },
     ...(options.ambiguous ? { duplicate: { ...source, sessionId: 'duplicate', creatorOpenId: 'ou_other_human' } } : {}),
   });
+  if (options.issueInReview) {
+    // Use an already-settled local issue: the real report path must not call
+    // the platform API just to retry its independent delivery notice.
+    createBinding(data, { anchorId: CHAT, larkAppId: APP_ID, scope: 'chat', issueId: 'fixture-issue',
+      teamId: 'fixture-team', platformBaseUrl: 'https://platform.example.invalid', claimId: 'c'.repeat(32),
+      claimEpoch: 1, chatId: CHAT });
+    updateBinding(data, CHAT, { bindState: 'bound', platformStateRev: 1, lastSyncedStatus: 'in_review' });
+  }
   if (options.peer !== 'missing' && options.peer !== 'global-only') {
     writeFileSync(join(data, `bot-openids-${options.peer === 'other-app' ? 'cli_other' : APP_ID}.json`),
       options.peer === 'malformed' ? 'null' : JSON.stringify({ Reviewer: REVIEWER, CurrentPeer: 'ou_current_peer' }));
@@ -422,5 +432,30 @@ describe('report partial publication receipt', () => {
     expect(result.stderr).toContain('--delivery relay');
     expect(result.outbound).toBeUndefined();
     expect(result.requests).toHaveLength(1);
+  });
+});
+
+
+describe('report issue notice source', () => {
+  it('retains the settled issue receipt but does not publish its notice after source withdrawal', async () => {
+    const result = await runReport({ issueInReview: true, topicPolicy: 'stop', unavailableMessage: THREAD });
+    expect(result.status).toBe(0);
+    expect(result.output).toMatchObject({ success: true, delivery: 'issue-in-review', alreadyInReview: true, reportPostedToChat: false });
+    expect(result.outbound).toBeUndefined(); expect(result.topicReads).toEqual([THREAD]);
+    expect(result.requests).toEqual([]); expect(result.stderr).toContain('TOPIC_SEND_BLOCKED');
+  });
+  it('rechecks the issue notice source before retrying a rate-limited write', async () => {
+    const result = await runReport({ issueInReview: true, topicPolicy: 'stop', unavailableMessage: THREAD, retryThenWithdraw: true });
+    expect(result.status).toBe(0);
+    expect(result.output).toMatchObject({ delivery: 'issue-in-review', alreadyInReview: true, reportPostedToChat: false });
+    expect(result.topicReads).toEqual([THREAD, THREAD]); expect(result.requests).toEqual([]);
+    expect(result.stderr).toContain('TOPIC_SEND_BLOCKED');
+  });
+  it.each(['stop', 'legacy'] as const)('delivers an issue notice under %s without losing its original chat', async topicPolicy => {
+    const result = await runReport({ issueInReview: true, topicPolicy, ...(topicPolicy === 'legacy' ? { unavailableMessage: THREAD } : {}) });
+    expect(result.status).toBe(0);
+    expect(result.output).toMatchObject({ delivery: 'issue-in-review', alreadyInReview: true, reportPostedToChat: true });
+    expect(result.outbound).toMatchObject({ method: 'create', request: { data: { receive_id: CHAT } } });
+    expect(result.topicReads).toEqual(topicPolicy === 'stop' ? [THREAD] : []); expect(result.requests).toEqual([]);
   });
 });

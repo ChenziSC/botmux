@@ -4,12 +4,14 @@ const mocks = vi.hoisted(() => ({
   config: { topicUnavailablePolicy: 'stop' as 'stop' | 'legacy', apiOnly: false },
   request: vi.fn(), create: vi.fn(), reply: vi.fn(), patch: vi.fn(), forward: vi.fn(),
   settings: vi.fn(), content: vi.fn(), element: vi.fn(), convert: vi.fn(), hook: vi.fn(),
+  reaction: vi.fn(), removeReaction: vi.fn(), pin: vi.fn(), unpin: vi.fn(),
 }));
 vi.mock('../src/bot-registry.js', () => ({
   getBot: () => ({ config: mocks.config }), getAllBots: () => [], loadBotConfigs: () => [],
   formatLarkError: (value: unknown) => String(value),
   getBotClient: () => ({ request: mocks.request,
-    im: { v1: { message: { create: mocks.create, reply: mocks.reply, patch: mocks.patch, forward: mocks.forward } } },
+    im: { v1: { message: { create: mocks.create, reply: mocks.reply, patch: mocks.patch, forward: mocks.forward },
+      messageReaction: { create: mocks.reaction, delete: mocks.removeReaction }, pin: { create: mocks.pin, delete: mocks.unpin } } },
     cardkit: { v1: { card: { settings: mocks.settings, idConvert: mocks.convert },
       cardElement: { content: mocks.content, patch: mocks.element } } },
   }),
@@ -17,11 +19,12 @@ vi.mock('../src/bot-registry.js', () => ({
 vi.mock('../src/services/hook-runner.js', () => ({ emitHookEvent: mocks.hook }));
 import { sendMessage, replyMessage, updateMessage, forwardMessage, urgentMessage,
   updateCardStreamingSettings, updateCardStreamElementContent, patchCardStreamElement,
-  resolveCardKitId, MessageWithdrawnError } from '../src/im/lark/client.js';
+  resolveCardKitId, MessageWithdrawnError, addReaction, removeReaction, pinMessage, unpinMessage } from '../src/im/lark/client.js';
 import { assertSendTopicsAvailable, TopicSendError } from '../src/im/lark/topic-send-guard.js';
 import { __testOnly_resetLarkGate } from '../src/im/lark/api-gate.js';
 
 const operations = [
+  ['reaction', () => addReaction('app', 'om_card', 'DONE'), () => mocks.reaction],
   ['reply', () => replyMessage('app', 'om_card', 'answer'), () => mocks.reply],
   ['whole card', () => updateMessage('app', 'om_card', '{}'), () => mocks.patch],
   ['forward', () => forwardMessage('app', 'om_card', 'oc_dest'), () => mocks.forward],
@@ -46,6 +49,10 @@ beforeEach(() => {
     mock.mockReset().mockResolvedValue({ code: 0, data: { message_id: 'om_sent' } });
   }
   mocks.convert.mockReset().mockResolvedValue({ code: 0, data: { card_id: 'card' } });
+  mocks.reaction.mockReset().mockResolvedValue({ code: 0, data: { reaction_id: 'reaction' } });
+  mocks.pin.mockReset().mockResolvedValue({ code: 0, data: { pin: { message_id: 'om_card' } } });
+  mocks.removeReaction.mockReset().mockResolvedValue({ code: 0 });
+  mocks.unpin.mockReset().mockResolvedValue({ code: 0 });
 });
 afterEach(() => { vi.unstubAllEnvs(); __testOnly_resetLarkGate(); });
 
@@ -132,6 +139,36 @@ describe('stop policy at the actual Lark write boundary', () => {
     const error = await replyMessage('app', 'om_card', 'answer').catch(value => value);
     expect(error).toBeInstanceOf(TopicSendError); expect(error).not.toBeInstanceOf(MessageWithdrawnError);
     expect(mocks.create).not.toHaveBeenCalled(); expect(mocks.hook).not.toHaveBeenCalled();
+  });
+  it('does not pin a surviving card beneath an unavailable root', async () => {
+    rootDeleted = true;
+    await expect(pinMessage('app', 'om_card')).resolves.toBeNull();
+    expect(mocks.pin).not.toHaveBeenCalled();
+    mocks.request.mockResolvedValue({ code: 0, data: { items: [] } });
+    await expect(pinMessage('app', 'om_card')).resolves.toBeNull();
+    expect(mocks.pin).not.toHaveBeenCalled();
+  });
+  it('keeps a confirmed pin on an available topic and preserves legacy reads', async () => {
+    await expect(pinMessage('app', 'om_card')).resolves.toMatchObject({ messageId: 'om_card' });
+    expect(mocks.pin).toHaveBeenCalledOnce();
+    mocks.request.mockClear(); mocks.pin.mockClear(); rootDeleted = true;
+    mocks.config.topicUnavailablePolicy = 'legacy';
+    await expect(pinMessage('app', 'om_card')).resolves.toMatchObject({ messageId: 'om_card' });
+    expect(mocks.pin).toHaveBeenCalledOnce(); expect(mocks.request).not.toHaveBeenCalled();
+  });
+  it('keeps cleanup of existing pins and reactions available after root withdrawal', async () => {
+    rootDeleted = true;
+    await expect(unpinMessage('app', 'om_card')).resolves.toBe(true);
+    await expect(removeReaction('app', 'om_card', 'reaction')).resolves.toBeUndefined();
+    expect(mocks.unpin).toHaveBeenCalledOnce(); expect(mocks.removeReaction).toHaveBeenCalledOnce();
+    expect(mocks.request).not.toHaveBeenCalled();
+  });
+  it('rechecks a reaction after rate limiting before adding another provider effect', async () => {
+    mocks.reaction.mockImplementationOnce(async () => {
+      rootDeleted = true; throw { isAxiosError: true, response: { status: 429 } };
+    });
+    await expect(addReaction('app', 'om_card', 'DONE')).rejects.toMatchObject({ code: 'TOPIC_SEND_BLOCKED' });
+    expect(mocks.reaction).toHaveBeenCalledOnce(); expect(mocks.request).toHaveBeenCalledTimes(4);
   });
   it('blocks a Buzz after the original topic becomes unavailable', async () => {
     rootDeleted = true;

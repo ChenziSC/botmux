@@ -13113,6 +13113,29 @@ async function cmdReport(rest: string[]): Promise<void> {
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
   const sessions = loadSessions();
 
+  // Destination overrides cannot erase the original session/turn source.
+  const reportOrigin = reportContext?.sessionId && reportContext.sessionId !== sid
+    ? await requireSessionById(reportContext.sessionId) : s;
+  const reportOriginTurnId = reportContext?.sessionId === reportOrigin.sessionId
+    ? reportContext.turnId : undefined;
+  const reportOriginTurn = pickTurnReplyTarget(reportOrigin, reportOriginTurnId);
+  const reportSourceAppId = reportOrigin.larkAppId!;
+  const reportSource = resolveSendTarget({
+    topLevel: false, chatScope: (reportOrigin.scope ?? 'thread') === 'chat', chatId: reportOrigin.chatId,
+    rootMessageId: reportOrigin.rootMessageId, replyTargetRootId: reportOriginTurn?.rootMessageId,
+    replyTargetTurnId: reportOriginTurn?.turnId,
+    replyTargetQuoteOnly: reportOriginTurn?.quoteOnly, currentTurnId: reportOriginTurnId,
+  });
+  const reportWriteOptions = { beforeWrite: async () => {
+    const { getBot } = await import('./bot-registry.js');
+    const { getMessageDetail } = await import('./im/lark/client.js');
+    await assertSendTopicsAvailable(reportSourceAppId,
+    [reportSource.mode === 'plain' ? undefined : reportSource.rootMessageId],
+    (appId, id) => getMessageDetail(appId, id, { userCardContent: false, timeoutMs: 10000 }),
+    getBot(reportSourceAppId).config.topicUnavailablePolicy);
+  } };
+
+
   const { readPeerCrossRef } = await import('./services/peer-cross-ref-store.js');
   let recipientResolution: ReturnType<typeof resolveReportRecipientForSession>;
   try {
@@ -13189,7 +13212,7 @@ async function cmdReport(rest: string[]): Promise<void> {
               alreadyInReview: result.alreadyInReview,
               ...(url ? { issueUrl: url } : {}),
             }),
-            'interactive',
+            'interactive', undefined, undefined, reportWriteOptions,
           );
           delivered = true;
         } catch (e: any) {
@@ -13319,28 +13342,11 @@ async function cmdReport(rest: string[]): Promise<void> {
     currentTurnId,
   });
 
-  const { registerBot, loadBotConfigs, getBot } = await import('./bot-registry.js');
+  const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
-  const { sendMessage, replyMessage, getMessageDetail } = await import('./im/lark/client.js');
+  const { sendMessage, replyMessage } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
-  // Destination overrides cannot erase the original session/turn source.
-  const reportOrigin = reportContext?.sessionId && reportContext.sessionId !== sid
-    ? await requireSessionById(reportContext.sessionId) : s;
-  const reportOriginTurnId = reportContext?.sessionId === reportOrigin.sessionId
-    ? reportContext.turnId : undefined;
-  const reportOriginTurn = pickTurnReplyTarget(reportOrigin, reportOriginTurnId);
-  const reportSourceAppId = reportOrigin.larkAppId!;
-  const reportSource = resolveSendTarget({
-    topLevel: false, chatScope: (reportOrigin.scope ?? 'thread') === 'chat', chatId: reportOrigin.chatId,
-    rootMessageId: reportOrigin.rootMessageId, replyTargetRootId: reportOriginTurn?.rootMessageId,
-    replyTargetTurnId: reportOriginTurn?.turnId,
-    replyTargetQuoteOnly: reportOriginTurn?.quoteOnly, currentTurnId: reportOriginTurnId,
-  });
-  const reportWriteOptions = { beforeWrite: () => assertSendTopicsAvailable(reportSourceAppId,
-    [reportSource.mode === 'plain' ? undefined : reportSource.rootMessageId],
-    (appId, id) => getMessageDetail(appId, id, { userCardContent: false, timeoutMs: 10000 }),
-    getBot(reportSourceAppId).config.topicUnavailablePolicy) };
 
   const paras = buildReportContent({ orchOpenId: reportRecipient, content });
   const postJson = JSON.stringify({ zh_cn: { title: '', content: paras } });

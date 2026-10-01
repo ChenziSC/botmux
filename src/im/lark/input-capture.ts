@@ -12,7 +12,8 @@ export function captureInboundText(data: any, runtime: InputCaptureRuntime,
   const message = data?.message;
   if (data?.sender?.sender_type !== 'user' || !message || !['text', 'post', 'image', 'file', 'audio', 'media', 'merge_forward'].includes(message.message_type)
     || (message.root_id && !/^om_[A-Za-z0-9_-]+$/.test(message.root_id))
-    || (message.thread_id && !message.root_id)) return false;
+    || (message.thread_id && !/^omt_[A-Za-z0-9_-]{1,196}$/.test(message.thread_id))
+    || message.root_id && message.root_id === message.message_id) return false;
   const { parsed, resources } = parseEventMessage(data);
   if (parsed.senderType === 'app' || parsed.senderType === 'bot'
     || !parsed.senderId || knownBot(parsed.senderId)) return false;
@@ -39,7 +40,11 @@ export function captureInboundText(data: any, runtime: InputCaptureRuntime,
   const command = stripLeadingMentions(text.trim(), parsed.mentions).trim();
   if (!command && !attachments.length || command.startsWith('/') || isCallbackUrl(command)
     || isTopicHeader(parseTopicHeaderWithLifecycleAliases(command))) return false;
+  const anchor = message.root_id || (message.thread_id ? runtime.resolveThreadAnchor({
+    messageId: parsed.messageId, chatId: message.chat_id, senderOpenId: parsed.senderId, threadId: message.thread_id,
+  }) : message.chat_id);
+  if (!anchor) return false;
   return runtime.capture({ messageId: parsed.messageId, chatId: message.chat_id,
-    anchor: message.root_id || message.chat_id, senderOpenId: parsed.senderId,
+    anchor, senderOpenId: parsed.senderId, ...(message.thread_id ? { threadId: message.thread_id } : {}),
     memberUnionId: parsed.senderUnionId, text, ...(attachments.length ? { attachments } : {}), botSender: false });
 }

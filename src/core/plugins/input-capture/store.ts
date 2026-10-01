@@ -10,15 +10,17 @@ export interface InputBinding {
   chatId: string; anchor: string; sourceAnchor: string; ownerOpenId: string; pluginId: string;
   requestId: string; providerRef: string; createdAt: string;
   captureAttachments?: boolean;
+  inputThreadId?: string;
 }
 export interface CapturedInput {
   id: string; bindingId: string; sequence: number; messageId: string;
   senderOpenId: string; text: string; receivedAt: string;
   attachments?: CaptureAttachment[];
+  threadId?: string;
   delivery: 'pending' | 'acknowledged'; acknowledgedAt?: string;
 }
 export interface CaptureJournal {
-  schemaVersion: 1 | 2; larkAppId: string; bindings: InputBinding[]; inputs: CapturedInput[];
+  schemaVersion: 1 | 2 | 3; larkAppId: string; bindings: InputBinding[]; inputs: CapturedInput[];
 }
 export const captureDigest = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
@@ -30,7 +32,7 @@ export function createInputCaptureStore(dataDir: string, larkAppId: string) {
   const read = (): CaptureJournal => {
     if (!existsSync(file)) return empty();
     const state: CaptureJournal = JSON.parse(readFileSync(file, 'utf8'));
-    if (![1, 2].includes(state.schemaVersion) || state.larkAppId !== larkAppId
+    if (![1, 2, 3].includes(state.schemaVersion) || state.larkAppId !== larkAppId
       || !Array.isArray(state.bindings) || !Array.isArray(state.inputs)) throw new Error('input_capture_journal_invalid');
     const ids = new Set<string>();
     for (const b of state.bindings) {
@@ -39,7 +41,10 @@ export function createInputCaptureStore(dataDir: string, larkAppId: string) {
         || !b.sessionId || !b.chatId || !b.anchor || !b.sourceAnchor || !b.ownerOpenId || !b.pluginId || !b.requestId
         || typeof b.providerRef !== 'string'
         || b.captureAttachments !== undefined && typeof b.captureAttachments !== 'boolean'
-        || b.captureAttachments === true && state.schemaVersion !== 2) throw new Error('input_capture_journal_invalid');
+        || b.captureAttachments === true && state.schemaVersion < 2
+        || b.inputThreadId !== undefined && (typeof b.inputThreadId !== 'string'
+          || !/^omt_[A-Za-z0-9_-]{1,196}$/.test(b.inputThreadId) || !/^om_[A-Za-z0-9_-]+$/.test(b.anchor)
+          || state.schemaVersion !== 3)) throw new Error('input_capture_journal_invalid');
       ids.add(b.id);
     }
     const events = new Set<string>(); const sequences = new Map<string, number>();
@@ -50,9 +55,25 @@ export function createInputCaptureStore(dataDir: string, larkAppId: string) {
         || !['pending', 'acknowledged'].includes(input.delivery)) throw new Error('input_capture_journal_invalid');
       events.add(input.id); sequences.set(input.bindingId, sequence);
       const attachments = parseCaptureAttachments(input.attachments);
+      const binding = state.bindings.find(b => b.id === input.bindingId)!;
+      if (input.threadId !== undefined && (typeof input.threadId !== 'string'
+        || !/^omt_[A-Za-z0-9_-]{1,196}$/.test(input.threadId) || !/^om_[A-Za-z0-9_-]+$/.test(binding.anchor)
+        || state.schemaVersion !== 3 || binding.inputThreadId && binding.inputThreadId !== input.threadId)) {
+        throw new Error('input_capture_journal_invalid');
+      }
       if (attachments.length && state.bindings.find(b => b.id === input.bindingId)?.captureAttachments !== true) {
         throw new Error('input_capture_journal_invalid');
       }
+    }
+    const aliases = new Set<string>();
+    for (const binding of state.bindings) {
+      const threads = new Set([binding.inputThreadId, ...state.inputs.filter(i => i.bindingId === binding.id).map(i => i.threadId)]
+        .filter((id): id is string => id !== undefined));
+      if (threads.size > 1) throw new Error('input_capture_journal_invalid');
+      if (!binding.active || !threads.size) continue;
+      const alias = JSON.stringify([binding.chatId, binding.ownerOpenId, [...threads][0]]);
+      if (aliases.has(alias)) throw new Error('input_capture_journal_invalid');
+      aliases.add(alias);
     }
     return state;
   };

@@ -131,3 +131,86 @@ it('requires an explicit boolean flag and preserves the old CLI request shape wh
   }
   for (const value of ['1', 'yes', '']) expect(() => parseInputCaptureCommand([...args, '--capture-attachments', value])).toThrow();
 });
+
+
+it('recovers a missing root from durable native-thread evidence after restart', async () => {
+  const f = fixture();
+  expect(f.capture(f.raw('om_first', 'text', { text: 'inspect' }, { thread_id: 'omt_native' }))).toBe(true);
+  expect(f.store.read().schemaVersion).toBe(3);
+  await f.runtime.stop();
+  const resumed = createInputCaptureRuntime(f.options); cleanups.push(() => resumed.stop());
+  const raw = f.raw('om_second', 'image', { image_key: 'img_original' }, { root_id: undefined, thread_id: 'omt_native' });
+  expect(captureInboundText(raw, resumed, () => false)).toBe(true);
+  const input = f.store.read().inputs[1];
+  expect(input).toMatchObject({ messageId: 'om_second', threadId: 'omt_native', bindingId: f.binding.id, text: '', delivery: 'pending' });
+  expect(input.attachments).toEqual([{ messageId: 'om_second', type: 'image', key: 'img_original' }]);
+  resumed.revoke('s', f.binding.id, 1);
+  expect(captureInboundText(raw, resumed, () => false)).toBe(true);
+  expect(f.store.read().inputs).toHaveLength(2);
+  expect(captureInboundText({ ...raw, message: { ...raw.message, message_id: 'om_late' } }, resumed, () => false)).toBe(false);
+});
+
+it('accepts a fixed host-verified thread binding and preserves immutable registration', () => {
+  const f = fixture(); f.runtime.revoke('s', f.binding.id, 1);
+  const request = { ...f.registration, requestId: 'verified', inputThreadId: 'omt_native' };
+  const binding = f.runtime.register('s', request);
+  expect(f.capture(f.raw('om_reply', 'text', { text: 'inspect' }, { root_id: undefined, thread_id: 'omt_native' }))).toBe(true);
+  expect(f.store.read().inputs[0].bindingId).toBe(binding.id);
+  expect(f.runtime.register('s', request)).toEqual(binding);
+  expect(() => f.runtime.register('s', { ...request, inputThreadId: 'omt_other' })).toThrow('identity_conflict');
+  expect(() => f.runtime.register('s', { ...request, requestId: 'other', inputAnchor: 'om_other' })).toThrow('anchor_conflict');
+  const args = ['register', '--bot', 'cli_example', '--session', 's', '--plugin', 'example', '--request', 'r', '--ref', 'opaque', '--input-thread-id', 'omt_native'];
+  expect(JSON.parse(parseInputCaptureCommand(args).init.body).inputThreadId).toBe('omt_native');
+  expect(() => parseInputCaptureCommand([...args.slice(0, -1), 'om_not_thread'])).toThrow('Invalid input thread id');
+});
+
+it('does not guess unknown roots or override explicit roots, native seeds, commands and actors', () => {
+  const f = fixture(); f.capture(f.raw('om_first', 'text', { text: 'inspect' }, { thread_id: 'omt_native' }));
+  for (const patch of [{ thread_id: 'omt_unknown' }, { chat_id: 'oc_other' }, { root_id: 'om_other' }, { message_id: 'om_root' }]) {
+    expect(f.capture(f.raw('om_unknown', 'text', { text: 'inspect' }, { root_id: undefined, thread_id: 'omt_native', ...patch }))).toBe(false);
+  }
+  const raw = f.raw('om_other', 'text', { text: 'inspect' }, { root_id: undefined, thread_id: 'omt_native' });
+  expect(captureInboundText(raw, f.runtime, () => true)).toBe(false);
+  expect(f.capture({ ...raw, sender: { sender_id: { open_id: 'ou_other' }, sender_type: 'user' } })).toBe(false);
+  expect(f.capture(f.raw('om_command', 'text', { text: '/stop' }, { root_id: undefined, thread_id: 'omt_native' }))).toBe(false);
+  expect(f.store.read().inputs).toHaveLength(1);
+  f.session.active = false;
+  expect(() => f.capture(raw)).toThrow('authority_changed');
+});
+
+it('rejects conflicting native identities and keeps v3 when later attachment bindings register', () => {
+  const f = fixture(); f.capture(f.raw('om_first', 'text', { text: 'inspect' }, { thread_id: 'omt_native' }));
+  const before = f.store.read();
+  expect(() => f.capture(f.raw('om_second', 'text', { text: 'inspect' }, { thread_id: 'omt_other' }))).toThrow('anchor_conflict');
+  expect(() => f.capture(f.raw('om_first', 'text', { text: 'inspect' }, { root_id: undefined, thread_id: 'omt_other' }))).toThrow('message_conflict');
+  expect(f.store.read()).toEqual(before);
+  f.runtime.register('s', { ...f.registration, requestId: 'card', inputAnchor: 'om_card' });
+  expect(f.store.read().schemaVersion).toBe(3);
+  expect(() => f.capture(f.raw('om_card_reply', 'text', { text: 'inspect' }, { root_id: 'om_card', thread_id: 'omt_native' }))).toThrow('anchor_conflict');
+});
+
+it('does not acknowledge recovered input after a persistence failure', () => {
+  const f = fixture(); f.capture(f.raw('om_first', 'text', { text: 'inspect' }, { thread_id: 'omt_native' }));
+  f.store.transact = () => { throw new Error('disk unavailable'); };
+  expect(() => f.capture(f.raw('om_second', 'text', { text: 'inspect' }, { root_id: undefined, thread_id: 'omt_native' }))).toThrow('disk unavailable');
+  expect(f.store.read().inputs).toHaveLength(1);
+});
+
+it('deduplicates older inputs using later native evidence without rewriting their original bytes', () => {
+  const f = fixture();
+  expect(f.capture(f.raw('om_old', 'text', { text: 'original words' }))).toBe(true);
+  const before = f.store.read().inputs[0];
+  expect(f.capture(f.raw('om_evidence', 'text', { text: 'later words' }, { thread_id: 'omt_original' }))).toBe(true);
+  expect(f.capture(f.raw('om_old', 'text', { text: 'original words' }, { root_id: undefined, thread_id: 'omt_original' }))).toBe(true);
+  expect(f.store.read().inputs[0]).toEqual(before);
+  expect(() => f.capture(f.raw('om_old', 'text', { text: 'original words' }, { thread_id: 'omt_other' }))).toThrow('message_conflict');
+  expect(f.capture(f.raw('om_root', 'text', { text: 'original root' }, { thread_id: 'omt_original' }))).toBe(false);
+  expect(f.store.read().inputs).toHaveLength(2);
+});
+
+it('rejects a journal with contradictory native aliases before resolving a route', () => {
+  const f = fixture();
+  expect(f.capture(f.raw('om_one', 'text', { text: 'one' }, { thread_id: 'omt_original' }))).toBe(true);
+  f.store.transact(state => { state.inputs.push({ ...state.inputs[0], id: 'another', sequence: 2, messageId: 'om_two', threadId: 'omt_other' }); });
+  expect(() => f.runtime.resolveThreadAnchor({ messageId: 'om_reply', chatId: 'oc_chat', senderOpenId: 'ou_owner', threadId: 'omt_original' })).toThrow('journal_invalid');
+});

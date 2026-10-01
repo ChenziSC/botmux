@@ -20,6 +20,61 @@ function fixture(overrides: Partial<InputCaptureOptions> = {}) {
   const event = { messageId: 'om_reply', chatId: 'oc_chat', anchor: 'om_root', senderOpenId: 'ou_owner', text: 'continue only the first step', botSender: false };
   return { runtime, binding, event, options, store, session };
 }
+
+it('pages full source bytes at a fixed upper sequence across restart and rejects closing over new input', async () => {
+  const f = fixture();
+  for (let i = 0; i < 12; i++) f.runtime.capture({ ...f.event, messageId: `om_long${i}`, text: 'x'.repeat(64 * 1024) });
+  await f.runtime.drain();
+  const original = f.runtime.inspect('s', f.binding.id)!;
+  expect(Buffer.byteLength(JSON.stringify(original))).toBeGreaterThan(512 * 1024);
+  expect(Object.keys(original)).toEqual(['binding', 'inputs']);
+  const first = f.runtime.inspect('s', f.binding.id, { after: 0 })!;
+  expect(first.throughSequence).toBe(12); expect(first.inputs).toHaveLength(1);
+  f.runtime.capture({ ...f.event, messageId: 'om_later', text: 'do not close yet' });
+  await f.runtime.stop();
+  const resumed = createInputCaptureRuntime(f.options); cleanups.push(() => resumed.stop());
+  let page = first;
+  const inputs = [...page.inputs];
+  while (page.nextSequence !== null) {
+    page = resumed.inspect('s', f.binding.id, { after: page.nextSequence, through: first.throughSequence })!;
+    expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThan(128 * 1024);
+    expect(page.throughSequence).toBe(12); inputs.push(...page.inputs);
+  }
+  expect(inputs).toEqual(original.inputs);
+  expect(() => resumed.revokeSet('s', [{ bindingId: f.binding.id, expectedRevision: 1, expectedInputCount: inputs.length }])).toThrow('inputs_conflict');
+  expect(resumed.inspect('s', f.binding.id)!.binding.active).toBe(true);
+  expect(resumed.inspect('s', f.binding.id)!.inputs).toHaveLength(13);
+});
+
+it('bounds short pages by count and returns a complete single input when JSON escaping exceeds the byte budget', async () => {
+  const f = fixture();
+  for (let i = 0; i < 66; i++) f.runtime.capture({ ...f.event, messageId: `om_short${i}` });
+  const first = f.runtime.inspect('s', f.binding.id, { after: 0 })!;
+  expect(first.inputs).toHaveLength(64); expect(first.nextSequence).toBe(64); expect(first.throughSequence).toBe(66);
+  const text = 'x' + '\u0001'.repeat(64 * 1024 - 1);
+  f.runtime.capture({ ...f.event, messageId: 'om_escaped', text });
+  const tail = f.runtime.inspect('s', f.binding.id, { after: 66 })!;
+  expect(tail.inputs[0].text).toBe(text); expect(tail.nextSequence).toBeNull();
+  expect(Buffer.byteLength(JSON.stringify(tail))).toBeGreaterThan(256 * 1024);
+  expect(Buffer.byteLength(JSON.stringify(tail))).toBeLessThan(512 * 1024);
+  expect(f.runtime.inspect('s', f.binding.id, { after: 0, through: 0 })).toMatchObject({ inputs: [], throughSequence: 0, nextSequence: null });
+  expect(f.runtime.inspect('other', f.binding.id, { after: 0 })).toBeUndefined();
+  for (const page of [{ after: -1 }, { after: 0.5 }, { after: '0' }, { after: null }, { through: 1 },
+    { after: 0, through: 68 }, { after: 2, through: 1 }, { after: 0, through: null }]) {
+    expect(() => f.runtime.inspect('s', f.binding.id, page)).toThrow('invalid_input_capture_page');
+  }
+  await f.runtime.drain();
+});
+
+it('validates optional inspect page flags without changing the legacy command', () => {
+  const args = ['inspect', '--bot', 'cli_example', '--session', 's', '--binding', 'a'.repeat(64)];
+  expect(JSON.parse(parseInputCaptureCommand(args).init.body)).not.toHaveProperty('after');
+  expect(JSON.parse(parseInputCaptureCommand([...args, '--after', '0', '--through', '0']).init.body)).toMatchObject({ after: 0, through: 0 });
+  for (const extra of [['--through', '1'], ['--after', '-1'], ['--after', '01'], ['--after', '1.5'],
+    ['--after', '9007199254740992'], ['--after', '2', '--through', '1'], ['--after', '0', '--after', '1']]) {
+    expect(() => parseInputCaptureCommand([...args, ...extra])).toThrow();
+  }
+});
 describe('exact plugin input capture', () => {
   it('commits before acknowledging and preserves the original input across outage and restart', async () => {
     const f = fixture(); expect(f.runtime.capture(f.event)).toBe(true); await f.runtime.drain(); await f.runtime.stop();

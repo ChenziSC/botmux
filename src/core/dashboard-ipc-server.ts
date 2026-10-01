@@ -1294,7 +1294,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/input-capture', async (req, res, para
     if (body.operation === 'register') result = runtime.register(params.sessionId, body);
     else if (body.operation === 'revoke-set') result = runtime.revokeSet(params.sessionId, body.bindings);
     else if (typeof body.bindingId === 'string' && /^[a-f0-9]{64}$/.test(body.bindingId)) {
-      if (body.operation === 'inspect') result = runtime.inspect(params.sessionId, body.bindingId);
+      if (body.operation === 'inspect') result = runtime.inspect(params.sessionId, body.bindingId, { after: body.after, through: body.through });
       else if (body.operation === 'revoke' && Number.isSafeInteger(body.expectedRevision) && Number(body.expectedRevision) > 0) {
         result = runtime.revoke(params.sessionId, body.bindingId, Number(body.expectedRevision));
       } else return jsonRes(res, 400, { ok: false, error: 'invalid_input_capture_operation' });
@@ -1303,7 +1303,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/input-capture', async (req, res, para
   } catch (error) {
     const message = error instanceof Error ? error.message : '';
     const conflict = /^input_capture_(?:identity|anchor|revision|inputs)_conflict$/.test(message);
-    const invalid = message === 'invalid_input_capture_conditions';
+    const invalid = ['invalid_input_capture_conditions', 'invalid_input_capture_page'].includes(message);
     return jsonRes(res, invalid ? 400 : conflict ? 409 : 503, { ok: false, error: invalid || conflict ? message : 'input_capture_unavailable' });
   }
 });

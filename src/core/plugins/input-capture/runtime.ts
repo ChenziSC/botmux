@@ -95,10 +95,27 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
         state.bindings.push(binding); return binding;
       });
     },
-    inspect(sessionId: string, bindingId: string) {
+    inspect(sessionId: string, bindingId: string, page: { after?: unknown; through?: unknown } = {}) {
       const state = store.read(); const binding = state.bindings.find(b => b.id === bindingId && b.sessionId === sessionId);
       if (!binding) return undefined;
-      return { binding, inputs: state.inputs.filter(row => row.bindingId === bindingId) };
+      const inputs = state.inputs.filter(row => row.bindingId === bindingId);
+      // Preserve the original unpaged response for existing host integrations.
+      if (page.after === undefined && page.through === undefined) return { binding, inputs };
+      const after = page.after, through = page.through === undefined ? inputs.length : page.through;
+      if (typeof after !== 'number' || !Number.isSafeInteger(after) || after < 0
+        || typeof through !== 'number' || !Number.isSafeInteger(through) || through < after || through > inputs.length) {
+        throw new Error('invalid_input_capture_page');
+      }
+      const selected: CapturedInput[] = []; let bytes = 2;
+      for (let index = after; index < through && selected.length < 64; index++) {
+        const input = inputs[index], size = Buffer.byteLength(JSON.stringify(input)) + 1;
+        // One accepted input may exceed the page budget after JSON escaping;
+        // retain it in full rather than returning an empty non-progressing page.
+        if (selected.length && bytes + size > 128 * 1024) break;
+        selected.push(input); bytes += size;
+      }
+      const last = selected.at(-1)?.sequence ?? after;
+      return { binding, inputs: selected, throughSequence: through, nextSequence: last < through ? last : null };
     },
     revoke(sessionId: string, bindingId: string, expectedRevision: number) {
       return store.transact(state => {

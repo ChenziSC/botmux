@@ -56,3 +56,12 @@ botmux input-capture revoke-set --bot <app> --session <session> --bindings '<con
 恢复仍为 ACK 前的同步路径，不等待网络查询。它不覆盖未知映射，不将原生话题根消息本身当作回复，不覆盖矛盾的显式 root_id，不跳过命令、机器人、群/答复者、关闭会话与当前权限检查。历史已接收消息沿原绑定去重；新的撤销后输入不能重新激活绑定。
 
 首次保存映射或原始 threadId 时，日志升级为 schemaVersion 3；附件 v2 和纯文字 v1 历史仍可读。旧 writer 必须拒绝 v3，后续附件注册也不能将日志降回 v2。HTTP/插件事件仍为 v1，可选的 input.threadId 是来源证据，不是业务批准。消费者如需用它读取缺 root_id 的材料，必须完整保存并核对该字段；平台接入及旧单写者迁移仍是独立门禁。
+
+
+## 长输入历史分页
+
+`input-capture inspect --bot <app> --session <session> --binding <id> --after 0` 返回第一批完整输入，附加 `throughSequence` 和 `nextSequence`。后续请求传 `--after <nextSequence> --through <首次 throughSequence>`，直到 `nextSequence:null`。首次上界为读取时已接收数量；其后新输入不进入这个固定前缀。`through` 必须与 `after` 一起提供，且满足非负安全整数和 `after ≤ through ≤ 当前数量`，否则 HTTP 400。
+
+每页最多 64 条，按完整输入 JSON 的实际字节数控制约 128 KiB；单条可能因转义超出该预算，仍完整返回且游标前进。消费者应支持 512 KiB 响应以容纳一条合法最大正文及附件引用，不无限提高整段历史的响应上限。空前缀/末页返回空数组和 null；不截断内容，不消费数据，不升级日志 schema。
+
+消费者逐页核对同一个 binding 身份、revision/active、固定 throughSequence、连续序号和游标，汇总到完整 snapshot。分页期间绑定生命周期变化须重读；输入追加可保留原前缀，但稍后 `revoke-set expectedInputCount` 必须拒绝变化后的总数。pending 和 acknowledged 都在前缀内。未传分页参数时维持旧 `{binding,inputs}` 格式；新集成要求显式分页回执，不能把旧宿主忽略参数的响应当作已经完整分页。

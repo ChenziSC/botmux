@@ -19,6 +19,29 @@ function setup() {
     pluginEnabled: id => id === 'example', canTalk: () => true, deliver: async () => { throw new Error('offline'); } });
   cleanup.push(() => runtime.stop()); return { runtime, store };
 }
+it('authenticates and validates paged inspect through the production CLI and IPC route', async () => {
+  const f = setup(); setInputCaptureRuntime('cli_capture', f.runtime); setLarkAppId('cli_capture'); setIpcAuthSecret('capture-test-secret');
+  const server = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true }); cleanup.push(() => server.close());
+  const binding = f.runtime.register('s', { pluginId: 'example', requestId: 'page', providerRef: 'opaque' });
+  for (let i = 0; i < 3; i++) f.runtime.capture({ messageId: `om_page${i}`, chatId: 'oc_chat', anchor: 'oc_chat',
+    senderOpenId: 'ou_owner', text: 'x'.repeat(64 * 1024), botSender: false });
+  const args = ['inspect', '--bot', 'cli_capture', '--session', 's', '--binding', binding.id];
+  const first = parseInputCaptureCommand([...args, '--after', '0']);
+  expect((await fetch(`http://127.0.0.1:${server.port}${first.path}`, first.init)).status).toBe(401);
+  const response = await fetchDaemonIpc(server.port, first.path, first.init, 'capture-test-secret');
+  expect(response.status).toBe(200);
+  const page = (await response.json()).result;
+  expect(page).toMatchObject({ throughSequence: 3, nextSequence: 1 }); expect(page.inputs).toHaveLength(1);
+  const next = parseInputCaptureCommand([...args, '--after', '1', '--through', '3']);
+  const nextPage = (await (await fetchDaemonIpc(server.port, next.path, next.init, 'capture-test-secret')).json()).result;
+  expect(nextPage.inputs[0].sequence).toBe(2); expect(nextPage.throughSequence).toBe(3);
+  for (const patch of [{ after: '0' }, { after: -1 }, { after: 0, through: 4 }, { after: 0, through: null }]) {
+    const invalid = await fetchDaemonIpc(server.port, first.path, { ...first.init,
+      body: JSON.stringify({ larkAppId: 'cli_capture', operation: 'inspect', bindingId: binding.id, ...patch }) }, 'capture-test-secret');
+    expect(invalid.status).toBe(400); expect((await invalid.json()).error).toBe('invalid_input_capture_page');
+  }
+  expect(f.store.read().inputs).toHaveLength(3);
+});
 it('requires real host HMAC before register and keeps query / revoke bound to the source session', async () => {
   const f = setup(); setInputCaptureRuntime('cli_capture', f.runtime); setLarkAppId('cli_capture'); setIpcAuthSecret('capture-test-secret');
   const server = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true }); cleanup.push(() => server.close());

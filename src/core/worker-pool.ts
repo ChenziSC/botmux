@@ -4983,6 +4983,8 @@ export function killWorker(
   restartCoordinator.cancelSession(ds.session.sessionId);
   clearUsageLimitState(ds);
   ds.workerReady = false;
+  // The CLI process dies with this worker — no prompt is ready any more.
+  ds.cliReady = false;
   clearUsageRefreshTimer(ds);
   ds.localProcessAttestation = undefined;
   // A managed-turn capability belongs to one concrete worker generation.
@@ -5065,6 +5067,8 @@ export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void
   restartCoordinator.cancelSession(ds.session.sessionId);
   clearUsageLimitState(ds);
   ds.workerReady = false;
+  // SIGTERM below makes the worker killCli() — the CLI prompt is gone.
+  ds.cliReady = false;
   clearUsageRefreshTimer(ds);
   ds.localProcessAttestation = undefined;
   ds.managedTurnOrigin = undefined;
@@ -5091,6 +5095,9 @@ function clearTransferWorkerState(
   restartCoordinator.cancelSession(ds.session.sessionId);
   clearUsageLimitState(ds);
   ds.workerReady = false;
+  // The transfer detaches this worker/CLI pair; the replacement must re-prove
+  // readiness with its own prompt_ready.
+  ds.cliReady = false;
   ds.localProcessAttestation = undefined;
   ds.managedTurnOrigin = undefined;
   invalidateStuckWarning(ds, reason);
@@ -5449,6 +5456,8 @@ export function requestSessionRestart(
   return restartCoordinator.request(ds.session.sessionId, observer, attemptId => {
     if (ds.worker && !ds.worker.killed) {
       ds.workerReady = false;
+      // In-worker respawn: the next prompt belongs to a NEW CLI generation.
+      ds.cliReady = false;
       ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds) } as DaemonToWorker);
       return;
     }
@@ -7032,6 +7041,8 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   }
   if (!ds.worker || ds.worker.killed) {
     ds.workerReady = false;
+    // No live worker ⟹ no live CLI prompt; converge the flag with reality.
+    ds.cliReady = false;
     // There is no live generation that can still own this capability.
     ds.managedTurnOrigin = undefined;
     invalidateTuiPrompt(ds, 'suspendWorker:no_worker');
@@ -7050,6 +7061,8 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
 
   ds.worker = null;
   ds.workerReady = false;
+  // The CLI is destroyed by the suspend; the cold resume brings a new one.
+  ds.cliReady = false;
   ds.localProcessAttestation = undefined;
   ds.workerPort = null;
   ds.workerToken = null;
@@ -12530,6 +12543,11 @@ export function forkWorker(
   replyCardModeFor(ds, initMsg.turnId);
   setupWorkerHandlers(ds, worker, startupState, workerGeneration, stderrRing);
 
+  // A spawn starts a NEW CLI generation: whatever readiness the replaced
+  // generation had (double-fork guard above, or a cold resume) does not carry
+  // over. Placed at the single unconditional handoff so every forkWorker path —
+  // refork, restore, cold resume, queued activation — clears it exactly once.
+  ds.cliReady = false;
   ds.worker = worker;
   initializeWorkerIpcBootstrap(worker);
   rememberScheduledTurnCaller(ds, initAttributionTurnId, initTrustedCaller);
@@ -13701,6 +13719,12 @@ function setupWorkerHandlers(
 
       case 'prompt_ready': {
         if (ds.worker !== worker) break;
+        // The ONLY set point for the in-memory readiness flag (design
+        // 2026-09-11-command-router §5). The generation counter is monotonic —
+        // clears below never touch it — so a cascade sequencer can capture it
+        // and wait for the NEXT set instead of trusting a stale `true`.
+        ds.cliReady = true;
+        ds.cliReadyGeneration = (ds.cliReadyGeneration ?? 0) + 1;
         logger.info(`[${t}] ${sessionCliDisplayName(ds, botCfg)} is ready for input`);
         // A live prompt means a (re)spawn reached a working CLI — clear the lazy
         // cold-resume marker set when we parked a crash diagnostic shell. The
@@ -14783,6 +14807,11 @@ function setupWorkerHandlers(
         // reuse its stale generation proof before the replacement reports one.
         ds.taskContinuationRpcProof = undefined;
         ds.activeInteractiveTurn = undefined;
+        // The CLI process is gone. Clear readiness up front so EVERY branch
+        // below (park diagnostic / auto-restart / crash-loop give-up / plain
+        // exit) is covered — a later prompt_ready can only come from the next
+        // generation. The monotonic counter is deliberately left untouched.
+        ds.cliReady = false;
         // The live-send capability dies with this backend. Preserve the
         // worker-generation policy capability only while this local worker is
         // still eligible for same-worker crash recovery. Branches that cannot
@@ -16361,6 +16390,8 @@ function setupWorkerHandlers(
       }
       ds.worker = null;
       ds.workerReady = false;
+      // The worker process died; its CLI died with it.
+      ds.cliReady = false;
       ds.workerPort = null;
       // A dead worker can no longer refresh its card/usage view.
       clearUsageRefreshTimer(ds);
@@ -17664,6 +17695,8 @@ export function forkAdoptWorker(
   if (!canForkRegisteredSession(ds)) return 'rejected';
   ds.workerReady = false;
   ds.taskContinuationRpcProof = undefined;
+  // Same spawn rule as forkWorker: the adopt bridge is a new CLI generation.
+  ds.cliReady = false;
   const cb = requireCallbacks();
   const t = tag(ds);
   const adopted = ds.adoptedFrom;

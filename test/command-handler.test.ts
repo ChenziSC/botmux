@@ -583,7 +583,7 @@ vi.mock('../src/im/lark/cot-message.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, cliHasNoRawPassthroughSurface, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, parseTopicHeader, isTopicHeader, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, cliHasNoRawPassthroughSurface, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
 import { setChatStreamingCardPin } from '../src/services/pin-streaming-card-mode-store.js';
 import { setCotMode } from '../src/services/cot-mode-store.js';
@@ -1691,75 +1691,6 @@ describe('parseSlashCommandInvocation', () => {
 
   it('ignores non-command text', () => {
     expect(parseSlashCommandInvocation('请解释 /adopt 怎么设计')).toBeNull();
-  });
-});
-
-describe('parseTopicHeader（取代 parseForceTopicInvocation 的路由元命令判定）', () => {
-  /** 只关心「是不是 force-topic + 正文是什么」——这是旧 parseForceTopicInvocation 的全部契约。 */
-  function forceTopic(content: string): { prompt: string } | null {
-    const parsed = parseTopicHeader(content);
-    return isTopicHeader(parsed) ? { prompt: parsed.prompt } : null;
-  }
-
-  it('parses /t with prompt', () => {
-    expect(forceTopic('/t 帮我看看 X')).toEqual({ prompt: '帮我看看 X' });
-  });
-
-  it('parses /topic with prompt', () => {
-    expect(forceTopic('/topic 帮我看看 Y')).toEqual({ prompt: '帮我看看 Y' });
-  });
-
-  it('parses bare /t and bare /topic with an empty prompt', () => {
-    expect(forceTopic('/t')).toEqual({ prompt: '' });
-    expect(forceTopic('/topic')).toEqual({ prompt: '' });
-  });
-
-  it('is case-insensitive on the sentinel itself', () => {
-    expect(forceTopic('/T hello')).toEqual({ prompt: 'hello' });
-    expect(forceTopic('/Topic hello')).toEqual({ prompt: 'hello' });
-  });
-
-  it('preserves multiline prompt content verbatim after the sentinel', () => {
-    expect(forceTopic('/t line1\nline2\nline3')).toEqual({ prompt: 'line1\nline2\nline3' });
-
-  });
-
-  it('retains cwd and worktree lifecycle aliases', () => {
-    expect(parseForceTopicInvocation('/t here 检查实现')).toEqual({ prompt: '检查实现', mode: 'here' });
-    expect(parseForceTopicInvocation('/topic worktree 检查实现')).toEqual({ prompt: '检查实现', mode: 'worktree' });
-    expect(parseForceTopicInvocation('/th 检查实现')).toEqual({ prompt: '检查实现', mode: 'here' });
-    expect(parseForceTopicInvocation('/tw 检查实现')).toEqual({ prompt: '检查实现', mode: 'worktree' });
-  });
-
-  it('does not match similar prefixes', () => {
-    expect(forceTopic('/tea is good')).toBeNull();
-    expect(forceTopic('/talk to me')).toBeNull();
-    expect(forceTopic('/topical')).toBeNull();
-  });
-
-  it('tolerates leading whitespace', () => {
-    expect(forceTopic('  /t hello')).toEqual({ prompt: 'hello' });
-
-  });
-
-  it('returns null for non-slash text', () => {
-    expect(forceTopic('hello world')).toBeNull();
-    expect(forceTopic('')).toBeNull();
-  });
-
-  it('does not collide with parseSlashCommandInvocation outputs', () => {
-    // /close, /restart, /repo etc. must NOT be claimed as force-topic invocations.
-    expect(forceTopic('/close')).toBeNull();
-    expect(forceTopic('/restart')).toBeNull();
-    expect(forceTopic('/repo 1')).toBeNull();
-  });
-
-  it('刻意的行为变化：/t 之前的文字现在是可读标题，不再判为非 force-topic', () => {
-    // 旧 parseForceTopicInvocation 要求 `/t` 在第 0 位，`hello /t world` 返回 null。
-    // 新语法把 `/t` 之前的文字当标题（飞书话题列表显示的是原消息，bot 改不了标题，
-    // 所以可读文字必须排在最前）。护栏在 topic-header 的单测里：标题不得含 `/` 开头的
-    // token、不超过 3 行、归一化后不超过 200 字，否则仍判为非 force-topic。
-    expect(parseTopicHeader('hello /t world')).toMatchObject({ ok: true, title: 'hello', prompt: 'world' });
   });
 });
 

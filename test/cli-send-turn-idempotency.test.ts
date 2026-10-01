@@ -9,7 +9,7 @@ import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
 const repo = fileURLToPath(new URL('..', import.meta.url));
 
-function createFixture(topicUnavailablePolicy?: 'stop') {
+function createFixture(topicUnavailablePolicy?: 'stop', session: Record<string, unknown> = {}) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-turn-idempotency-'));
   const dataDir = join(root, 'data');
   const sessionId = 'sid_turn_idempotency';
@@ -22,6 +22,7 @@ function createFixture(topicUnavailablePolicy?: 'stop') {
   seedPersistedSessionRows(dataDir, 'cli_test', { [sessionId]: {
     sessionId, status: 'active', cliId: 'codex', larkAppId: 'cli_test',
     chatId: 'oc_test', rootMessageId: 'om_root', scope: 'thread', chatType: 'group', workingDir: root,
+    ...session,
   } });
   const run = (
     kind: 'progress' | 'final' | 'auxiliary',
@@ -49,6 +50,35 @@ function createFixture(topicUnavailablePolicy?: 'stop') {
 }
 
 describe('botmux send per-turn final idempotency', () => {
+  it.each([['--top-level'], ['--top-level', '--chat-id', 'oc_other'], ['--into', 'om_other']])(
+    'does not erase a chat turn quote source with destination arguments %j', (...args) => {
+      const f = createFixture('stop', { scope: 'chat', replyTargets: {
+        om_turn_idempotency: { rootMessageId: 'om_quote', quoteOnly: true, updatedAt: new Date().toISOString() },
+      } });
+      try {
+        const attempt = f.run('final', 'answer', args, 'deleted');
+        expect(attempt.result.status).not.toBe(0);
+        expect(String(attempt.result.stderr)).toContain('TOPIC_SEND_BLOCKED');
+        expect(attempt.requests).toHaveLength(0);
+        expect(existsSync(join(f.dataDir, 'turn-send-ledger'))).toBe(false);
+      } finally { rmSync(f.root, { recursive: true, force: true }); }
+    }, 30_000,
+  );
+  it('keeps the executing thread source when an explicit destination session is unthreaded', () => {
+    const f = createFixture('stop');
+    try {
+      seedPersistedSessionRows(f.dataDir, 'cli_test', { sid_other: {
+        sessionId: 'sid_other', status: 'active', cliId: 'codex', larkAppId: 'cli_test',
+        chatId: 'oc_other', rootMessageId: 'om_other', scope: 'chat', chatType: 'group', workingDir: f.root,
+      } });
+      const attempt = f.run('final', 'answer', ['--session-id', 'sid_other', '--top-level'], 'deleted');
+      expect(attempt.result.status).not.toBe(0);
+      expect(String(attempt.result.stderr)).toContain('TOPIC_SEND_BLOCKED');
+      expect(attempt.requests).toHaveLength(0);
+      expect(existsSync(join(f.dataDir, 'turn-send-ledger'))).toBe(false);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 30_000);
+
   it.each(['deleted', 'missing', 'unknown'])('keeps the stop policy before a ledger replay when the source is %s', state => {
     const f = createFixture('stop');
     try {

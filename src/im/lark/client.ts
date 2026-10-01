@@ -265,6 +265,8 @@ const listBotsApiFailures = new Map<string, { reason: string; expiresAt: number 
  * the param and get exactly the pre-Step-6 behavior.
  */
 export interface OutboundMessageOptions {
+  /** Revalidate the frozen source immediately before every provider attempt. */
+  beforeWrite?: () => void | Promise<void>;
   /** The provider request is reconciling an already-attempted stable UUID.
    * Lark deduplicates the message, but the local outbound hook is a separate
    * side effect and must not be fired twice. */
@@ -321,6 +323,7 @@ export async function sendMessage(
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendMessage');
   return executeWithLarkGate(larkAppId, 'sendMessage', async () => {
+    await options?.beforeWrite?.();
     const c = getBotClient(larkAppId);
     const body = msgType === 'text'
       ? JSON.stringify({ text: content })
@@ -384,6 +387,7 @@ export async function replyMessage(
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'replyMessage');
   return executeWithLarkGate(larkAppId, 'replyMessage', async () => {
+    await options?.beforeWrite?.();
     await assertMessageWriteAllowed(larkAppId, messageId);
     const c = getBotClient(larkAppId);
     const body = msgType === 'text'

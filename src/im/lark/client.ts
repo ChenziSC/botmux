@@ -526,6 +526,7 @@ export async function forwardMessage(
 export async function addReaction(larkAppId: string, messageId: string, emojiType: string): Promise<string> {
   assertLarkTransport(larkAppId, 'addReaction');
   return executeWithLarkGate(larkAppId, 'addReaction', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
     const c = getBotClient(larkAppId);
     const res = await (c as any).im.v1.messageReaction.create({
       path: { message_id: messageId },
@@ -1109,6 +1110,7 @@ export async function pinMessage(larkAppId: string, messageId: string): Promise<
   assertLarkTransport(larkAppId, 'pinMessage');
   const c = getBotClient(larkAppId);
   try {
+    await assertMessageWriteAllowed(larkAppId, messageId);
     const res: any = await c.im.v1.pin.create({ data: { message_id: messageId } });
     if (res?.code !== 0) {
       logger.debug(`[pin:${larkAppId}] failed message=${messageId} code=${res?.code ?? 'missing'}`);

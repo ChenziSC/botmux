@@ -189,7 +189,7 @@ import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { ensureDevboxDashboardExport } from './platform/devbox-dashboard-export.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from './platform/binding.js';
-import { isRemoteAccessEnabled } from './global-config.js';
+import { isMultiTopicOrchestrationEnabled, isRemoteAccessEnabled } from './global-config.js';
 import {
   DASHBOARD_COMMAND_USAGE,
   DASHBOARD_LOCAL_TOKEN_FLAG,
@@ -3915,8 +3915,8 @@ interface SessionData {
   cliId?: string;
   /** CLI-native resume id when it differs from botmux's Session id. */
   cliSessionId?: string;
-  /** Frozen file-sandbox decision from the persisted session. */
-  sandbox?: boolean;
+  /** Frozen file-sandbox decision from the persisted session (tri-state). */
+  sandbox?: boolean | 'off' | 'oncall' | 'scratch';
   backendType?: BackendType;
   /** Exact persistent host/agent selected by the worker. In particular, Herdr
    * may own one agent inside a shared host session rather than the host itself. */
@@ -10199,7 +10199,14 @@ async function cmdSend(rest: string[]): Promise<void> {
   } catch (error) {
     // Retention is maintenance, never part of send correctness. Keep the
     // completed/in-flight records fail-closed and let this send proceed.
-    logger.warn(`[turn-send-ledger] completed-record prune skipped: ${error instanceof Error ? error.message : String(error)}`);
+    // A write-sandboxed CLI is granted only its own session directory, so the
+    // shared root sweep is expected to be refused there; unsandboxed sends and
+    // the operator command still sweep every session. Stay quiet in that case
+    // rather than print a spurious warning on every sandboxed send.
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code !== 'EPERM' && code !== 'EACCES' && code !== 'EROFS') {
+      logger.warn(`[turn-send-ledger] completed-record prune skipped: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   const executeTurnPrimary = async (
     renderedContent: string,
@@ -11560,7 +11567,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         mention.open_id === replyTargetSenderOpenId && replyTargetSenderIsBot === false);
       // A restored record can remain readable (for example via the Linux host
       // relay). Match the daemon's sandbox exclusion instead of reviving it.
-      const replyCardSandboxed = s.sandbox === true || process.env.BOTMUX_READ_ISOLATION === '1'
+      const replyCardSandboxed = s.sandbox === true || s.sandbox === 'oncall' || s.sandbox === 'scratch' || process.env.BOTMUX_READ_ISOLATION === '1'
         || process.env.BOTMUX_SANDBOX === '1';
       const canUseReplyCard = replyKey && !replyCardSandboxed && !sendTopLevel && !overrideChatId && !sendInto
         && !vcMeetingManagedSendOrigin && !attention.requested && !explicitQuote && !noQuote
@@ -12383,6 +12390,14 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --chat-id <id>        覆盖目标群（默认当前会话所在群）
   --session-id <id>     指定来源会话（默认自动推断）`);
     return;
+  }
+  if (!dispatchArgs.into && !isMultiTopicOrchestrationEnabled()) {
+    console.error(JSON.stringify({
+      success: false,
+      errorCode: 'multi_topic_disabled',
+      detail: '多话题协作已关闭，不能新建子项目话题。可在 Dashboard 设置中开启，或使用 botmux dispatch --into <话题根消息id> 追加到已有话题。',
+    }));
+    process.exit(2);
   }
   const dispatchRelayDir = process.env.BOTMUX_SEND_RELAY;
   if (dispatchRelayDir) {

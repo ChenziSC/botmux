@@ -62,6 +62,7 @@ import { createGroupWithBots, transferGroupOwner } from '../services/group-creat
 import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
+import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
 import * as backendTypeStore from '../services/backend-type-store.js';
 import { setGroupSerialInput } from '../services/group-serial-input-store.js';
 import { parseGroupSerialInput } from './group-serial-input.js';
@@ -315,7 +316,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
 import { tokenStoreProtection, triggerUserAuthApplies, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
@@ -6289,6 +6290,11 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     replyStyle,
     askOptionLayout,
     sandbox: sandboxStore.getBotSandbox(cachedLarkAppId),
+    sandboxMode: sandboxStore.getBotSandboxMode(cachedLarkAppId),
+    scratchStorage: (() => { try { return getBot(cachedLarkAppId).config.scratchStorage ?? null; } catch { return null; } })(),
+    scratchTmpfsSizeMb: (() => { try { return getBot(cachedLarkAppId).config.scratchTmpfsSizeMb ?? null; } catch { return null; } })(),
+    scratchDenyPaths: (() => { try { return getBot(cachedLarkAppId).config.scratchDenyPaths ?? null; } catch { return null; } })(),
+    scratchSupported: process.platform === 'linux' || process.platform === 'darwin',
     codexAuthSync,
     sandboxPaths: sandboxStore.getBotSandboxPaths(cachedLarkAppId) ?? null,
     readIsolation: sandboxStore.getBotReadIsolation(cachedLarkAppId),
@@ -6493,7 +6499,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
       if (config.cliId !== 'codex-app') {
         return jsonRes(res, 400, { ok: false, error: 'codex_browser_requires_codex_app' });
       }
-      if (config.existingAppServer || config.sandbox === true || config.readIsolation === true) {
+      if (config.existingAppServer || sandboxBoolValue(config.sandbox) || config.readIsolation === true) {
         return jsonRes(res, 409, { ok: false, error: 'codex_browser_config_conflict' });
       }
     }
@@ -6963,6 +6969,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     turnTimeoutMs?: unknown;
     cliRuntime?: unknown;
     dshRuntime?: unknown;
+    dshProfile?: unknown;
   };
   try { body = await readJsonBody<typeof body>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
@@ -7049,6 +7056,21 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       return jsonRes(res, 400, { ok: false, error: 'invalid_dsh_runtime' });
     }
     nextDshRuntime = body.dshRuntime;
+  }
+  // dsh-only profile name. Empty clears to dsh's default; profile names use
+  // the same safe character set as the Dashboard profile-create endpoint.
+  const supportsDshProfile = selected.cliId === 'dsh';
+  const dshProfileFieldPresent = Object.prototype.hasOwnProperty.call(body, 'dshProfile');
+  let nextDshProfile: string | undefined;
+  if (supportsDshProfile && dshProfileFieldPresent && body.dshProfile !== null) {
+    if (typeof body.dshProfile !== 'string') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_dsh_profile' });
+    }
+    const trimmed = body.dshProfile.trim();
+    if (trimmed) {
+      nextDshProfile = normalizeDshProfile(trimmed);
+      if (!nextDshProfile) return jsonRes(res, 400, { ok: false, error: 'invalid_dsh_profile' });
+    }
   }
   const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
   const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli, currentBotConfig.cliLaunchMode);
@@ -7161,7 +7183,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       nextModelBackendVariant?: 'standard' | 'max';
       nextNativeSubagentRuntimeState?: NativeSubagentRuntimeConfigState;
     }>(larkAppId, (entry) => {
-      if (selected.cliLaunchMode && (entry.sandbox === true || entry.readIsolation === true)) {
+      if (selected.cliLaunchMode && (sandboxBoolValue(entry.sandbox) || entry.readIsolation === true)) {
         return { write: false, result: { error: 'launch_mode_sandbox_conflict' } };
       }
       const storedModelBackendVariant = entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max'
@@ -7245,6 +7267,13 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
         if (nextDshRuntime !== undefined) entry.dshRuntime = nextDshRuntime;
         else delete entry.dshRuntime;
       }
+      // dsh-only profile: non-dsh always drops it; on dsh, presence controls
+      // write/clear while absence preserves older Dashboard clients' value.
+      if (!supportsDshProfile) delete entry.dshProfile;
+      else if (dshProfileFieldPresent) {
+        if (nextDshProfile !== undefined) entry.dshProfile = nextDshProfile;
+        else delete entry.dshProfile;
+      }
       if (entry.readIsolation === true &&
           !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli, cliLaunchMode: selected.cliLaunchMode })) {
         delete entry.readIsolation;
@@ -7303,6 +7332,8 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // dsh-only runtime variant: same mirror semantics as turnTimeoutMs.
     if (!supportsDshRuntime) bot.config.dshRuntime = undefined;
     else if (dshRuntimeFieldPresent) bot.config.dshRuntime = nextDshRuntime;
+    if (!supportsDshProfile) bot.config.dshProfile = undefined;
+    else if (dshProfileFieldPresent) bot.config.dshProfile = nextDshProfile;
     if (readIsolationCleared) bot.config.readIsolation = false;
     if (codexBrowserCleared) bot.config.codexBrowser = undefined;
     if (isRemoteCliId(selected.cliId)) {
@@ -7329,6 +7360,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       nativeSubagentRuntime: bot.config.nativeSubagentRuntime ?? null,
       turnTimeoutMs: supportsTurnTimeout ? bot.config.turnTimeoutMs ?? null : null,
       dshRuntime: supportsDshRuntime ? bot.config.dshRuntime ?? null : null,
+      dshProfile: supportsDshProfile ? bot.config.dshProfile ?? null : null,
       selectionKey,
       // Number kept for compatibility with an older dashboard bundle; the residual
       // count rides alongside so a hot CLI switch cannot silently strand a remote
@@ -7410,6 +7442,7 @@ ipcRoute('GET', '/api/session-group-tag-status', async (_req, res) => {
       ...status,
       tagMode: cfg.sessionGroup?.tag?.mode ?? 'feed-group',
       tagName: cfg.sessionGroup?.tag?.name ?? '',
+      closedTagName: cfg.sessionGroup?.tag?.closedName ?? '',
       defaultTagName: defaultSessionTagName(cachedLarkAppId),
     });
   } catch (e: any) {
@@ -7419,28 +7452,32 @@ ipcRoute('GET', '/api/session-group-tag-status', async (_req, res) => {
 
 // PUT /api/session-group-tag-config — 会话群标签模式 + 标签名（Dashboard 的
 // 「会话群标签」区块，PR review：授权行必须与实际 tagMode 一致）。
-// Body `{ mode?, name? }`，两者都可单独提交（Dashboard 下拉只发 mode、输入框只发
+// Body `{ mode?, name?, closedName? }`，字段均可单独提交（Dashboard 下拉只发 mode、输入框只发
 // name），但至少要带一个：
 //   mode: 'feed-group'（默认，个人侧边栏分组，需一次 OAuth，任何租户可用）|
 //         'chat-tag'（应用租户身份，无需用户授权，但飞书尚未开放该能力，权限
 //         目录里搜不到该 scope）| 'off'
 //   name: 自定义标签名；trim 后为空 = 删掉该字段回默认名「<bot 显示名>会话」。
 //         超长按码点保守截断（clampSessionTagName），存进去的就是实际生效的。
+//   closedName: /close 后的个人消息分组名；留空 = 禁用关闭后切换。
 // 写 bots.json 的 sessionGroup.tag 并热更内存注册表，与 /botconfig 同一持久化通道。
 ipcRoute('PUT', '/api/session-group-tag-config', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
-  let body: { mode?: unknown; name?: unknown };
-  try { body = await readJsonBody<{ mode?: unknown; name?: unknown }>(req); }
+  let body: { mode?: unknown; name?: unknown; closedName?: unknown };
+  try { body = await readJsonBody<{ mode?: unknown; name?: unknown; closedName?: unknown }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
   const hasMode = body.mode !== undefined && body.mode !== null;
   const hasName = body.name !== undefined && body.name !== null;
+  const hasClosedName = Object.hasOwn(body, 'closedName');
   const mode = body.mode === 'chat-tag' || body.mode === 'feed-group' || body.mode === 'off'
     ? body.mode : undefined;
   if (hasMode && !mode) return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
   if (hasName && typeof body.name !== 'string') return jsonRes(res, 400, { ok: false, error: 'invalid_name' });
+  if (hasClosedName && typeof body.closedName !== 'string') return jsonRes(res, 400, { ok: false, error: 'invalid_closed_name' });
   // 一个字段都没带 → 沿用原来的 invalid_mode（老 dashboard 只发 mode，语义不变）。
-  if (!hasMode && !hasName) return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
+  if (!hasMode && !hasName && !hasClosedName) return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
   const name = hasName ? clampSessionTagName(body.name as string) : undefined;
+  const closedName = typeof body.closedName === 'string' ? clampSessionTagName(body.closedName) : undefined;
   try {
     const bot = getBot(cachedLarkAppId);
     const r = await rmwBotEntry(cachedLarkAppId, (entry: any) => {
@@ -7451,6 +7488,10 @@ ipcRoute('PUT', '/api/session-group-tag-config', async (req, res) => {
         if (name) entry.sessionGroup.tag.name = name;
         else delete entry.sessionGroup.tag.name; // 留空 = 清配置回默认，bots.json 保持干净
       }
+      if (hasClosedName) {
+        if (closedName) entry.sessionGroup.tag.closedName = closedName;
+        else delete entry.sessionGroup.tag.closedName;
+      }
       return { write: true, result: mode };
     });
     if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
@@ -7460,11 +7501,16 @@ ipcRoute('PUT', '/api/session-group-tag-config', async (req, res) => {
       if (name) tag.name = name;
       else delete tag.name;
     }
+    if (hasClosedName) {
+      if (closedName) tag.closedName = closedName;
+      else delete tag.closedName;
+    }
     bot.config.sessionGroup = { ...(bot.config.sessionGroup ?? {}), tag };
     jsonRes(res, 200, {
       ok: true,
       tagMode: tag.mode ?? 'feed-group',
       tagName: tag.name ?? '',
+      closedTagName: tag.closedName ?? '',
       defaultTagName: defaultSessionTagName(cachedLarkAppId),
     });
   } catch (e: any) {
@@ -7846,9 +7892,11 @@ ipcRoute('GET', '/api/bot-trigger-user-auth-status', async (_req, res) => {
     const cfg = getBot(cachedLarkAppId).config;
     const policy = cfg.triggerUserAuth ?? null;
     const authorizedCount = listAuthorizedUsers(cfg.larkAppId, normalizeBrand(cfg.brand)).length;
-    // Sandbox is what makes the isolation OS-enforced; without it the agent runs
-    // as the same OS user as botmux and can read other people's token files.
-    const protection = tokenStoreProtection(cfg.sandbox === true);
+    // Oncall (legacy true) provides the OS-enforced credential boundary that
+    // makes other people's token files unreadable. scratch is NOT counted here:
+    // it is write-integrity COW, not a read/credential boundary, so the agent
+    // can still read shared token stores.
+    const protection = tokenStoreProtection(cfg.sandbox === true || cfg.sandbox === 'oncall');
     const mcpAdvisory = credentialBearingMcpAdvisory(scanCredentialBearingMcpServers());
     jsonRes(res, 200, {
       ok: true,
@@ -8029,35 +8077,81 @@ ipcRoute('PUT', '/api/bot-skills', async (req, res) => {
   jsonRes(res, 200, { ok: true, skills: getBot(cachedLarkAppId).config.skills ?? null });
 });
 
-// Per-bot file-sandbox toggle. Body `{ enabled: boolean }`. When on, this bot's
-// CLI sessions run inside a per-session bwrap file sandbox (Linux). For oncall
-// bots shared with semi-trusted users.
+// Per-bot file-sandbox selection. Body either:
+//   { enabled: boolean }                 — legacy toggle (true = oncall)
+//   { mode: 'off'|'oncall'|'scratch',    — tri-state + scratch sub-options
+//     scratchStorage?, scratchTmpfsSizeMb?, scratchDenyPaths? }
+// oncall = per-session bwrap/Seatbelt whitelist for bots shared with
+// semi-trusted users; scratch = Linux-only full-root COW throwaway sandbox for
+// the owner's own disposable experiments.
 ipcRoute('PUT', '/api/bot-sandbox', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
-  let body: { enabled?: unknown };
-  try { body = await readJsonBody<{ enabled?: unknown }>(req); }
+  let body: { enabled?: unknown; mode?: unknown; scratchStorage?: unknown; scratchTmpfsSizeMb?: unknown; scratchDenyPaths?: unknown };
+  try { body = await readJsonBody<typeof body>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
-  if (body.enabled === true) {
+
+  let mode: 'off' | 'oncall' | 'scratch';
+  if (typeof body.mode === 'string') {
+    if (body.mode !== 'off' && body.mode !== 'oncall' && body.mode !== 'scratch') {
+      return jsonRes(res, 400, { ok: false, error: 'bad_sandbox_mode' });
+    }
+    mode = body.mode;
+  } else {
+    mode = body.enabled === true ? 'oncall' : 'off';
+  }
+  if (mode === 'scratch' && process.platform !== 'linux' && process.platform !== 'darwin') {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: 'scratch_platform_unsupported',
+      message: 'scratch 沙盒仅支持 Linux 与 macOS。',
+    });
+  }
+  if (mode !== 'off') {
     try {
-      if (getBot(cachedLarkAppId).config.cliLaunchMode === 'forge-traex') {
+      const cfg = getBot(cachedLarkAppId).config;
+      if (cfg.cliLaunchMode === 'forge-traex') {
         return jsonRes(res, 400, {
           ok: false,
           error: 'launch_mode_sandbox_conflict',
           message: 'Forge x TraeX 暂不支持文件沙盒。',
         });
       }
+      // codexBrowser / existingAppServer conflicts are enforced by the shared
+      // bot-config invariants on the bots.json WRITE below, which return the
+      // canonical 409 reason (same contract as the legacy boolean toggle).
     } catch { /* Let the store return the canonical config error below. */ }
   }
+
+  let scratch: { storage?: 'tmpfs' | 'disk'; tmpfsSizeMb?: number; denyPaths?: string[] } | undefined;
+  if (mode === 'scratch') {
+    if (body.scratchStorage !== undefined && body.scratchStorage !== 'tmpfs' && body.scratchStorage !== 'disk') {
+      return jsonRes(res, 400, { ok: false, error: 'bad_scratch_storage' });
+    }
+    if (body.scratchTmpfsSizeMb !== undefined
+      && (typeof body.scratchTmpfsSizeMb !== 'number' || body.scratchTmpfsSizeMb <= 0)) {
+      return jsonRes(res, 400, { ok: false, error: 'bad_scratch_tmpfs_size' });
+    }
+    if (body.scratchDenyPaths !== undefined
+      && (!Array.isArray(body.scratchDenyPaths) || body.scratchDenyPaths.some(x => typeof x !== 'string'))) {
+      return jsonRes(res, 400, { ok: false, error: 'bad_scratch_deny_paths' });
+    }
+    scratch = {
+      storage: body.scratchStorage as 'tmpfs' | 'disk' | undefined,
+      tmpfsSizeMb: body.scratchTmpfsSizeMb as number | undefined,
+      denyPaths: body.scratchDenyPaths as string[] | undefined,
+    };
+  }
+
   // File-sandbox policy is frozen onto each Session at creation and reused on
-  // restore; this toggle is intentionally next-session-only and cannot mutate
-  // a live pane's profile.
-  const r = await sandboxStore.updateBotSandbox(cachedLarkAppId, body.enabled === true);
+  // restore; this selection is intentionally next-session-only and cannot
+  // mutate a live pane's profile.
+  const r = await sandboxStore.updateBotSandboxMode(cachedLarkAppId, mode, scratch);
   if (!r.ok) {
     const status = r.reason === 'codex_browser_config_conflict'
       || r.reason === 'existing_app_server_sandbox_conflict' ? 409 : 400;
     return jsonRes(res, status, { ok: false, error: r.reason });
   }
-  jsonRes(res, 200, { ok: true, sandbox: r.sandbox });
+  jsonRes(res, 200, { ok: true, sandbox: r.sandbox !== 'off', mode: r.sandbox });
 });
 
 // Per-bot sandboxPaths (three-tier whitelist: readWrite / readOnly / deny).

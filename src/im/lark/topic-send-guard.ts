@@ -18,7 +18,7 @@ export async function assertSendTopicsAvailable(
 ): Promise<void> {
   if (policy !== 'stop') return;
   for (const root of new Set(roots.filter((id): id is string => !!id))) {
-    await readAvailableMessage(appId, root, getMessage);
+    await assertMessageTopicAvailable(appId, root, getMessage);
   }
 }
 

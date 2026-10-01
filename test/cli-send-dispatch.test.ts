@@ -52,6 +52,28 @@ describe('dispatchPrimaryMessage hook context wiring', () => {
     MessageWithdrawnError,
   };
 
+  it.each([false, true])('passes the write fence through quote fallback (hook suppressed: %s)', async suppressHook => {
+    const events: string[] = [];
+    const beforeWrite = async () => { events.push('write-fence'); };
+    const beforeQuoteFallback = async () => { events.push('fallback-fence'); };
+    const replyMessage = vi.fn(async (...args: any[]) => {
+      await args[7].beforeWrite();
+      events.push('reply');
+      throw new MessageWithdrawnError();
+    });
+    const sendMessage = vi.fn(async (...args: any[]) => {
+      await args[6].beforeWrite();
+      events.push('send');
+      return 'om_sent';
+    });
+    await dispatchPrimaryMessage({ replyMessage, sendMessage }, {
+      ...baseOptions, quoteTargetId: 'om_quote', content: 'answer', msgType: 'text',
+      dispatch: vi.fn(async () => 'unused'), beforeWrite, beforeQuoteFallback, suppressHook,
+    });
+    expect(events).toEqual(['write-fence', 'reply', 'fallback-fence', 'write-fence', 'send']);
+    expect(sendMessage.mock.calls[0][6].suppressHook).toBe(suppressHook ? true : undefined);
+  });
+
   it('passes hookContext when quote reply succeeds', async () => {
     const replyMessage = vi.fn(async () => 'om_reply');
     const sendMessage = vi.fn(async () => 'om_send');

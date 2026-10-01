@@ -9870,17 +9870,16 @@ async function cmdSend(rest: string[]): Promise<void> {
   // behavior, but bind it to a fresh challenge of this command's original
   // protected claim. The Lark client treats fence failure as hook-only loss so
   // an already-delivered primary is never reported failed and duplicated.
-  const outboundMessageOptions = (suppressHook = false) =>
-    suppressHook
+  const outboundMessageOptions = (suppressHook = false) => ({
+    beforeWrite: fenceIsolatedOriginBeforeEffect,
+    ...(suppressHook
       ? { suppressHook: true as const }
       : isolatedAttestationContext
         ? isolatedHookOrigin
-          ? {
-              beforeHook: fenceIsolatedOriginBeforeEffect,
-              hookOrigin: isolatedHookOrigin,
-            }
+          ? { beforeHook: fenceIsolatedOriginBeforeEffect, hookOrigin: isolatedHookOrigin }
           : { suppressHook: true as const }
-        : undefined;
+        : {}),
+  });
 
   // A document-comment turn has exactly one supported observable effect: a
   // plain text reply to its frozen origin target.  Validate the complete shape
@@ -10187,25 +10186,33 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   const { getMessageDetail: getTopicMessageDetail } = await import('./im/lark/client.js');
   // Source routing deliberately ignores explicit destination overrides.
-  const sourceTopicTarget = frozenTurnReplyTarget ?? resolveSendTarget({
-    topLevel: false, chatScope: s.scope === 'chat', chatId: s.chatId,
-    rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId,
-    replyTargetTurnId: turnReplyTarget?.turnId,
-    replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId,
+  // Destination overrides do not transfer the source's policy or identity.
+  const topicSourceSession = originSession ?? s;
+  const topicSourceTurnId = originSession ? originTurnId : currentTurnId;
+  const topicSourceTurn = pickTurnReplyTarget(topicSourceSession, topicSourceTurnId);
+  const sourceTopicTarget = exactOriginDispatch?.replyTarget ?? resolveSendTarget({
+    topLevel: false, chatScope: topicSourceSession.scope === 'chat', chatId: topicSourceSession.chatId,
+    rootMessageId: topicSourceSession.rootMessageId, replyTargetRootId: topicSourceTurn?.rootMessageId,
+    replyTargetTurnId: topicSourceTurn?.turnId,
+    replyTargetQuoteOnly: topicSourceTurn?.quoteOnly, currentTurnId: topicSourceTurnId,
   });
   checkSendTopics = async () => {
-    if (getBot(appId).config.topicUnavailablePolicy !== 'stop') return;
-    const scheduledRoot = reusableDeferredTopicRoot({
-      session: s as SessionData & { larkAppId: string },
-      binding: readDeferredTopicBinding(dataDir, s.sessionId),
-      explicitTopLevel: false,
-    });
-    await assertSendTopicsAvailable(appId, [
-      scheduledRoot,
-      !s.deferredScheduleRun && sourceTopicTarget.mode === 'thread'
-        ? sourceTopicTarget.rootMessageId : undefined,
-      sendInto,
-    ], getTopicMessageDetail, 'stop');
+    const sourceAppId = topicSourceSession.larkAppId ?? appId;
+    if (getBot(sourceAppId).config.topicUnavailablePolicy === 'stop') {
+      const scheduledRoot = reusableDeferredTopicRoot({
+        session: { ...topicSourceSession, larkAppId: sourceAppId },
+        binding: readDeferredTopicBinding(dataDir, topicSourceSession.sessionId),
+        explicitTopLevel: false,
+      });
+      await assertSendTopicsAvailable(sourceAppId, [
+        scheduledRoot,
+        !topicSourceSession.deferredScheduleRun && sourceTopicTarget.mode !== 'plain'
+          ? sourceTopicTarget.rootMessageId : undefined,
+      ], (app, id) => getTopicMessageDetail(app, id, { userCardContent: false, timeoutMs: 10000 }), 'stop');
+    }
+    await assertSendTopicsAvailable(appId, [sendInto],
+      (app, id) => getTopicMessageDetail(app, id, { userCardContent: false, timeoutMs: 10000 }),
+      getBot(appId).config.topicUnavailablePolicy);
   };
   await checkSendTopics();
   const turnSendKey = currentTurnId
@@ -10431,7 +10438,7 @@ async function cmdSend(rest: string[]): Promise<void> {
                 },
                 sendTitleSeed: async (title, uuid) => {
                   await revalidateIsolatedOriginBeforeEffect();
-                  return sendMessage(appId, targetChatId, title, 'text', uuid);
+                  return sendMessage(appId, targetChatId, title, 'text', uuid, undefined, outboundMessageOptions());
                 },
                 replyRoot: async (root, body, type, uuid) => {
                   await revalidateIsolatedOriginBeforeEffect();
@@ -10985,7 +10992,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         // only seed text; the alert itself still goes through the hook path.
         sendTitleSeed: async (title, rootUuid) => {
           await revalidateIsolatedOriginBeforeEffect();
-          return sendMessage(appId, targetChatId, title, 'text', rootUuid);
+          return sendMessage(appId, targetChatId, title, 'text', rootUuid, undefined, outboundMessageOptions());
         },
         replyRoot: async (root, body, type, replyUuid) => {
           await revalidateIsolatedOriginBeforeEffect();
@@ -11177,6 +11184,7 @@ async function cmdSend(rest: string[]): Promise<void> {
               );
             }
           : dispatchAfterOriginGate,
+        beforeWrite: fenceIsolatedOriginBeforeEffect,
         beforeEffect: originAlreadyRevalidated
           ? undefined
           : fenceIsolatedOriginBeforeEffect,
@@ -13304,11 +13312,28 @@ async function cmdReport(rest: string[]): Promise<void> {
     currentTurnId,
   });
 
-  const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
+  const { registerBot, loadBotConfigs, getBot } = await import('./bot-registry.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
-  const { sendMessage, replyMessage } = await import('./im/lark/client.js');
+  const { sendMessage, replyMessage, getMessageDetail } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
+  // Destination overrides cannot erase the original session/turn source.
+  const reportOrigin = reportContext?.sessionId && reportContext.sessionId !== sid
+    ? await requireSessionById(reportContext.sessionId) : s;
+  const reportOriginTurnId = reportContext?.sessionId === reportOrigin.sessionId
+    ? reportContext.turnId : undefined;
+  const reportOriginTurn = pickTurnReplyTarget(reportOrigin, reportOriginTurnId);
+  const reportSourceAppId = reportOrigin.larkAppId!;
+  const reportSource = resolveSendTarget({
+    topLevel: false, chatScope: (reportOrigin.scope ?? 'thread') === 'chat', chatId: reportOrigin.chatId,
+    rootMessageId: reportOrigin.rootMessageId, replyTargetRootId: reportOriginTurn?.rootMessageId,
+    replyTargetTurnId: reportOriginTurn?.turnId,
+    replyTargetQuoteOnly: reportOriginTurn?.quoteOnly, currentTurnId: reportOriginTurnId,
+  });
+  const reportWriteOptions = { beforeWrite: () => assertSendTopicsAvailable(reportSourceAppId,
+    [reportSource.mode === 'plain' ? undefined : reportSource.rootMessageId],
+    (appId, id) => getMessageDetail(appId, id, { userCardContent: false, timeoutMs: 10000 }),
+    getBot(reportSourceAppId).config.topicUnavailablePolicy) };
 
   const paras = buildReportContent({ orchOpenId: reportRecipient, content });
   const postJson = JSON.stringify({ zh_cn: { title: '', content: paras } });
@@ -13316,7 +13341,7 @@ async function cmdReport(rest: string[]): Promise<void> {
   try {
     let msgId: string;
     if (placement.target.mode === 'plain') {
-      msgId = await sendMessage(appId, placement.target.chatId, postJson, 'post');
+      msgId = await sendMessage(appId, placement.target.chatId, postJson, 'post', undefined, undefined, reportWriteOptions);
     } else {
       msgId = await replyMessage(
         appId,
@@ -13324,6 +13349,7 @@ async function cmdReport(rest: string[]): Promise<void> {
         postJson,
         'post',
         placement.target.mode === 'thread',
+        undefined, undefined, reportWriteOptions,
       );
     }
     const messageTarget = placement.target.mode === 'plain'

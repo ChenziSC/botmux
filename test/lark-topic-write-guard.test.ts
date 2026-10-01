@@ -15,10 +15,10 @@ vi.mock('../src/bot-registry.js', () => ({
   }),
 }));
 vi.mock('../src/services/hook-runner.js', () => ({ emitHookEvent: mocks.hook }));
-import { replyMessage, updateMessage, forwardMessage, urgentMessage,
+import { sendMessage, replyMessage, updateMessage, forwardMessage, urgentMessage,
   updateCardStreamingSettings, updateCardStreamElementContent, patchCardStreamElement,
   resolveCardKitId, MessageWithdrawnError } from '../src/im/lark/client.js';
-import { TopicSendError } from '../src/im/lark/topic-send-guard.js';
+import { assertSendTopicsAvailable, TopicSendError } from '../src/im/lark/topic-send-guard.js';
 import { __testOnly_resetLarkGate } from '../src/im/lark/api-gate.js';
 
 const operations = [
@@ -50,6 +50,32 @@ beforeEach(() => {
 afterEach(() => { vi.unstubAllEnvs(); __testOnly_resetLarkGate(); });
 
 describe('stop policy at the actual Lark write boundary', () => {
+  it.each(['send', 'reply'] as const)('%s rechecks the source after a rate-limit retry without firing the hook', async operation => {
+    const beforeWrite = vi.fn(() => assertSendTopicsAvailable('app', ['om_root'],
+      async () => ({ items: [{ message_id: 'om_root', deleted: rootDeleted }] }), 'stop'));
+    const provider = operation === 'send' ? mocks.create : mocks.reply;
+    provider.mockImplementationOnce(async () => {
+      rootDeleted = true;
+      throw { isAxiosError: true, response: { status: 429 } };
+    });
+    const attempt = operation === 'send'
+      ? sendMessage('app', 'oc_other', 'answer', 'text', 'stable', undefined, { beforeWrite })
+      : replyMessage('app', 'om_other', 'answer', 'text', true, 'stable', undefined, { beforeWrite });
+    await expect(attempt).rejects.toMatchObject({ code: 'TOPIC_SEND_BLOCKED' });
+    expect(provider).toHaveBeenCalledOnce();
+    expect(provider.mock.calls[0][0].data.uuid).toBe('stable');
+    expect(beforeWrite).toHaveBeenCalledTimes(2);
+    expect(mocks.hook).not.toHaveBeenCalled();
+  });
+  it('keeps the original UUID and emits a single hook when a permitted retry succeeds', async () => {
+    const beforeWrite = vi.fn(async () => {});
+    mocks.create.mockRejectedValueOnce({ isAxiosError: true, response: { status: 429 } });
+    await expect(sendMessage('app', 'oc_other', 'answer', 'text', 'stable', undefined, { beforeWrite }))
+      .resolves.toBe('om_sent');
+    expect(beforeWrite).toHaveBeenCalledTimes(2);
+    expect(mocks.create.mock.calls.map(([request]) => request.data.uuid)).toEqual(['stable', 'stable']);
+    expect(mocks.hook).toHaveBeenCalledOnce();
+  });
   it.each(operations)('%s checks the surviving card and its withdrawn root', async (_name, run, write) => {
     rootDeleted = true;
     await expect(run()).rejects.toMatchObject({ code: 'TOPIC_SEND_BLOCKED' });

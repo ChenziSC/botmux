@@ -387,8 +387,9 @@ export async function replyMessage(
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'replyMessage');
   return executeWithLarkGate(larkAppId, 'replyMessage', async () => {
-    await options?.beforeWrite?.();
     await assertMessageWriteAllowed(larkAppId, messageId);
+    // The source/authority fence follows the awaited destination lookup.
+    await options?.beforeWrite?.();
     const c = getBotClient(larkAppId);
     const body = msgType === 'text'
       ? JSON.stringify({ text: content })

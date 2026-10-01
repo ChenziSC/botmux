@@ -13260,6 +13260,13 @@ async function cmdReport(rest: string[]): Promise<void> {
       && !explicitDispatchRoot) {
       // Ordinary topic/chat turn, not a registered dispatch.
     } else if (!response.ok || triggerBody?.ok !== true) {
+      if (typeof triggerBody?.publishedMessageId === 'string' && triggerBody.publishedMessageId) {
+        console.log(JSON.stringify({
+          success: false, delivery: 'publish-and-relay', publishedMessageId: triggerBody.publishedMessageId,
+          relayConfirmed: false, error: triggerBody.error ?? `HTTP ${response.status}`,
+        }));
+        console.error(`消息已发布（${triggerBody.publishedMessageId}），回注未确认；保留此回执，核对后仅重试 --delivery relay。`);
+      }
       console.error(`来源会话回传失败: ${triggerBody?.error ?? `HTTP ${response.status}`}`);
       process.exit(1);
     } else {

@@ -12584,7 +12584,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const sid = sessionIdArg ?? findAncestorSessionId();
+  const dispatchContext = resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID);
+  const sid = sessionIdArg ?? dispatchContext?.sessionId;
   if (!sid) {
     console.error('无法推断 session-id。请在 Lark 话题内的 CLI 会话中运行，或传 --session-id <id>。');
     process.exit(1);
@@ -12596,6 +12597,28 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   // no-transport turn may not originate a Feishu topic/write). Closes the
   // `dispatch --session-id <virtual> --chat-id oc_real` env-only gap.
   assertSessionTransportOrExit({ chatId: s.chatId, larkAppId: s.larkAppId }, 'dispatch');
+
+  // The repo-prime reply is a direct CLI write. An explicit source session or
+  // new destination must not replace the process-tree execution origin.
+  const dispatchOrigin = dispatchContext?.sessionId && dispatchContext.sessionId !== sid
+    ? await requireSessionById(dispatchContext.sessionId) : s;
+  const dispatchTurnId = dispatchContext?.sessionId === dispatchOrigin.sessionId
+    ? dispatchContext.turnId : undefined;
+  const dispatchTurn = pickTurnReplyTarget(dispatchOrigin, dispatchTurnId);
+  const dispatchSourceAppId = dispatchOrigin.larkAppId!;
+  const dispatchSource = resolveSendTarget({
+    topLevel: false, chatScope: (dispatchOrigin.scope ?? 'thread') === 'chat', chatId: dispatchOrigin.chatId,
+    rootMessageId: dispatchOrigin.rootMessageId, replyTargetRootId: dispatchTurn?.rootMessageId,
+    replyTargetTurnId: dispatchTurn?.turnId, replyTargetQuoteOnly: dispatchTurn?.quoteOnly, currentTurnId: dispatchTurnId,
+  });
+  const dispatchWriteOptions = { beforeWrite: async () => {
+    const { getBot } = await import('./bot-registry.js');
+    const { getMessageDetail } = await import('./im/lark/client.js');
+    await assertSendTopicsAvailable(dispatchSourceAppId,
+      [dispatchSource.mode === 'plain' ? undefined : dispatchSource.rootMessageId],
+      (appId, id) => getMessageDetail(appId, id, { userCardContent: false, timeoutMs: 10000 }),
+      getBot(dispatchSourceAppId).config.topicUnavailablePolicy);
+  } };
 
   const targetChatId = overrideChatId ?? s.chatId;
   if (!targetChatId) { console.error(`session ${sid} 缺少 chatId，且未提供 --chat-id`); process.exit(1); }
@@ -12825,7 +12848,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     let primeId: string | undefined;
     if (repo) {
       const prime = buildRepoPrimeText({ path: repo, bots });
-      primeId = await replyMessage(appId, seedId, prime.text, 'text', true);
+      primeId = await replyMessage(appId, seedId, prime.text, 'text', true, undefined, undefined, dispatchWriteOptions);
     }
 
     // 3. Brief kickoff — reply_in_thread @-ing the bots so each spawns its own

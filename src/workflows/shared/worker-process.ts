@@ -1,12 +1,13 @@
 /** Engine-neutral process primitives for short-lived workflow workers. */
 
-import type { ChildProcess } from 'node:child_process';
+import { fork, type ChildProcess, type ForkOptions } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 
-import { spawnWorker } from '../../core/self-spawn.js';
 import type { WorkerToDaemon } from '../../types.js';
+
+type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
 export interface WorkerHandle {
   send(msg: unknown): void;
@@ -32,17 +33,15 @@ export type WorkerSpawnOptions = {
   env: NodeJS.ProcessEnv;
 };
 
-/** Default factory: source runs fork the supplied worker module; standalone
- * builds re-enter the current Botmux binary through `__worker`. */
+/** Default factory: real `node:child_process.fork` against `worker.js`. */
 export const forkWorkerJsFactory: WorkerProcessFactory = {
   spawn(opts) {
-    const child: ChildProcess = spawnWorker({
-      distDir: dirname(opts.workerPath),
-      workerPath: opts.workerPath,
+    const child: ChildProcess = fork(opts.workerPath, [], {
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       cwd: opts.cwd,
       env: opts.env,
-      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-    });
+    } as WindowsForkOptions);
     return {
       send: (message) => child.send(message as never),
       on: (event: string, cb: (...args: unknown[]) => void) => {

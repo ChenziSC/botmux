@@ -26,7 +26,7 @@ import {
   isVcMeetingAgentGloballyEnabled,
   vcMeetingAgentGlobalListenerBotAppId,
 } from './config.js';
-import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from './global-config.js';
+import { readGlobalConfig, repoPickerScanOptions, isMultiTopicOrchestrationEnabled, isWorkflowFeatureEnabled } from './global-config.js';
 import { buildDashboardUrls, reportDashboardUrls } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
@@ -443,6 +443,8 @@ import { settleDeferredScheduleRun } from './core/deferred-schedule-settlement.j
 import { renderMessageListenerPrompt, refreshListenerCardTextFromResolved } from './services/message-listener.js';
 import { renderCommandTriggerPrompt } from './services/command-trigger.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
+import { sweepOrphanScratchSandboxes } from './adapters/backend/scratch-sandbox.js';
+import { sweepOrphanMacScratchSandboxes } from './adapters/backend/scratch-sandbox-darwin.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { HerdrBackend } from './adapters/backend/herdr-backend.js';
 import { ZellijBackend } from './adapters/backend/zellij-backend.js';
@@ -6582,6 +6584,20 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
   if (!verified.ok) return jsonRes(res, 403, { ok: false, error: verified.error });
   if (!ds || !ds.larkAppId || ds.larkAppId !== selfDaemonLarkAppId) {
     return jsonRes(res, 403, { ok: false, error: 'session_identity_incomplete' });
+  }
+
+  // Machine-wide multi-topic orchestration kill-switch. This daemon route is
+  // the authoritative sink that actually creates a new sub-project topic: the
+  // CLI never sends the seed itself, it posts here and the daemon performs the
+  // send below. The route lives in the narrow untrusted-auth aperture, so a
+  // sandboxed / read-isolated CLI holding its own session's rotating capability
+  // can reach it directly (networked sandboxes keep loopback), which the
+  // CLI-side gate in cmdDispatch cannot cover for a hand-rolled POST. Mirror the
+  // workflow feature's daemon-side 409. Appending to an existing topic via
+  // `dispatch --into` never reaches this route, so only new-topic creation is
+  // refused.
+  if (!isMultiTopicOrchestrationEnabled()) {
+    return jsonRes(res, 409, { ok: false, error: 'multi_topic_disabled' });
   }
 
   const stringArray = (value: unknown): string[] => Array.isArray(value)
@@ -21673,13 +21689,19 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     if (sgEntry?.lastSessionId) {
       const prevSession = sessionStore.getSession(sgEntry.lastSessionId);
       if (prevSession?.status === 'closed') {
-        const resumed = await resumeSession(sgEntry.lastSessionId, activeSessions);
-        if (resumed.ok) {
-          touchSessionGroup(chatId);
-          logger.info(`[session-group] resumed session=${sgEntry.lastSessionId.substring(0, 8)} in chat=${chatId.substring(0, 12)}`);
-          return handleThreadReply(data, ctx);
+        // /dismiss retries operate on the closed row. Resuming here would
+        // invalidate every confirmation before the sessionless route sees it.
+        const { parsed: preview } = parseEventMessage(data, createImgNumberer());
+        const command = parseSlashCommandInvocation(stripLeadingMentions(preview.content, preview.mentions));
+        if (command?.cmd !== '/dismiss') {
+          const resumed = await resumeSession(sgEntry.lastSessionId, activeSessions);
+          if (resumed.ok) {
+            touchSessionGroup(chatId);
+            logger.info(`[session-group] resumed session=${sgEntry.lastSessionId.substring(0, 8)} in chat=${chatId.substring(0, 12)}`);
+            return handleThreadReply(data, ctx);
+          }
+          logger.warn(`[session-group] resume failed (${resumed.error}) chat=${chatId.substring(0, 12)}; spawning fresh session`);
         }
-        logger.warn(`[session-group] resume failed (${resumed.error}) chat=${chatId.substring(0, 12)}; spawning fresh session`);
       }
     }
   }
@@ -28424,6 +28446,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Active sessions keep theirs — a same-topic worker reuses the tree.
   try {
     sweepOrphanSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
+    sweepOrphanScratchSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
+    sweepOrphanMacScratchSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
   } catch (err: any) {
     logger.warn(`[sandbox-sweep] failed: ${err?.message ?? err}`);
   }
@@ -28483,6 +28507,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const sandboxReconcileTimer = setInterval(() => {
     try {
       sweepOrphanSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
+    sweepOrphanScratchSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
+    sweepOrphanMacScratchSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
     } catch (err: any) {
       logger.warn(`[sandbox-reconcile] failed: ${err?.message ?? err}`);
     }

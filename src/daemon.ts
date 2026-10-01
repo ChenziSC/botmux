@@ -20386,6 +20386,31 @@ async function prepareIndependentCrossPrincipalSession(
   sourceDs: DaemonSession,
   record: CrossPrincipalInterruption,
 ): Promise<void> {
+  // This request belongs to the proposer, not the owner's active turn. The
+  // durable ingress envelope survives classification, IPC rerouting and restart.
+  // A physical IM id lets the provider prove both the message and its root;
+  // synthetic turn ids are never sent to the message API as if they were ids.
+  const sourceChecks = (record.messages.length ? record.messages : [undefined]).map(message =>
+    sourceTopicWriteOptions(sourceDs.larkAppId,
+      message?.turnId.startsWith('om_') ? message.turnId
+        : message?.inThread === false ? null
+          : message?.inThread === true ? message.replyRootId : undefined));
+  const recordId = record.id;
+  const sourceWriteOptions = { beforeWrite: async (): Promise<void> => {
+    if (getBot(sourceDs.larkAppId).config.topicUnavailablePolicy !== 'stop') return;
+    const assertCurrent = () => {
+      const current = sourceDs.session.crossPrincipalInterruptions?.find(item => item.id === recordId);
+      if (sourceDs.session.status !== 'active'
+        || findActiveBySessionId(sourceDs.session.sessionId) !== sourceDs
+        || !current || !['preparing_independent', 'independent_queued'].includes(current.phase)) {
+        throw new TopicSendError('TOPIC_SEND_CHECK_FAILED', '独立请求已变更，暂停创建和执行。');
+      }
+    };
+    assertCurrent();
+    for (const source of sourceChecks) await source.beforeWrite();
+    assertCurrent();
+  } };
+  await sourceWriteOptions.beforeWrite();
   let proposerId = record.proposer.requestUserOpenId;
   if (record.proposer.senderType === 'user') {
     const proposerIdentity = await resolveXpiHumanOpenId(sourceDs, record.proposer, 'proposer');
@@ -20442,11 +20467,14 @@ async function prepareIndependentCrossPrincipalSession(
       `${proposerAt}已为这条独立任务创建隔离话题；不会读取原会话的 CLI 记录或工具输出。`,
       'text',
       record.id,
+      undefined,
+      sourceWriteOptions,
     );
     record.independentRootMessageId = rootMessageId;
     persistCrossPrincipalQueue(sourceDs);
   }
 
+  await sourceWriteOptions.beforeWrite();
   let childDs = independentChildById(record.independentChildSessionId);
   if (!childDs) {
     const title = (record.messages[0]?.text || '独立任务').slice(0, 50);
@@ -20545,6 +20573,11 @@ async function prepareIndependentCrossPrincipalSession(
     type: record.proposer.senderType === 'bot' ? 'bot' as const : 'user' as const,
     ...(record.messages[0]?.proposerName ? { name: record.messages[0].proposerName } : {}),
   };
+  // Complete asynchronous preparation before staging an executable opening.
+  // A failed source check leaves the confirmed child/root reusable, without a
+  // new pending prompt that another recovery path could start in the meantime.
+  const availableBots = await getAvailableBots(childDs.larkAppId, childDs.chatId);
+  await sourceWriteOptions.beforeWrite();
   childDs.pendingPrompt = taskPrompt;
   childDs.pendingCodexAppText = taskText;
   childDs.pendingAttachments = record.messages.flatMap(item => item.attachments ?? []);
@@ -20566,7 +20599,6 @@ async function prepareIndependentCrossPrincipalSession(
     return;
   }
 
-  const availableBots = await getAvailableBots(childDs.larkAppId, childDs.chatId);
   const started = forkReservedInitialSession(childDs, availableBots, record.proposer);
   await settleCrossPrincipalTerminal(
     sourceDs,

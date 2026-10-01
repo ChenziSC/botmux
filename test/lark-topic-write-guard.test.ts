@@ -67,6 +67,17 @@ describe('stop policy at the actual Lark write boundary', () => {
     expect(beforeWrite).toHaveBeenCalledTimes(2);
     expect(mocks.hook).not.toHaveBeenCalled();
   });
+  it('checks authority after the awaited destination lookup before writing a reply', async () => {
+    let authorized = true;
+    mocks.request.mockImplementationOnce(async ({ url }) => {
+      authorized = false;
+      return { code: 0, data: { items: [{ message_id: url.split('/').at(-1), deleted: false }] } };
+    });
+    const beforeWrite = () => { if (!authorized) throw new Error('origin revoked'); };
+    await expect(replyMessage('app', 'om_other', 'answer', 'text', true, 'stable', undefined, { beforeWrite }))
+      .rejects.toThrow('origin revoked');
+    expect(mocks.reply).not.toHaveBeenCalled(); expect(mocks.hook).not.toHaveBeenCalled();
+  });
   it('keeps the original UUID and emits a single hook when a permitted retry succeeds', async () => {
     const beforeWrite = vi.fn(async () => {});
     mocks.create.mockRejectedValueOnce({ isAxiosError: true, response: { status: 429 } });

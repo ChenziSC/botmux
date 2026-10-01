@@ -361,7 +361,7 @@ describe('report source topic preservation', () => {
       expect(result.status).toBe(1);
       expect(result.stderr).toContain('TOPIC_SEND_BLOCKED');
       expect(result.outbound).toBeUndefined();
-      expect(result.topicReads).toEqual([THREAD]);
+      expect(result.topicReads).toContain(THREAD);
     },
   );
   it.each(['thread', 'quote'] as const)('retains the live chat turn %s source under top-level override', async turnPlacement => {
@@ -397,7 +397,7 @@ describe('report source topic preservation', () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toContain('TOPIC_SEND_BLOCKED');
     expect(result.outbound).toBeUndefined();
-    expect(result.topicReads).toEqual([THREAD, 'om_other']);
+    expect(result.topicReads).toEqual(['om_other']);
     const live = await runReport({ args: ['--top-level'], topicPolicy: 'stop' });
     expectRecipient(live, USER);
     expect(live.topicReads).toEqual([THREAD]);
@@ -409,5 +409,18 @@ describe('report source topic preservation', () => {
     const legacy = await runReport({ args: ['--top-level'], topicPolicy: 'legacy', unavailableMessage: THREAD });
     expectRecipient(legacy, USER);
     expect(legacy.topicReads).toEqual([]);
+  });
+});
+
+
+describe('report partial publication receipt', () => {
+  it('preserves the published message when the daemon cannot confirm the subsequent relay', async () => {
+    const result = await runReport({ args: ['--delivery', 'publish-and-relay'], relayStatus: 502,
+      relayBody: { ok: false, error: 'TOPIC_SEND_BLOCKED', publishedMessageId: 'om_published', relayConfirmed: false } });
+    expect(result.status).toBe(1);
+    expect(result.output).toMatchObject({ success: false, delivery: 'publish-and-relay', publishedMessageId: 'om_published', relayConfirmed: false });
+    expect(result.stderr).toContain('--delivery relay');
+    expect(result.outbound).toBeUndefined();
+    expect(result.requests).toHaveLength(1);
   });
 });

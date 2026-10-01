@@ -126,6 +126,8 @@ import {
   sessionConfiguredRuntimeDisplayName,
 } from './cli-runtime-display.js';
 import { isSessionGroup } from '../services/session-groups-store.js';
+import { tagClosedSessionGroup } from '../services/feed-group-tagger.js';
+import { dismissSessionGroup } from './dismiss-command.js';
 import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
 import { retryCooldownRemaining, markRetryAttempt } from '../services/failed-turn-retry.js';
 import { readGroupCollaborationMode, writeGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
@@ -155,7 +157,7 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * card buttons routable, but for these that record is a phantom conversation
  * that pollutes the dashboard's session list. Handle them without a session.
  */
-export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/project', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/sessions', '/skills', '/vc-auth', '/watch-comment', '/issue', '/cleanup-wt']);
+export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/project', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/sessions', '/skills', '/vc-auth', '/watch-comment', '/issue', '/cleanup-wt', '/dismiss']);
 
 const SLASH_GROUP_NAME_MAX_UTF16_LENGTH = 50;
 
@@ -2177,6 +2179,36 @@ export async function handleCommand(
         break;
       }
 
+      case '/dismiss': {
+        const appId = larkAppId ?? ds?.larkAppId;
+        const chatId = message.chatId ?? ds?.chatId;
+        if (!appId || !chatId || message.senderType !== 'user' || !message.senderId
+          || !canOperate(appId, chatId, message.senderId, message.senderUnionId)) {
+          await sessionReply(rootId, t('cmd.dismiss.owner_only', undefined, loc));
+          break;
+        }
+        const parsed = /^\/dismiss(?:\s+--confirm=([a-f0-9]{64}))?\s*$/i.exec(message.content.trim());
+        if (!parsed) {
+          await sessionReply(rootId, t('cmd.dismiss.usage', undefined, loc));
+          break;
+        }
+        const result = await dismissSessionGroup({
+          larkAppId: appId, chatId, rootId, senderId: message.senderId,
+          confirmedState: parsed[1], activeSessions,
+        });
+        if (result.status === 'dismissed') {
+          // The deleted group cannot receive the receipt; notify privately.
+          try { await sendUserMessage(appId, message.senderId, t('cmd.dismiss.dismissed', undefined, loc)); }
+          catch (err) { logger.warn(`[dismiss] private receipt failed: ${err}`); }
+        } else {
+          const reply = result.status === 'confirm'
+            ? t('cmd.dismiss.confirm', { command: `/dismiss --confirm=${result.state}` }, loc)
+            : t(`cmd.dismiss.${result.status}`, undefined, loc);
+          await sessionReply(rootId, reply + ('detail' in result && result.detail ? `\n${result.detail}` : ''));
+        }
+        break;
+      }
+
       case '/close': {
         const closeArg = message.content.replace(/^\/close\s*/i, '').trim();
         const closeTokens = closeArg.split(/\s+/).filter(Boolean);
@@ -2309,13 +2341,17 @@ export async function handleCommand(
             // Capture the closed-session card BEFORE closeWorkerPoolSession —
             // it reads the live session's identity off `current`.
             const card = buildClosedSessionCard(current, localeForBot(current.larkAppId));
+            const privateCard = getBot(current.larkAppId).config.privateCard === true;
             let closeResult;
             try {
               // closeWorkerPoolSession proves fail-closed backing teardown
               // before mutating any registry/store state, throwing when it
               // cannot verify it. Surface that so the active record is kept
               // for retry instead of being silently dropped.
-              closeResult = await closeWorkerPoolSession(targetSessionId);
+              const closeArgs: Parameters<typeof closeWorkerPoolSession> = privateCard
+                ? [targetSessionId, { cardVisibility: 'private' }]
+                : [targetSessionId];
+              closeResult = await closeWorkerPoolSession(...closeArgs);
             } catch (err) {
               return { status: 'teardown_failed' as const, err };
             }
@@ -2338,7 +2374,8 @@ export async function handleCommand(
                 residual: closeResult.residual,
               };
             }
-            return { status: 'closed' as const, current, card };
+            return { status: 'closed' as const, current, card, privateCard,
+              closedCardPatchQueued: closeResult.closedCardPatchQueued === true };
           });
           if (!closed) {
             await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
@@ -2389,18 +2426,38 @@ export async function handleCommand(
             );
             break;
           }
+          // Run only after a clean explicit close, never on crash/restart/refusal.
+          // The already-closed session and its receipt do not wait for OAuth/IM.
+          void tagClosedSessionGroup(closed.current.larkAppId, closed.current.chatId, targetSessionId)
+            .then(async result => {
+              if (result.status === 'skipped') return;
+              await sessionReply(rootId, result.status === 'updated'
+                ? t('cmd.close.tag_updated', { name: result.name }, loc)
+                : t('cmd.close.tag_failed', undefined, loc));
+            }).catch(err => logger.warn(`[${logTag}] close tag notification failed: ${err}`));
           // 「会话已关闭」卡片优先「仅自己可见」：普通群顶层走 ephemeral 只发给
           // 执行 /close 的本人；若本命令从折叠到 chat-scope 的真实话题触发，则
           // invocationReplyTarget 让 helper 跳过无 thread 锚点的 ephemeral，回原话题。
           try {
-            await deliverEphemeralOrReply(
-              closed.current,
-              message.senderId,
-              closed.card,
-              'interactive',
-              () => sessionReply(rootId, closed.card, 'interactive'),
-              deps.invocationReplyTarget,
-            );
+            if (closed.privateCard) {
+              const { sendEphemeralCard } = await import('../im/lark/client.js');
+              for (const openId of resolvePrivateCardAudience(closed.current)) {
+                await sendEphemeralCard(closed.current.larkAppId, closed.current.chatId, openId, closed.card)
+                  .catch(err => logger.warn(`[${logTag}] private close card delivery failed: ${err}`));
+              }
+            } else if (closed.current.scope === 'chat' || !closed.closedCardPatchQueued) {
+              // A thread's live card already has its closing PATCH queued. Keep
+              // the fallback when no PATCH was queued, and preserve the separate
+              // operator confirmation for chat-scoped sessions.
+              await deliverEphemeralOrReply(
+                closed.current,
+                message.senderId,
+                closed.card,
+                'interactive',
+                () => sessionReply(rootId, closed.card, 'interactive'),
+                deps.invocationReplyTarget,
+              );
+            }
           } catch (err) {
             if (!removeWorktree) throw err;
             // The session is already durably closed. For an explicitly confirmed
@@ -5788,6 +5845,7 @@ export async function handleCommand(
         const help = [
           t('help.heading_session', undefined, loc),
           t('help.close', { cliName }, loc),
+          t('help.dismiss', undefined, loc),
           t('help.cleanup_wt', undefined, loc),
           t('help.lane', undefined, loc),
           t('help.stop', { cliName }, loc),

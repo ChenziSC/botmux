@@ -1121,6 +1121,8 @@ interface ResolvedDashboardSettings {
     olderThanHours: SessionCleanupHours;
     intervalMinutes: number;
   };
+  /** Machine-wide multi-topic orchestration switch. Default ON. */
+  multiTopic: { enabled: boolean };
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
@@ -1706,6 +1708,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       olderThanHours: resolveCleanupHours(global.sessionCleanup),
       intervalMinutes: resolveCleanupIntervalMs(global.sessionCleanup) / 60_000,
     },
+    multiTopic: { enabled: global.multiTopic?.enabled !== false }, // default ON
     remoteAccess: global.remoteAccess === true,
     oauthRedirectBase: global.oauthRedirectBase ?? null,
     scheduleTimeZone: global.scheduleTimeZone ?? null,
@@ -3688,7 +3691,12 @@ const companionApi = (() => {
   const requireBoundBot = () => {
     const matches = readBotsJsonOrEmpty(BOTS_JSON_PATH).filter((entry) => entry?.larkAppId === appId);
     const bot = matches.length === 1 ? matches[0] : undefined;
-    if (!bot || bot.sandbox !== true || (bot.cliId !== 'codex' && bot.cliId !== 'traex')) {
+    // Companion binding REQUIRES a credential-isolating oncall sandbox (the
+    // companion's whole premise is running with the bot's masked transport
+    // credential). scratch is write-integrity COW without a read/secret
+    // boundary, so it is deliberately NOT accepted here — the CLI-side gate
+    // (companion-startup-options) rejects it too; keep both gates identical.
+    if (!bot || !(bot.sandbox === true || bot.sandbox === 'oncall') || (bot.cliId !== 'codex' && bot.cliId !== 'traex')) {
       throw new Error('companion_bound_bot_invalid');
     }
     return bot;

@@ -1,5 +1,6 @@
 import { captureDigest, createInputCaptureStore, type CapturedInput, type InputBinding } from './store.js';
 import { parseInputCaptureConditions } from './conditions.js';
+import { parseCaptureAttachments, type CaptureAttachment } from './attachments.js';
 
 export interface CaptureSession {
   sessionId: string; larkAppId: string; chatId: string; anchor: string;
@@ -55,6 +56,7 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
   return {
     register(sessionId: string, body: Record<string, unknown>) {
       if (!valid(body.pluginId, 100) || !valid(body.requestId, 128) || !valid(body.providerRef, 1000)
+        || body.captureAttachments !== undefined && typeof body.captureAttachments !== 'boolean'
         || body.inputAnchor !== undefined && (typeof body.inputAnchor !== 'string' || !/^om_[A-Za-z0-9_-]+$/.test(body.inputAnchor))) throw new Error('invalid_input_capture_request');
       const session = options.session(sessionId);
       if (!session || session.sessionId !== sessionId || !session.active || session.larkAppId !== larkAppId || !/^ou_[A-Za-z0-9_-]+$/.test(session.ownerOpenId)
@@ -66,7 +68,8 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
       return store.transact(state => {
         const prior = state.bindings.find(b => b.id === id);
         if (prior) {
-          if (!matchesSession(prior, session) || prior.providerRef !== body.providerRef || prior.anchor !== anchor) throw new Error('input_capture_identity_conflict');
+          if (!matchesSession(prior, session) || prior.providerRef !== body.providerRef || prior.anchor !== anchor
+            || !!prior.captureAttachments !== !!body.captureAttachments) throw new Error('input_capture_identity_conflict');
           return prior;
         }
         if (state.bindings.some(b => b.active && b.chatId === session.chatId
@@ -74,7 +77,10 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
         const binding: InputBinding = { id, revision: 1, active: true, larkAppId, sessionId,
           chatId: session.chatId, anchor, sourceAnchor: session.anchor, ownerOpenId: session.ownerOpenId,
           pluginId: body.pluginId as string, requestId: body.requestId as string, providerRef: body.providerRef as string,
-          createdAt: new Date().toISOString() };
+          createdAt: new Date().toISOString(), ...(body.captureAttachments === true ? { captureAttachments: true } : {}) };
+        // Opt-in data needs a new journal version: old readers must not advertise
+        // persisted attachment capability while running a text-only implementation.
+        if (binding.captureAttachments) state.schemaVersion = 2;
         state.bindings.push(binding); return binding;
       });
     },
@@ -110,18 +116,24 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
       });
     },
     capture(event: { messageId: string; chatId: string; anchor: string; senderOpenId: string;
-      memberUnionId?: string; text: string; botSender: boolean }): boolean {
-      if (event.botSender || !valid(event.messageId) || !valid(event.senderOpenId) || !event.text.trim()) return false;
+      memberUnionId?: string; text: string; attachments?: CaptureAttachment[]; botSender: boolean }): boolean {
+      if (event.botSender || !valid(event.messageId) || !valid(event.senderOpenId)
+        || typeof event.text !== 'string' || !event.text.trim() && !event.attachments?.length) return false;
       const state = store.read();
       const historical = state.inputs.find(row => row.messageId === event.messageId && state.bindings.some(b =>
         b.id === row.bindingId && b.chatId === event.chatId && b.anchor === event.anchor && b.ownerOpenId === event.senderOpenId));
       if (historical) {
-        if (historical.text !== event.text) throw new Error('input_capture_message_conflict');
+        if (historical.text !== event.text
+          || JSON.stringify(parseCaptureAttachments(historical.attachments)) !== JSON.stringify(parseCaptureAttachments(event.attachments))) {
+          throw new Error('input_capture_message_conflict');
+        }
         void kick(); return true;
       }
       const binding = state.bindings.find(b => b.active && b.chatId === event.chatId
         && b.anchor === event.anchor && b.ownerOpenId === event.senderOpenId);
       if (!binding) return false;
+      if (event.attachments?.length && !binding.captureAttachments) return false;
+      const attachments = parseCaptureAttachments(event.attachments);
       // Once a binding owns a route, invalidated authority must not turn it into
       // an unrelated Worker prompt. Keep the binding for explicit reconciliation.
       const session = options.session(binding.sessionId);
@@ -135,12 +147,14 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
         const id = captureDigest([binding.id, event.messageId]);
         const prior = current.inputs.find(row => row.id === id);
         if (prior) {
-          if (prior.senderOpenId !== event.senderOpenId || prior.text !== event.text) throw new Error('input_capture_message_conflict');
+          if (prior.senderOpenId !== event.senderOpenId || prior.text !== event.text
+            || JSON.stringify(parseCaptureAttachments(prior.attachments)) !== JSON.stringify(attachments)) throw new Error('input_capture_message_conflict');
           return;
         }
         current.inputs.push({ id, bindingId: binding.id,
           sequence: current.inputs.filter(row => row.bindingId === binding.id).length + 1,
           messageId: event.messageId, senderOpenId: event.senderOpenId, text: event.text,
+          ...(attachments.length ? { attachments } : {}),
           receivedAt: new Date().toISOString(), delivery: 'pending' });
       });
       void kick(); return true;

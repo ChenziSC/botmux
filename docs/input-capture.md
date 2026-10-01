@@ -9,7 +9,7 @@ botmux input-capture revoke --bot <app> --session <session> --binding <binding-i
 botmux input-capture revoke-set --bot <app> --session <session> --bindings '<conditions-json>'
 ```
 
-对应 `POST /api/sessions/:sessionId/input-capture`，body 包含 larkAppId、operation 与命令字段。路由必须通过当前宿主 HMAC；不加入 session relay allowlist。register 同一身份幂等；同一 bot/chat/anchor/owner 的第二个活动绑定冲突。撤销后保留墓碑，同一个 request 不会重新激活。
+对应 `POST /api/sessions/:sessionId/input-capture`，body 包含 larkAppId、operation 与命令字段。注册支持可选布尔值 `captureAttachments`（CLI 为 `--capture-attachments true|false`），默认关闭；同一 request 的订阅能力固定，重试不得改变。路由必须通过当前宿主 HMAC；不加入 session relay allowlist。register 同一身份幂等；同一 bot/chat/anchor/owner 的第二个活动绑定冲突。撤销后保留墓碑，同一个 request 不会重新激活。
 
 `revoke-set` 的 `conditions-json` 是 1–32 个 `{bindingId, expectedRevision, expectedInputCount}` 对象。
 宿主在同一个日志事务内核验所有绑定都属于原 session、revision 匹配且已接收输入总数等于预期，然后一起撤销。
@@ -21,7 +21,7 @@ botmux input-capture revoke-set --bot <app> --session <session> --bindings '<con
 消费者应先核对 inspect 返回的全部原 input ID、内容和连续序号已经持久化，再用它们的数量发起条件撤销。
 这个接口只建立输入接管的结束边界；它不证明插件已处理输入、业务已完成或下一步已获授权。
 
-接管在飞书 SDK 回调返回 ACK 之前同步执行，并排除 slash/回调命令、话题控制头与附件；不会经过先 ACK 再异步执行的普通消息调度队列。附件、workflow grill、机器人和其他答复者继续走现有路由。命中后重新检查当前原生 talk 权限及会话身份，再将完整文字、真实 messageId、sender 和单调序号 fsync 到宿主日志，才返回已接收。持久化失败不返回成功，也不转投普通 Worker；需要排查保存故障，不能假定上游一定重投。
+接管在飞书 SDK 回调返回 ACK 之前同步执行，并排除 slash/回调命令与话题控制头；不会经过先 ACK 再异步执行的普通消息调度队列。未订阅的附件、workflow grill、机器人和其他答复者继续走现有路由。命中后重新检查当前原生 talk 权限及会话身份，再将完整正文、订阅的资源引用、真实 messageId、sender 和单调序号 fsync 到宿主日志，才返回已接收。持久化失败不返回成功，也不转投普通 Worker；需要排查保存故障，不能假定上游一定重投。
 
 宿主异步向该插件的现有服务 `POST /botmux/inputs/v1`。沿用官方插件服务注册、固定 loopback 端口和 `BOTMUX_PLUGIN_CARD_ACTION_TOKEN`，不接受调用者提供 URL 或凭据：
 
@@ -32,6 +32,16 @@ botmux input-capture revoke-set --bot <app> --session <session> --bindings '<con
 
 插件必须先按 input.id 幂等持久化，再返回 `{schemaVersion:1, bindingId, acceptedInputId}`。输入是已接收事实，不能视作未来执行的授权。相同 ID 的不同内容必须拒绝，禁止改写历史消息。服务离线、错误 ACK、超时或宿主保存 ACK 失败，均保留原条目并按原顺序重试；不得 fallback 普通 Worker，也不得假定飞书重投。
 
-重启恢复 pending；撤销接管保留并继续交付已经接收的输入。移除插件启用配置会暂停交付，保留记录。inspect 不消费、不 GC。当前不自动清理绑定、已确认输入或墓碑；历史数据归档/清理由未来显式迁移处理。接口只接管已经通过消息入口到达原会话的纯文字，不声称覆盖附件或飞书未投递的消息。
+重启恢复 pending；撤销接管保留并继续交付已经接收的输入。移除插件启用配置会暂停交付，保留记录。inspect 不消费、不 GC。当前不自动清理绑定、已确认输入或墓碑；历史数据归档/清理由未来显式迁移处理。接口只接管已经通过消息入口到达原会话的输入，不声称覆盖飞书未投递的消息；仅有 thread_id 而无原 root_id 的消息仍保留在原路由，尚不在该接管范围内。
 
 此能力不调度模型、不解释答案、不维护业务阶段。平台负责原会话续执行、scope/专业回执与副作用校验。没有完成平台 consumer 和旧数据迁移前不能切换生产来源。
+
+## 可选附件订阅
+
+注册时传 `--capture-attachments true` 后，绑定回执包含 `captureAttachments:true`。既有默认文字绑定保持原行为，不允许同一 request 静默切换能力。消费者必须核对能力回执，不能把旧宿主忽略参数当作支持。
+
+已捕获输入可包含 `attachments:[{messageId,type,key}]`；类型为 `image|file|audio|media|merge_forward`。图片、文件、音视频和富文本资源只传稳定引用；合并转发保留原消息引用（key 等于 messageId）。单条最多 100 个引用，字段只允许上述三项，不提供本地下载路径、URL 或凭据。正文仍限制为 64 KiB。资源内容由插件使用自己的授权读取，此接口不下载或解释附件。
+
+附件输入的 text 仅保留原作者正文，去除图片/文件占位标签、文件名和转发内容；纯附件输入允许空正文。上传资料本身不是批准。纯文字旧输入不补写空 attachments，读取不改变历史字节。重复消息必须同时匹配正文和完整资源引用；撤销、保存失败、断连与恢复沿用相同日志和 ACK 规则。
+
+首次注册附件订阅时，宿主内部日志原子升级为 schemaVersion 2，旧 reader/writer 必须拒绝该日志；没有附件订阅的文字日志仍为 v1，读取和幂等注册不改写。HTTP/插件事件仍为 schemaVersion 1。回退运行版本前必须排空并核对能力，不能降低日志版本或拿旧文件覆盖新输入。

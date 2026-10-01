@@ -23,11 +23,16 @@ it('requires real host HMAC before register and keeps query / revoke bound to th
   const f = setup(); setInputCaptureRuntime('cli_capture', f.runtime); setLarkAppId('cli_capture'); setIpcAuthSecret('capture-test-secret');
   const server = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true }); cleanup.push(() => server.close());
   const path = '/api/sessions/s/input-capture';
-  const init = { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ larkAppId: 'cli_capture', operation: 'register', pluginId: 'example', requestId: 'r', providerRef: 'opaque', inputAnchor: 'om_card' }) };
+  const init = parseInputCaptureCommand(['register', '--bot', 'cli_capture', '--session', 's', '--plugin', 'example',
+    '--request', 'r', '--ref', 'opaque', '--input-anchor', 'om_card', '--capture-attachments', 'true']).init;
   expect((await fetch(`http://127.0.0.1:${server.port}${path}`, init)).status).toBe(401);
   expect(f.store.read().bindings).toEqual([]);
   const registered = await fetchDaemonIpc(server.port, path, init, 'capture-test-secret'); expect(registered.status).toBe(200);
-  const body = await registered.json(); expect(body.result).toMatchObject({ anchor: 'om_card', sourceAnchor: 'oc_chat' });
+  const body = await registered.json(); expect(body.result).toMatchObject({ anchor: 'om_card', sourceAnchor: 'oc_chat', captureAttachments: true });
+  expect(captureInboundText({ sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+    message: { message_id: 'om_upload', chat_id: 'oc_chat', chat_type: 'group', root_id: 'om_card',
+      message_type: 'file', content: JSON.stringify({ file_key: 'file_material', file_name: 'approve.txt' }) } }, f.runtime, () => false)).toBe(true);
+  expect(f.store.read().inputs[0]).toMatchObject({ text: '', attachments: [{ messageId: 'om_upload', type: 'file', key: 'file_material' }] });
   const inspect = { ...init, body: JSON.stringify({ larkAppId: 'cli_capture', operation: 'inspect', bindingId: body.result.id }) };
   expect((await fetchDaemonIpc(server.port, '/api/sessions/other/input-capture', inspect, 'capture-test-secret')).status).toBe(404);
   const revoked = await fetchDaemonIpc(server.port, path, { ...init, body: JSON.stringify({ larkAppId: 'cli_capture', operation: 'revoke', bindingId: body.result.id, expectedRevision: 1 }) }, 'capture-test-secret');

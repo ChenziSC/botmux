@@ -3,19 +3,22 @@ import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { atomicWriteFileSync } from '../../../utils/atomic-write.js';
 import { withFileLockSync } from '../../../utils/file-lock.js';
+import { parseCaptureAttachments, type CaptureAttachment } from './attachments.js';
 
 export interface InputBinding {
   id: string; revision: number; active: boolean; larkAppId: string; sessionId: string;
   chatId: string; anchor: string; sourceAnchor: string; ownerOpenId: string; pluginId: string;
   requestId: string; providerRef: string; createdAt: string;
+  captureAttachments?: boolean;
 }
 export interface CapturedInput {
   id: string; bindingId: string; sequence: number; messageId: string;
   senderOpenId: string; text: string; receivedAt: string;
+  attachments?: CaptureAttachment[];
   delivery: 'pending' | 'acknowledged'; acknowledgedAt?: string;
 }
 export interface CaptureJournal {
-  schemaVersion: 1; larkAppId: string; bindings: InputBinding[]; inputs: CapturedInput[];
+  schemaVersion: 1 | 2; larkAppId: string; bindings: InputBinding[]; inputs: CapturedInput[];
 }
 export const captureDigest = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
@@ -27,14 +30,16 @@ export function createInputCaptureStore(dataDir: string, larkAppId: string) {
   const read = (): CaptureJournal => {
     if (!existsSync(file)) return empty();
     const state: CaptureJournal = JSON.parse(readFileSync(file, 'utf8'));
-    if (state.schemaVersion !== 1 || state.larkAppId !== larkAppId
+    if (![1, 2].includes(state.schemaVersion) || state.larkAppId !== larkAppId
       || !Array.isArray(state.bindings) || !Array.isArray(state.inputs)) throw new Error('input_capture_journal_invalid');
     const ids = new Set<string>();
     for (const b of state.bindings) {
       if (b.larkAppId !== larkAppId || !b.id || ids.has(b.id) || typeof b.active !== 'boolean'
         || !Number.isSafeInteger(b.revision) || b.revision < 1
         || !b.sessionId || !b.chatId || !b.anchor || !b.sourceAnchor || !b.ownerOpenId || !b.pluginId || !b.requestId
-        || typeof b.providerRef !== 'string') throw new Error('input_capture_journal_invalid');
+        || typeof b.providerRef !== 'string'
+        || b.captureAttachments !== undefined && typeof b.captureAttachments !== 'boolean'
+        || b.captureAttachments === true && state.schemaVersion !== 2) throw new Error('input_capture_journal_invalid');
       ids.add(b.id);
     }
     const events = new Set<string>(); const sequences = new Map<string, number>();
@@ -44,6 +49,10 @@ export function createInputCaptureStore(dataDir: string, larkAppId: string) {
         || !input.messageId || !input.senderOpenId || typeof input.text !== 'string'
         || !['pending', 'acknowledged'].includes(input.delivery)) throw new Error('input_capture_journal_invalid');
       events.add(input.id); sequences.set(input.bindingId, sequence);
+      const attachments = parseCaptureAttachments(input.attachments);
+      if (attachments.length && state.bindings.find(b => b.id === input.bindingId)?.captureAttachments !== true) {
+        throw new Error('input_capture_journal_invalid');
+      }
     }
     return state;
   };

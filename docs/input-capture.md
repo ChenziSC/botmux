@@ -65,3 +65,5 @@ botmux input-capture revoke-set --bot <app> --session <session> --bindings '<con
 每页最多 64 条，按完整输入 JSON 的实际字节数控制约 128 KiB；单条可能因转义超出该预算，仍完整返回且游标前进。消费者应支持 512 KiB 响应以容纳一条合法最大正文及附件引用，不无限提高整段历史的响应上限。空前缀/末页返回空数组和 null；不截断内容，不消费数据，不升级日志 schema。
 
 消费者逐页核对同一个 binding 身份、revision/active、固定 throughSequence、连续序号和游标，汇总到完整 snapshot。分页期间绑定生命周期变化须重读；输入追加可保留原前缀，但稍后 `revoke-set expectedInputCount` 必须拒绝变化后的总数。pending 和 acknowledged 都在前缀内。未传分页参数时维持旧 `{binding,inputs}` 格式；新集成要求显式分页回执，不能把旧宿主忽略参数的响应当作已经完整分页。
+
+Topic header detection uses the same native parser as command routing, including titled lifecycle aliases and `/repo wt`. Both valid and invalid recognized headers remain with the native router (including rich posts with attachments), so command errors cannot silently become captured answers. Ordinary replies remain eligible for their original exact binding.

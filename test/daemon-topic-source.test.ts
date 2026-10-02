@@ -134,6 +134,53 @@ describe('daemon dispatch and report source topics', () => {
     expect(result.body.detail).toContain('dispatch origin changed');
     expect(mocks.create).not.toHaveBeenCalled();
   });
+  it('retains a folded topic for a trusted host request without managed turn metadata', async () => {
+    ds.scope = 'chat'; ds.session.scope = 'chat'; ds.managedTurnOrigin = undefined;
+    ds.currentReplyTarget = { turnId: 'turn-source', rootMessageId: 'om_source' };
+    unavailable = true;
+    const result = await invoke(DISPATCH_REPORT_REGISTER_ROUTE, registerBody());
+    expect(result.status).toBe(502);
+    expect(result.body.detail).toContain('TOPIC_SEND_BLOCKED');
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
+  it('rejects a new managed origin introduced while an unscoped request awaits lookup', async () => {
+    ds.managedTurnOrigin = undefined;
+    mocks.request.mockImplementationOnce(async ({ url }) => {
+      ds.managedTurnOrigin = { turnId: 'turn-next', capability: 'd'.repeat(64), dispatchAttempt: 2 };
+      return { code: 0, data: { items: [{ message_id: url.split('/').at(-1), deleted: false }] } };
+    });
+    const result = await invoke(DISPATCH_REPORT_REGISTER_ROUTE, registerBody());
+    expect(result.status).toBe(502);
+    expect(result.body.detail).toContain('dispatch origin changed');
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
+  it('uses the exact frozen turn instead of a newer chat reply target', async () => {
+    ds.scope = 'chat'; ds.session.scope = 'chat';
+    ds.currentReplyTarget = { turnId: 'turn-next', rootMessageId: 'om_new_topic' };
+    ds.session.turnReplyContexts = { 'turn-source': { target: { mode: 'thread', rootMessageId: 'om_source' } } };
+    unavailable = true;
+    const result = await invoke(DISPATCH_REPORT_REGISTER_ROUTE, registerBody());
+    expect(result.status).toBe(502);
+    expect(mocks.create).not.toHaveBeenCalled();
+    expect(mocks.request.mock.calls.map(([r]) => r.url.split('/').at(-1))).toEqual(['om_source']);
+  });
+  it('does not write after its active session instance is removed during lookup', async () => {
+    mocks.request.mockImplementationOnce(async ({ url }) => {
+      activeSessions.clear();
+      return { code: 0, data: { items: [{ message_id: url.split('/').at(-1), deleted: false }] } };
+    });
+    const result = await invoke(DISPATCH_REPORT_REGISTER_ROUTE, registerBody());
+    expect(result.status).toBe(502);
+    expect(result.body.detail).toContain('dispatch origin changed');
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
+  it('rejects missing topic evidence instead of treating it as a plain chat', async () => {
+    ds.session.rootMessageId = undefined;
+    const result = await invoke(DISPATCH_REPORT_REGISTER_ROUTE, registerBody());
+    expect(result.status).toBe(502);
+    expect(result.body.detail).toContain('TOPIC_SEND_CHECK_FAILED');
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
   it('allows a live source while preserving its intended dispatch destination', async () => {
     const result = await invoke(DISPATCH_REPORT_REGISTER_ROUTE, registerBody());
     expect(result.status).toBe(201);

@@ -3912,16 +3912,15 @@ function sourceTopicWriteOptions(larkAppId: string, sourceRoot: string | null | 
 function sessionTopicWriteOptions(ds: DaemonSession, turnId?: string, verifiedSourceRoot?: string) {
   const source = verifiedSourceRoot !== undefined
     ? { mode: 'thread' as const, rootMessageId: verifiedSourceRoot }
-    : frozenReplyContextForTurn(ds, turnId)?.target
-      ?? resolveSessionReplyTarget(ds, fallbackTurnId(ds, turnId));
+    : frozenReplyContextForTurn(ds, fallbackTurnId(ds, turnId)).target;
   const topic = sourceTopicWriteOptions(ds.larkAppId, source.mode === 'plain' ? null : source.rootMessageId);
   const sessionId = ds.session.sessionId;
   const origin = ds.managedTurnOrigin ? { ...ds.managedTurnOrigin } : undefined;
   const assertOrigin = () => {
     if (findActiveBySessionId(sessionId) !== ds
-      || (origin && (ds.managedTurnOrigin?.turnId !== origin.turnId
-        || ds.managedTurnOrigin?.dispatchAttempt !== origin.dispatchAttempt
-        || ds.managedTurnOrigin?.capability !== origin.capability))) {
+      || ds.managedTurnOrigin?.turnId !== origin?.turnId
+      || ds.managedTurnOrigin?.dispatchAttempt !== origin?.dispatchAttempt
+      || ds.managedTurnOrigin?.capability !== origin?.capability) {
       throw new Error('dispatch origin changed before provider effect');
     }
   };

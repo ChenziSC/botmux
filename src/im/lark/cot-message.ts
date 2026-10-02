@@ -47,6 +47,7 @@ import { boundSubjectForTitle, subjectFromArgsString, type ToolSubject } from '.
 import { fallbackTurnId, frozenReplyContextForTurn } from '../../core/reply-target.js';
 import { isSilentScheduledTurn } from '../../core/silent-schedule-turns.js';
 import { TopicSendError } from './topic-send-guard.js';
+import { pendingStartingCardPublication } from '../../core/starting-card-publication.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 import { localeForBot, t } from '../../i18n/index.js';
@@ -629,6 +630,18 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
   try {
     while (!state.disabled) {
       if (!state.cotId) {
+        const startingCard = pendingStartingCardPublication(ds);
+        if (startingCard) {
+          await startingCard;
+          // A newer turn/stop can arrive during the POST. Never resurrect its
+          // predecessor's not-yet-visible bubble below the current work card.
+          if (state.disabled || state.settled || states.get(ds) !== state
+            || state.finishStatus === 'interrupted'
+            || (ds.currentTurnId && ds.currentTurnId !== state.turnId)) {
+            state.disabled = true;
+            break;
+          }
+        }
         await apiCreate(ds, state);
         // Record the orphan marker the moment the bubble exists — before the
         // prologue append. If the prologue fails (or the daemon restarts

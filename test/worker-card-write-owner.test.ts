@@ -15,10 +15,10 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({ Client: class {
 } }));
 import {
   initWorkerPool, setActiveSessionsRegistry, getActiveSessionsRegistry,
-  postTurnStartingCard, postFreshStreamingCard, __testOnly_setupWorkerHandlers as setupWorkerHandlers,
+  postTurnStartingCard, postFreshStreamingCard, scheduleCardPatch, closeSession, __testOnly_setupWorkerHandlers as setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { updateTurnReplyCard } from '../src/core/turn-reply-card.js';
-import { registerBot } from '../src/bot-registry.js';
+import { registerBot, getBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
@@ -215,4 +215,156 @@ describe('native worker card publication', () => {
       expect(mocks.reply.mock.calls[0][0].path.message_id).toBe('om_source');
     } else expect(ds.streamCardNonce).toBe('replacement');
   });
+});
+
+
+describe('queued streaming-card PATCH ownership', () => {
+  const changes = ['nonce', 'generation', 'turn', 'session', 'registry', 'chat', 'card', 'disabled', 'transport'] as const;
+  it.each(changes)('does not retry a PATCH after its %s owner changes', async change => {
+    ds.streamCardId = 'om_status'; ds.streamCardNonce = 'nonce_original';
+    ds.workerGeneration = 1; ds.currentTurnId = 'turn_original';
+    let rejected = false;
+    mocks.patch.mockImplementationOnce(async () => {
+      if (change === 'nonce') ds.streamCardNonce = 'replacement';
+      if (change === 'generation') ds.workerGeneration = 2;
+      if (change === 'turn') ds.currentTurnId = 'turn_replacement';
+      if (change === 'session') ds.session = { ...ds.session };
+      if (change === 'registry') activeSessions.clear();
+      if (change === 'chat') ds.chatId = 'oc_replacement';
+      if (change === 'card') ds.streamCardId = 'om_replacement';
+      if (change === 'disabled') getBot(APP).config.disableStreamingCard = true;
+      if (change === 'transport') getBot(APP).config.apiOnly = true;
+      rejected = true;
+      throw { isAxiosError: true, response: { status: 429 } };
+    });
+    expect(scheduleCardPatch(ds, '{"status":"working"}', 'turn_original')).toBe(true);
+    await vi.waitFor(() => expect(rejected).toBe(true));
+    await vi.waitFor(() => expect(ds.cardPatchInFlight).toBe(false), { timeout: 3000 });
+    expect(mocks.patch).toHaveBeenCalledTimes(1);
+    expect(ds.streamCardId).toBe(change === 'card' ? 'om_replacement' : 'om_status');
+  });
+
+  it('still retries an owned PATCH at its original message', async () => {
+    ds.streamCardId = 'om_status'; ds.streamCardNonce = 'nonce_original';
+    mocks.patch.mockRejectedValueOnce({ isAxiosError: true, response: { status: 429 } });
+    expect(scheduleCardPatch(ds, '{"status":"working"}')).toBe(true);
+    await vi.waitFor(() => expect(ds.cardPatchInFlight).toBe(false), { timeout: 3000 });
+    expect(mocks.patch).toHaveBeenCalledTimes(2);
+    expect(mocks.patch.mock.calls.every(([request]) => request.path.message_id === 'om_status')).toBe(true);
+  });
+
+  it('drains the newer queued card after a stale PATCH loses ownership', async () => {
+    ds.streamCardId = 'om_status'; ds.streamCardNonce = 'nonce_original';
+    mocks.patch.mockImplementationOnce(async () => {
+      ds.streamCardNonce = 'nonce_new'; ds.streamCardId = 'om_new_status';
+      scheduleCardPatch(ds, '{"status":"new"}');
+      throw { isAxiosError: true, response: { status: 429 } };
+    });
+    scheduleCardPatch(ds, '{"status":"old"}');
+    await vi.waitFor(() => expect(ds.cardPatchInFlight).toBe(false), { timeout: 3000 });
+    expect(mocks.patch.mock.calls.map(([request]) => request.path.message_id)).toEqual(['om_status', 'om_new_status']);
+    expect(ds.pendingCardJson).toBeUndefined();
+  });
+
+  it('freezes the original card after close even when the active registry no longer owns the session', async () => {
+    ds.streamCardId = 'om_status'; ds.streamCardNonce = 'nonce_original';
+    mocks.patch.mockRejectedValueOnce({ isAxiosError: true, response: { status: 429 } });
+    const result = await closeSession(ds.session.sessionId);
+    expect(result.ok).toBe(true);
+    await vi.waitFor(() => expect(ds.cardPatchInFlight).toBe(false), { timeout: 3000 });
+    expect(ds.session.status).toBe('closed');
+    expect(mocks.patch).toHaveBeenCalledTimes(2);
+    expect(mocks.patch.mock.calls.every(([request]) => request.path.message_id === 'om_status')).toBe(true);
+  });
+});
+
+
+it('drops a queued status PATCH when its source lookup observes owner replacement', async () => {
+  ds.streamCardId = 'om_status'; ds.streamCardNonce = 'nonce_original';
+  const read = mocks.request.getMockImplementation()!;
+  mocks.request.mockImplementationOnce(async request => {
+    const result = await read(request); ds.streamCardNonce = 'nonce_new'; return result;
+  });
+  scheduleCardPatch(ds, '{"status":"working"}');
+  await vi.waitFor(() => expect(ds.cardPatchInFlight).toBe(false), { timeout: 3000 });
+  expect(mocks.patch).not.toHaveBeenCalled();
+});
+
+it('replaces pending active renders with a close freeze while the old PATCH is retrying', async () => {
+  ds.streamCardId = 'om_status'; ds.streamCardNonce = 'nonce_original';
+  let reject!: (error: unknown) => void;
+  mocks.patch.mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail; }));
+  scheduleCardPatch(ds, '{"status":"working"}');
+  await vi.waitFor(() => expect(reject).toBeTypeOf('function'));
+  scheduleCardPatch(ds, '{"status":"queued_working"}');
+  expect((await closeSession(ds.session.sessionId)).ok).toBe(true);
+  reject({ isAxiosError: true, response: { status: 429 } });
+  await vi.waitFor(() => expect(ds.cardPatchInFlight).toBe(false), { timeout: 3000 });
+  expect(mocks.patch).toHaveBeenCalledTimes(2);
+  expect(mocks.patch.mock.calls[1][0].data.content).not.toContain('queued_working');
+  expect(ds.session.status).toBe('closed');
+  expect(ds.pendingCardJson).toBeUndefined();
+});
+
+
+it.each(['private', 'disabled'] as const)('does not retry a close freeze after the card becomes %s', async change => {
+  ds.streamCardId = 'om_status'; ds.streamCardNonce = 'nonce_original';
+  mocks.patch.mockImplementationOnce(async () => {
+    if (change === 'private') getBot(APP).config.privateCard = true;
+    else getBot(APP).config.disableStreamingCard = true;
+    throw { isAxiosError: true, response: { status: 429 } };
+  });
+  expect((await closeSession(ds.session.sessionId)).ok).toBe(true);
+  await vi.waitFor(() => expect(ds.cardPatchInFlight).toBe(false), { timeout: 3000 });
+  expect(mocks.patch).toHaveBeenCalledTimes(1);
+});
+
+it('does not clear a reused card after an old PATCH reports it withdrawn', async () => {
+  ds.streamCardId = 'om_status'; ds.streamCardNonce = 'nonce_original';
+  mocks.patch.mockImplementationOnce(async () => {
+    ds.streamCardNonce = 'nonce_new';
+    scheduleCardPatch(ds, '{"status":"new"}');
+    return { code: 230011, msg: 'Message recalled' };
+  });
+  scheduleCardPatch(ds, '{"status":"old"}');
+  await vi.waitFor(() => expect(ds.cardPatchInFlight).toBe(false), { timeout: 3000 });
+  expect(ds.streamCardId).toBe('om_status');
+  expect(ds.streamCardNonce).toBe('nonce_new');
+  expect(mocks.patch).toHaveBeenCalledTimes(2);
+});
+
+
+function prepareLegacyStatusPolicy() {
+  ds.streamCardId = 'om_status'; ds.streamCardNonce = 'nonce_original';
+  ds.workerGeneration = 4; ds.session.workerGeneration = 4;
+  ds.session.statusPolicyTurnId = 'turn_policy';
+  ds.session.turnStatusPolicies = { turn_policy: { statusCard: 'visible', title: 'visible',
+    state: 'committed', workerGeneration: 4, dispatchAttempt: 1 } };
+}
+
+it('rechecks the retained status policy at the actual provider retry', async () => {
+  prepareLegacyStatusPolicy();
+  mocks.patch.mockImplementationOnce(async () => {
+    ds.session.turnStatusPolicies!.turn_policy.dispatchAttempt = 2;
+    throw { isAxiosError: true, response: { status: 429 } };
+  });
+  scheduleCardPatch(ds, '{"status":"working"}', 'turn_policy');
+  await vi.waitFor(() => expect(ds.cardPatchInFlight).toBe(false), { timeout: 3000 });
+  expect(mocks.patch).toHaveBeenCalledTimes(1);
+});
+
+it('does not reuse a pending active policy fence for the closed card', async () => {
+  prepareLegacyStatusPolicy();
+  let reject!: (error: unknown) => void;
+  mocks.patch.mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail; }));
+  scheduleCardPatch(ds, '{"status":"working"}', 'turn_policy');
+  await vi.waitFor(() => expect(reject).toBeTypeOf('function'));
+  scheduleCardPatch(ds, '{"status":"queued_working"}', 'turn_policy');
+  ds.session.turnStatusPolicies!.turn_policy.dispatchAttempt = 2;
+  expect((await closeSession(ds.session.sessionId)).ok).toBe(true);
+  reject({ isAxiosError: true, response: { status: 429 } });
+  await vi.waitFor(() => expect(ds.cardPatchInFlight).toBe(false), { timeout: 3000 });
+  expect(mocks.patch).toHaveBeenCalledTimes(2);
+  expect(mocks.patch.mock.calls[1][0].data.content).not.toContain('queued_working');
+  expect(ds.session.status).toBe('closed');
 });

@@ -12497,7 +12497,6 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --bot <spec>          兼容外部/旧链路；spec = open_id[:名字[:角色]]，不保证本机双向授权
   --brief <text>        子项目简报 / 追加内容；首个语义行写 @steer 可显式调整活跃 Codex App turn
   --brief-file <path>   从文件读取简报
-  --result-delivery <mode>  结果投递：relay（默认）|publish|publish-and-relay
   --steer               在简报前注入通用 @steer 指令；普通 dispatch 默认仍进入 Queue
   --repo <path>         预设子 bot 工作目录（绝对路径，需在子 bot 所在机器上存在）
   --standby             仅 --repo 待命，不派简报
@@ -12532,7 +12531,6 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const intoRoot = dispatchArgs.into;
   const standby = dispatchArgs.standby;
   const steer = dispatchArgs.steer;
-  const resultDelivery = dispatchArgs.resultDelivery ?? 'relay';
   const botSpecs = dispatchArgs.bots;
   const botAppSpecs = dispatchArgs.botApps;
 
@@ -12565,10 +12563,6 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   }
   if (!standby && !brief.trim()) {
     console.error('缺少简报。用 --brief 或 --brief-file 指定（仅 --standby 模式可省略）。');
-    process.exit(1);
-  }
-  if (!['relay', 'publish', 'publish-and-relay'].includes(resultDelivery)) {
-    console.error('--result-delivery 必须是 relay|publish|publish-and-relay。');
     process.exit(1);
   }
   if (steer) brief = withBotSteerDirective(brief);
@@ -12709,7 +12703,6 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     dispatchRootId,
     exactReportRootEnabled,
     sameTopicSendEnabled,
-    resultDelivery: resultDelivery as 'relay' | 'publish' | 'publish-and-relay',
   });
   let built;
   try {

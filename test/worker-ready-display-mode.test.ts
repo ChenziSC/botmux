@@ -1748,7 +1748,9 @@ describe('worker-authoritative handoff live card', () => {
     expect(effects.remove.mock.calls.every(([id]) => id === 'om_previous')).toBe(true);
     expect(ds.streamCardId).toBe('om_manual');
     worker.emit('message', { type: 'screen_update', content: 'manual update', status: 'idle', turnId: 'trg_review' });
-    await vi.waitFor(() => expect(updateMessageMock).toHaveBeenCalledWith('app_test', 'om_manual', expect.any(String)));
+    await vi.waitFor(() => expect(updateMessageMock).toHaveBeenCalledWith(
+      'app_test', 'om_manual', expect.any(String), { beforeWrite: expect.any(Function) },
+    ));
     expect(reply).not.toHaveBeenCalled();
   });
 

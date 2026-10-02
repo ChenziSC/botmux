@@ -322,7 +322,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
     setupActiveWorkerHandlers(ds, fakeWorker);
     fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
     await primaryEffectsBarrier();
-    expect(updateMessageMock).toHaveBeenCalledWith('app_test', 'om_restored_card', expect.any(String));
+    expect(updateMessageMock).toHaveBeenCalledWith('app_test', 'om_restored_card', expect.any(String), { beforeWrite: expect.any(Function) });
     expect(pinMessageMock).toHaveBeenCalledWith('app_test', 'om_restored_card');
     expect(deleteMessageMock).toHaveBeenCalledWith('app_test', 'om_frozen_predecessor');
 
@@ -350,7 +350,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
     setupActiveWorkerHandlers(ds, fakeWorker);
     fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
     await flush();
-    expect(updateMessageMock).toHaveBeenCalledWith('app_test', 'om_restored_card', expect.any(String));
+    expect(updateMessageMock).toHaveBeenCalledWith('app_test', 'om_restored_card', expect.any(String), { beforeWrite: expect.any(Function) });
 
     ds.streamCardId = 'om_successor';
     rejectRestore(new Error('restored card rejected'));
@@ -1036,6 +1036,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
       'app_test',
       'om_lane_restored',
       expect.any(String),
+      { beforeWrite: expect.any(Function) },
     );
     expect(sessionReplyMock).not.toHaveBeenCalled();
     expect(ds.streamCardId).toBe('om_lane_restored');
@@ -1489,6 +1490,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
       'app_test',
       'om_fallback_card',
       expect.any(String),
+      { beforeWrite: expect.any(Function) },
     );
     expect(closeSessionMock).not.toHaveBeenCalled();
   });

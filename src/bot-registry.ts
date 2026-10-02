@@ -1581,6 +1581,8 @@ export interface BotConfig {
    * 都持久化。系统提示部分需 /restart 生效，逐轮信封立即生效。
    */
   replyDelivery?: 'send' | 'transcript';
+  /** Absent preserves existing routing; stop opts into source-topic checks. */
+  topicUnavailablePolicy?: 'legacy' | 'stop';
   /** Skip Botmux prompt/skill/context injection and auto-forward final replies.
    * Existing prompt and skill customizations remain saved. */
   promptInjection?: 'default' | 'none';
@@ -3837,6 +3839,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
       // 显式 send / transcript 都保留；缺省按 defaultReplyDeliveryFor 解析。
+      topicUnavailablePolicy: entry.topicUnavailablePolicy === 'stop' ? 'stop' : undefined,
       replyDelivery: entry.replyDelivery === 'transcript' || entry.replyDelivery === 'send' ? entry.replyDelivery : undefined,
       promptInjection: entry.promptInjection === 'none' ? 'none' : undefined,
       // Only the non-default hook mode is persisted; absent, 'off', and invalid

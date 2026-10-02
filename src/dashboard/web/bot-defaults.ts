@@ -161,6 +161,7 @@ export type BotDefaultsRow = {
   p2pMode?: string;
   /** #794: per-turn 上下文注入方式。'auto' = 支持的 CLI 走 hook 注入；缺省/'off' = 内联。 */
   envelopeInjection?: 'auto' | 'off' | null;
+  topicUnavailablePolicy?: 'legacy' | 'stop';
   /** 最终回复投递方式的**生效值**（显式配置，否则按 CLI 缺省）。'transcript' = daemon
    *  从 CLI 转写自动取最终回复，模型不再被要求 botmux send；'send' = 模型自己 botmux send。 */
   replyDelivery?: 'send' | 'transcript' | null;

@@ -1,3 +1,4 @@
+import { assertMessageTopicAvailable, TopicSendError } from './topic-send-guard.js';
 import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync } from 'node:fs';
 import { dirname, extname, basename, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
@@ -264,6 +265,8 @@ const listBotsApiFailures = new Map<string, { reason: string; expiresAt: number 
  * the param and get exactly the pre-Step-6 behavior.
  */
 export interface OutboundMessageOptions {
+  /** Revalidate the frozen source immediately before every provider attempt. */
+  beforeWrite?: () => void | Promise<void>;
   /** The provider request is reconciling an already-attempted stable UUID.
    * Lark deduplicates the message, but the local outbound hook is a separate
    * side effect and must not be fired twice. */
@@ -295,6 +298,20 @@ async function emitOutboundHookIfAllowed(
   }
 }
 
+// Inside the API gate callback so rate-limit waits and retries cannot reuse
+// an earlier available observation. Policy refusals are not provider failures.
+export async function assertMessageWriteAllowed(larkAppId: string, messageId?: string): Promise<void> {
+  if (getBot(larkAppId)?.config?.topicUnavailablePolicy !== 'stop') return;
+  await assertMessageTopicAvailable(larkAppId, messageId, (appId, id) =>
+    getMessageDetail(appId, id, { userCardContent: false, timeoutMs: 10000 }));
+}
+
+function withdrawnWriteError(larkAppId: string, messageId: string): Error {
+  return getBot(larkAppId)?.config?.topicUnavailablePolicy === 'stop'
+    ? new TopicSendError('TOPIC_SEND_BLOCKED', `消息 ${messageId} 已撤回，停止发送；不要更换目标。`)
+    : new MessageWithdrawnError(messageId);
+}
+
 export async function sendMessage(
   larkAppId: string,
   chatId: string,
@@ -306,6 +323,7 @@ export async function sendMessage(
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendMessage');
   return executeWithLarkGate(larkAppId, 'sendMessage', async () => {
+    if (options?.beforeWrite) await options.beforeWrite();
     const c = getBotClient(larkAppId);
     const body = msgType === 'text'
       ? JSON.stringify({ text: content })
@@ -324,13 +342,13 @@ export async function sendMessage(
       });
     } catch (err: any) {
       if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
-        throw new MessageWithdrawnError(chatId);
+        throw withdrawnWriteError(larkAppId, chatId);
       }
       throw err;
     }
 
     if (res.code !== 0) {
-      if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(chatId);
+      if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw withdrawnWriteError(larkAppId, chatId);
       throw new Error(`Failed to send message: ${res.msg} (code: ${res.code})`);
     }
 
@@ -369,6 +387,9 @@ export async function replyMessage(
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'replyMessage');
   return executeWithLarkGate(larkAppId, 'replyMessage', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
+    // The source/authority fence follows the awaited destination lookup.
+    if (options?.beforeWrite) await options.beforeWrite();
     const c = getBotClient(larkAppId);
     const body = msgType === 'text'
       ? JSON.stringify({ text: content })
@@ -387,13 +408,13 @@ export async function replyMessage(
       });
     } catch (err: any) {
       if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
-        throw new MessageWithdrawnError(messageId);
+        throw withdrawnWriteError(larkAppId, messageId);
       }
       throw err;
     }
 
     if (res.code !== 0) {
-      if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
+      if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw withdrawnWriteError(larkAppId, messageId);
       throw new Error(`Failed to reply message: ${res.msg} (code: ${res.code})`);
     }
 
@@ -431,6 +452,7 @@ export async function urgentMessage(
   requestOptions?: LarkRequestOptions,
 ): Promise<void> {
   assertLarkTransport(larkAppId, 'urgentMessage');
+  await assertMessageWriteAllowed(larkAppId, messageId);
   const recipients = [...new Set(userOpenIds.map(id => id.trim()).filter(Boolean))];
   if (recipients.length === 0) throw new Error('Urgent message requires at least one user open_id');
 
@@ -472,6 +494,7 @@ export async function forwardMessage(
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'forwardMessage');
   return executeWithLarkGate(larkAppId, 'forwardMessage', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
     const c = getBotClient(larkAppId);
     let res: any;
     try {
@@ -483,13 +506,13 @@ export async function forwardMessage(
       });
     } catch (err: any) {
       if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
-        throw new MessageWithdrawnError(messageId);
+        throw withdrawnWriteError(larkAppId, messageId);
       }
       throw err;
     }
 
     if (res.code !== 0) {
-      if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
+      if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw withdrawnWriteError(larkAppId, messageId);
       throw new Error(`Failed to forward message: ${res.msg} (code: ${res.code})`);
     }
 
@@ -503,6 +526,7 @@ export async function forwardMessage(
 export async function addReaction(larkAppId: string, messageId: string, emojiType: string): Promise<string> {
   assertLarkTransport(larkAppId, 'addReaction');
   return executeWithLarkGate(larkAppId, 'addReaction', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
     const c = getBotClient(larkAppId);
     const res = await (c as any).im.v1.messageReaction.create({
       path: { message_id: messageId },
@@ -1086,6 +1110,7 @@ export async function pinMessage(larkAppId: string, messageId: string): Promise<
   assertLarkTransport(larkAppId, 'pinMessage');
   const c = getBotClient(larkAppId);
   try {
+    await assertMessageWriteAllowed(larkAppId, messageId);
     const res: any = await c.im.v1.pin.create({ data: { message_id: messageId } });
     if (res?.code !== 0) {
       logger.debug(`[pin:${larkAppId}] failed message=${messageId} code=${res?.code ?? 'missing'}`);
@@ -1242,9 +1267,14 @@ export async function deleteEphemeralCard(larkAppId: string, messageId: string):
   });
 }
 
-export async function updateMessage(larkAppId: string, messageId: string, cardJson: string): Promise<void> {
+export async function updateMessage(
+  larkAppId: string, messageId: string, cardJson: string,
+  options?: Pick<OutboundMessageOptions, 'beforeWrite'>,
+): Promise<void> {
   assertLarkTransport(larkAppId, 'updateMessage');
   return executeWithLarkGate(larkAppId, 'updateMessage', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
+    if (options?.beforeWrite) await options.beforeWrite();
     const c = getBotClient(larkAppId);
     let res: any;
     try {
@@ -1255,7 +1285,7 @@ export async function updateMessage(larkAppId: string, messageId: string, cardJs
     } catch (err: any) {
       const code = getLarkErrorCode(err);
       if (code === LARK_CODE_MESSAGE_WITHDRAWN) {
-        throw new MessageWithdrawnError(messageId);
+        throw withdrawnWriteError(larkAppId, messageId);
       }
       if (code === LARK_CODE_MESSAGE_UPDATE_EXPIRED) {
         throw new MessageUpdateExpiredError(messageId);
@@ -1263,7 +1293,7 @@ export async function updateMessage(larkAppId: string, messageId: string, cardJs
       throw err;
     }
     if (res.code !== 0) {
-      if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
+      if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw withdrawnWriteError(larkAppId, messageId);
       if (res.code === LARK_CODE_MESSAGE_UPDATE_EXPIRED) throw new MessageUpdateExpiredError(messageId);
       throw new Error(`Failed to update message: ${res.msg} (code: ${res.code})`);
     }
@@ -1271,6 +1301,8 @@ export async function updateMessage(larkAppId: string, messageId: string, cardJs
 }
 
 export interface CardStreamingSettings {
+  /** Original message from the persisted stream lease; required by stop policy. */
+  messageId?: string;
   streamingMode: boolean;
   sequence: number;
   uuid: string;
@@ -1287,18 +1319,19 @@ export interface CardStreamingSettings {
 export async function resolveCardKitId(larkAppId: string, messageId: string): Promise<string> {
   assertLarkTransport(larkAppId, 'resolveCardKitId');
   return executeWithLarkGate(larkAppId, 'resolveCardKitId', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
     const c = getBotClient(larkAppId);
     let res: any;
     try {
       res = await c.cardkit.v1.card.idConvert({ data: { message_id: messageId } });
     } catch (err: any) {
       if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
-        throw new MessageWithdrawnError(messageId);
+        throw withdrawnWriteError(larkAppId, messageId);
       }
       throw err;
     }
     if (res.code !== 0) {
-      if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
+      if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw withdrawnWriteError(larkAppId, messageId);
       throw new Error(`Failed to resolve CardKit id: ${res.msg} (code: ${res.code})`);
     }
     const cardId = res.data?.card_id;
@@ -1315,6 +1348,7 @@ export async function updateCardStreamingSettings(
 ): Promise<void> {
   assertLarkTransport(larkAppId, 'updateCardStreamingSettings');
   return executeWithLarkGate(larkAppId, 'updateCardStreamingSettings', async () => {
+    await assertMessageWriteAllowed(larkAppId, settings.messageId);
     const c = getBotClient(larkAppId);
     const config: Record<string, unknown> = {
       streaming_mode: settings.streamingMode,
@@ -1349,9 +1383,11 @@ export async function updateCardStreamElementContent(
   content: string,
   sequence: number,
   uuid: string,
+  messageId?: string,
 ): Promise<void> {
   assertLarkTransport(larkAppId, 'updateCardStreamElementContent');
   return executeWithLarkGate(larkAppId, 'updateCardStreamElementContent', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
     const c = getBotClient(larkAppId);
     const res: any = await c.cardkit.v1.cardElement.content({
       path: { card_id: cardId, element_id: elementId },
@@ -1371,9 +1407,11 @@ export async function patchCardStreamElement(
   partialElement: Record<string, unknown>,
   sequence: number,
   uuid: string,
+  messageId?: string,
 ): Promise<void> {
   assertLarkTransport(larkAppId, 'patchCardStreamElement');
   return executeWithLarkGate(larkAppId, 'patchCardStreamElement', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
     const c = getBotClient(larkAppId);
     const res: any = await c.cardkit.v1.cardElement.patch({
       path: { card_id: cardId, element_id: elementId },

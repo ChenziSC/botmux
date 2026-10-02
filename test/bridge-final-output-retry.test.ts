@@ -11,7 +11,8 @@ import * as registrationStore from '../src/services/idempotency-store.js';
  *   - 3 consecutive failures give up and DO NOT commit the dedup marker
  *     (so any retransmit can still deliver)
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
+import { config } from '../src/config.js';
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 
 const updateMessageMock = vi.fn(async () => {});
@@ -76,13 +77,19 @@ vi.mock('../src/bot-registry.js', () => ({
   resolveReplyDelivery: vi.fn((): 'send' | 'transcript' | undefined => 'send'),
 }));
 
-vi.mock('../src/config.js', () => ({
-  config: {
-    web: { externalHost: 'localhost' },
-    session: { dataDir: '/tmp/test-sessions' },
-    daemon: { backendType: 'tmux', cliId: 'claude-code' },
-  },
-}));
+vi.mock('../src/config.js', async () => {
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  return {
+    config: {
+      web: { externalHost: 'localhost' },
+      // Concurrent checkouts/processes must never reset each other's journals.
+      session: { dataDir: mkdtempSync(join(tmpdir(), 'bridge-final-output-')) },
+      daemon: { backendType: 'tmux', cliId: 'claude-code' },
+    },
+  };
+});
 
 vi.mock('../src/core/cost-calculator.js', () => ({
   getSessionTokenUsage: vi.fn(() => null),
@@ -221,14 +228,14 @@ function seedReceiverReceipt(responseMode: 'silent' | 'listener_thread'): void {
   const memberKey = {
     listenerAppId: 'listener-app', meetingId: 'meeting-1', memberId: 'member-1', memberEpoch: 1,
   };
-  expect(applyVcMeetingMemberProjection('/tmp/test-sessions', {
+  expect(applyVcMeetingMemberProjection(config.session.dataDir, {
     ...memberKey,
     ownerBootId: 'owner-boot', ownerEpoch: 1, agentAppId: 'app_test', role: 'minutes',
     membershipGeneration: 1, status: 'active', responseMode, joinedAtIngestSeq: 0,
     capabilities: ['meeting.read', 'listener.output.request'], ownedSinks: [], sinkOwnerGeneration: 1,
     receiverSessionId: 'sid-final-out', outputChatId: 'oc_chat',
   })).toMatchObject({ ok: true });
-  expect(acceptVcMeetingDelivery('/tmp/test-sessions', {
+  expect(acceptVcMeetingDelivery(config.session.dataDir, {
     ...memberKey,
     ownerBootId: 'owner-boot', ownerEpoch: 1, membershipGeneration: 1,
     deliveryKey: 'delivery-stable-key', inputHash: 'input-hash', fromSeq: 1, toSeq: 1,
@@ -236,7 +243,7 @@ function seedReceiverReceipt(responseMode: 'silent' | 'listener_thread'): void {
     listenerOutputProtocol: responseMode === 'listener_thread' ? 'decision_v1' : 'plain',
     receiverBootId: 'receiver-boot',
   })).toMatchObject({ kind: 'accepted' });
-  expect(markVcMeetingDeliveryDispatched('/tmp/test-sessions', {
+  expect(markVcMeetingDeliveryDispatched(config.session.dataDir, {
     ...memberKey, deliveryKey: 'delivery-stable-key',
   }, { receiverBootId: 'receiver-boot', workerGeneration: 1 })).toMatchObject({
     ok: true,
@@ -249,6 +256,12 @@ function seedSilentReceiverReceipt(): void {
 }
 
 const SCOPED_DEDUPE_KEY = 'sid-final-out:uuid-1';
+
+afterAll(async () => {
+  const { __testOnly_closeSkillFeedbackStores } = await import('../src/services/skill-feedback-store.js');
+  await __testOnly_closeSkillFeedbackStores();
+  rmSync(config.session.dataDir, { recursive: true, force: true });
+});
 
 describe('Bridge final_output delivery (P2 retry)', () => {
   beforeEach(async () => {
@@ -270,8 +283,8 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     // clearAllMocks wipes the factory return; re-arm footer mode so the
     // positive usage-render tests see footer usage (individual tests override).
     vi.mocked(resolveUsageDisplay).mockReturnValue('footer');
-    rmSync('/tmp/test-sessions', { recursive: true, force: true });
-    mkdirSync('/tmp/test-sessions', { recursive: true });
+    rmSync(config.session.dataDir, { recursive: true, force: true });
+    mkdirSync(config.session.dataDir, { recursive: true });
   });
 
   afterEach(async () => {
@@ -279,7 +292,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     const { __testOnly_closeSkillFeedbackStores } = await import('../src/services/skill-feedback-store.js');
     await __testOnly_closeSkillFeedbackStores();
     setActiveSessionsRegistry(undefined);
-    rmSync('/tmp/test-sessions', { recursive: true, force: true });
+    rmSync(config.session.dataDir, { recursive: true, force: true });
     clearMessageListenerRunPreviewStore();
     vi.useRealTimers();
   });
@@ -319,13 +332,13 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     const { OncallGroupStore } = await import('../src/services/oncall-group-store.js');
     await vi.waitFor(() => {
       expect(updateMessageMock.mock.calls.some(call => call[2]?.includes(expectedAnswer) && call[2]?.includes('已完成') && call[2]?.includes('oncall_group_create'))).toBe(true);
-      expect(new OncallGroupStore('/tmp/test-sessions').findSource('app_test', 'om_managed_reply'))
+      expect(new OncallGroupStore(config.session.dataDir).findSource('app_test', 'om_managed_reply'))
         .toMatchObject({ chatId: 'oc_chat', questionId: ds.currentTurnId, answer: expectedAnswer });
     }, { timeout: 5000 });
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(updateMessageMock.mock.calls.every(call => call[1] === 'om_managed_reply')).toBe(true);
     const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
-    const record = new TurnReplyCardStore('/tmp/test-sessions').read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId });
+    const record = new TurnReplyCardStore(config.session.dataDir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId });
     if (source === 'bridge') expect(record?.tools[0]?.subject).toBe('README.md');
     expect(record?.finalDelivered).toBe(true);
     expect(record?.finalSource).toBe(source);
@@ -432,7 +445,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       expect(sessionReply.mock.calls[0][2]).toBe('text');
     } else {
       const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
-      await vi.waitFor(() => expect(new TurnReplyCardStore('/tmp/test-sessions').read({
+      await vi.waitFor(() => expect(new TurnReplyCardStore(config.session.dataDir).read({
         larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId!,
       })?.updatedAtMs).toBeGreaterThan(enqueuedAt), { timeout: 4000 });
       expect(sessionReply).toHaveBeenCalledTimes(1);
@@ -621,9 +634,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(String(sessionReply.mock.calls[0][1])).toContain('oncall_group_create');
     expect(String(sessionReply.mock.calls[0][1])).not.toContain('botmux_feedback');
     const { OncallGroupStore } = await import('../src/services/oncall-group-store.js');
-    expect(new OncallGroupStore('/tmp/test-sessions').findSource('app_test', 'om_oncall_answer')).toMatchObject({ chatId: 'oc_chat' });
+    expect(new OncallGroupStore(config.session.dataDir).findSource('app_test', 'om_oncall_answer')).toMatchObject({ chatId: 'oc_chat' });
     const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
-    const delivery = (await getSkillFeedbackStore('/tmp/test-sessions'))
+    const delivery = (await getSkillFeedbackStore(config.session.dataDir))
       .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_oncall_answer');
     expect(delivery).toMatchObject({ cardMode: 'card' });
     expect(delivery?.policy).toBeUndefined();
@@ -649,7 +662,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
 
     __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
-    const feedbackStore = await getSkillFeedbackStore('/tmp/test-sessions');
+    const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
     expect(feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_feedback_answer')).toBeUndefined();
     await vi.advanceTimersByTimeAsync(10);
 
@@ -723,7 +736,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
-    expect((await getSkillFeedbackStore('/tmp/test-sessions'))
+    expect((await getSkillFeedbackStore(config.session.dataDir))
       .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_everyone_feedback'))
       .toMatchObject({ policy: { audience: 'everyone', reviewers: [] } });
   });
@@ -750,7 +763,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(resolveAllowedUsersWithMapMock).toHaveBeenCalledWith('app_test', ['reviewer@example.com']);
     expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
-    const delivery = (await getSkillFeedbackStore('/tmp/test-sessions'))
+    const delivery = (await getSkillFeedbackStore(config.session.dataDir))
       .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_email_feedback');
     expect(delivery?.policy?.reviewers).toEqual(['ou_email_reviewer']);
     expect(JSON.stringify(delivery?.policy)).not.toContain('reviewer@example.com');
@@ -790,7 +803,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     // But the delivery is still recorded so a later turn_terminal correlates to
     // a turn.completed event — feedback is independent of completion bookkeeping.
     const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
-    const delivery = (await getSkillFeedbackStore('/tmp/test-sessions'))
+    const delivery = (await getSkillFeedbackStore(config.session.dataDir))
       .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_plain_answer');
     expect(delivery).toMatchObject({ cardMode: 'card' });
     expect(delivery?.policy).toBeUndefined();
@@ -1911,7 +1924,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
   it('does not address daemon final-output footers to a known bot owner', async () => {
     writeFileSync(
-      join('/tmp/test-sessions', 'bot-openids-app_test.json'),
+      join(config.session.dataDir, 'bot-openids-app_test.json'),
       JSON.stringify({ Claude: 'ou_foreign_bot' }),
     );
 
@@ -2151,7 +2164,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     // which records the dispatching bot as ownerOpenId (daemon /repo
     // session-create path) instead of nulling it like @-mention auto-create.
     writeFileSync(
-      join('/tmp/test-sessions', 'bot-openids-app_test.json'),
+      join(config.session.dataDir, 'bot-openids-app_test.json'),
       JSON.stringify({ Orchestrator: 'ou_orch_bot' }),
     );
 
@@ -2435,7 +2448,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       receiverSessionId: ds.session.sessionId, larkMessageId: 'om_human_a',
       replyTargetSenderOpenId: 'ou_human_a',
     };
-    expect(applyVcMeetingMemberProjection('/tmp/test-sessions', {
+    expect(applyVcMeetingMemberProjection(config.session.dataDir, {
       listenerAppId: origin.listenerAppId,
       meetingId: origin.meetingId,
       memberId: origin.memberId,
@@ -2478,7 +2491,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(cardJson).not.toContain('<at');
     expect(cardJson).toContain('＜at');
     const providerUuid = sessionReply.mock.calls[0][5].uuid;
-    expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
+    expect(listVcMeetingListenerMessageIds(config.session.dataDir, {
       listenerAppId: origin.listenerAppId,
       meetingId: origin.meetingId,
       targetChatId: ds.chatId,
@@ -2520,7 +2533,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       membershipGeneration: 1, sinkOwnerGeneration: 1,
       receiverSessionId: ds.session.sessionId, larkMessageId: 'om_human_envelope',
     };
-    expect(applyVcMeetingMemberProjection('/tmp/test-sessions', {
+    expect(applyVcMeetingMemberProjection(config.session.dataDir, {
       listenerAppId: origin.listenerAppId,
       meetingId: origin.meetingId,
       memberId: origin.memberId,
@@ -2572,7 +2585,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       } | undefined;
       // Model the exact daemon sequence: the quote RPC was already in flight,
       // then the member was removed before Lark answered "withdrawn".
-      expect(applyVcMeetingMemberProjection('/tmp/test-sessions', {
+      expect(applyVcMeetingMemberProjection(config.session.dataDir, {
         listenerAppId: 'listener-app', meetingId: 'meeting-im-race',
         memberId: 'member-im-race', memberEpoch: 1,
         agentAppId: 'app_test', ownerBootId: 'owner-boot', ownerEpoch: 1,
@@ -2605,7 +2618,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       membershipGeneration: 1, sinkOwnerGeneration: 1,
       receiverSessionId: ds.session.sessionId, larkMessageId: 'om_human_race',
     };
-    expect(applyVcMeetingMemberProjection('/tmp/test-sessions', {
+    expect(applyVcMeetingMemberProjection(config.session.dataDir, {
       ...origin,
       role: 'minutes', status: 'active', responseMode: 'silent',
       capabilities: ['meeting.read'], ownedSinks: [], joinedAtIngestSeq: 0,
@@ -2624,7 +2637,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(plainFallbackCalls).toBe(0);
     expect(ds.lastBridgeEmittedUuid).toBeUndefined();
-    const actions = listVcMeetingActions('/tmp/test-sessions', {
+    const actions = listVcMeetingActions(config.session.dataDir, {
       listenerAppId: origin.listenerAppId,
       meetingId: origin.meetingId,
     });
@@ -2667,13 +2680,13 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       sourceSessionId: ds.session.sessionId,
       suppressHook: true,
     });
-    expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
+    expect(listVcMeetingListenerMessageIds(config.session.dataDir, {
       listenerAppId: 'listener-app',
       meetingId: 'meeting-1',
       targetChatId: ds.chatId,
     })).toEqual(['om_meeting_fallback']);
     const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
-    expect((await getSkillFeedbackStore('/tmp/test-sessions')).findDeliveryByPlatformMessage(
+    expect((await getSkillFeedbackStore(config.session.dataDir)).findDeliveryByPlatformMessage(
       'lark', ds.larkAppId, 'om_meeting_fallback',
     )).toBeUndefined();
   });
@@ -2708,7 +2721,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
-    expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
+    expect(listVcMeetingListenerMessageIds(config.session.dataDir, {
       listenerAppId: 'listener-app',
       meetingId: 'meeting-1',
       targetChatId: ds.chatId,
@@ -2743,7 +2756,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(sessionReply).not.toHaveBeenCalled();
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
-    expect(listVcMeetingActions('/tmp/test-sessions', {
+    expect(listVcMeetingActions(config.session.dataDir, {
       listenerAppId: 'listener-app', meetingId: 'meeting-1',
     })).toEqual([]);
   });
@@ -2775,7 +2788,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     expect(sessionReply).not.toHaveBeenCalled();
-    expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
+    expect(listVcMeetingListenerMessageIds(config.session.dataDir, {
       listenerAppId: 'listener-app', meetingId: 'meeting-1', targetChatId: ds.chatId,
     })).toEqual([]);
   });
@@ -2824,11 +2837,11 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       memberId: 'member-1', memberEpoch: 1,
       deliveryKey: 'delivery-stable-key',
     };
-    expect(markVcMeetingDeliveryAmbiguous('/tmp/test-sessions', deliveryKey, {
+    expect(markVcMeetingDeliveryAmbiguous(config.session.dataDir, deliveryKey, {
       workerGeneration: 1,
       dispatchAttempt: 1,
     })).toMatchObject({ ok: true, receipt: { status: 'ambiguous' } });
-    expect(markVcMeetingDeliveryDispatched('/tmp/test-sessions', deliveryKey, {
+    expect(markVcMeetingDeliveryDispatched(config.session.dataDir, deliveryKey, {
       receiverBootId: 'receiver-boot-2',
       workerGeneration: 2,
     })).toMatchObject({ ok: true, receipt: { dispatchAttempt: 2 } });
@@ -2850,7 +2863,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply.mock.calls[0][5]).toMatchObject({ suppressHook: true });
     expect(sessionReply.mock.calls[1][5]).toMatchObject({ suppressHook: true });
     expect(providerMessages).toEqual(new Map([[firstUuid, 'om_provider_once']]));
-    expect(listVcMeetingActions('/tmp/test-sessions', {
+    expect(listVcMeetingActions(config.session.dataDir, {
       listenerAppId: 'listener-app',
       meetingId: 'meeting-1',
     })).toEqual([
@@ -2878,7 +2891,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       memberId: 'member-1', memberEpoch: 1,
     };
     seedReceiverReceipt('listener_thread');
-    expect(failVcMeetingDelivery('/tmp/test-sessions', {
+    expect(failVcMeetingDelivery(config.session.dataDir, {
       listenerAppId: 'listener-app', meetingId: 'meeting-1',
       memberId: 'member-1', memberEpoch: 1,
       deliveryKey: 'delivery-stable-key',
@@ -2899,7 +2912,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     expect(sessionReply).not.toHaveBeenCalled();
-    expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
+    expect(listVcMeetingListenerMessageIds(config.session.dataDir, {
       listenerAppId: 'listener-app', meetingId: 'meeting-1', targetChatId: ds.chatId,
     })).toEqual([]);
   });
@@ -3627,7 +3640,7 @@ describe('Worker turn_terminal routing', () => {
       getActiveCount: () => 1,
       closeSession: vi.fn(),
       onTurnTerminal: (_ds, terminal) => {
-        completeVcMeetingDelivery('/tmp/test-sessions', {
+        completeVcMeetingDelivery(config.session.dataDir, {
           listenerAppId: 'listener-app', meetingId: 'meeting-1', memberId: 'member-1', memberEpoch: 1,
           deliveryKey: terminal.turnId,
         }, { workerGeneration: 1, dispatchAttempt: terminal.dispatchAttempt });

@@ -6430,6 +6430,9 @@ export async function startForkSubtopicSession(
     const availableBots = await getAvailableBots(appId, chatId);
     const childCliId = parentSession.cliLaunchSnapshot?.cliId ?? parentSession.cliId ?? botCfg.cliId;
     const { forkSession } = await import('./worker-pool.js');
+    // Seed publication may outlive its source during thread/bot lookup.
+    // Recheck before handing the first executable task to the child session.
+    if (sourceOptions?.beforeWrite) await sourceOptions.beforeWrite();
     const forkResult = await forkSession(
       parentSession.sessionId,
       chatId,

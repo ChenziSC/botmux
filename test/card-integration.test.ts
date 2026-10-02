@@ -259,6 +259,9 @@ function makeDeps(activeSessions: Map<string, DaemonSession>): CardHandlerDeps {
   // Card actions and worker-pool closeSession share this exact registry in
   // production. Model that identity here so close teardown mutates the same
   // object the card handler subsequently removes.
+  // Chat-scoped sessions are owned by the chat key; legacy topic aliases
+  // still route clicks but are not sufficient to authorize a current PATCH.
+  for (const ds of [...activeSessions.values()]) activeSessions.set(activeSessionKey(ds), ds);
   setActiveSessionsRegistry(activeSessions);
   vi.mocked(sessionStore.getOwnedSession).mockImplementation((sessionId: string) =>
     [...activeSessions.values()].find(ds => ds.session.sessionId === sessionId)?.session,

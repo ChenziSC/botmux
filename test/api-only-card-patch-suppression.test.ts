@@ -30,11 +30,12 @@ vi.mock('../src/im/lark/client.js', () => ({
 }));
 
 // apiOnly bot config drives larkTransportEnabled → false.
-const getBotMock = vi.fn(() => ({
+const localBot = {
   config: { larkAppId: 'local_riff', larkAppSecret: '', cliId: 'codex-app', apiOnly: true },
   resolvedAllowedUsers: [],
   botOpenId: 'bot_local_riff',
-}));
+};
+const getBotMock = vi.fn(() => localBot);
 vi.mock('../src/bot-registry.js', () => ({
   getBot: (...a: any[]) => getBotMock(...a),
   getAllBots: vi.fn(() => []),
@@ -43,7 +44,8 @@ vi.mock('../src/bot-registry.js', () => ({
   resolveBrandLabel: vi.fn(() => 'Feishu'),
 }));
 
-import { scheduleCardPatch } from '../src/core/worker-pool.js';
+import { scheduleCardPatch, setActiveSessionsRegistry } from '../src/core/worker-pool.js';
+import { activeSessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 function makeNoTransportSession(overrides?: Partial<DaemonSession>): DaemonSession {
@@ -71,6 +73,8 @@ describe('API-only: aux-UI card patch produces zero Feishu calls', () => {
   beforeEach(() => {
     updateMessageMock.mockClear();
     sendMessageMock.mockClear();
+    getBotMock.mockReset().mockReturnValue(localBot);
+    setActiveSessionsRegistry(new Map());
   });
 
   it('scheduleCardPatch is a no-op for an apiOnly session (no updateMessage)', () => {
@@ -81,7 +85,7 @@ describe('API-only: aux-UI card patch produces zero Feishu calls', () => {
 
   it('scheduleCardPatch is a no-op for an HTTP virtual session on a normal bot', () => {
     // Even if the bot is NOT apiOnly, a synthetic http_async_* chat has no card.
-    getBotMock.mockReturnValueOnce({
+    getBotMock.mockReturnValue({
       config: { larkAppId: 'app_normal', larkAppSecret: 's', cliId: 'claude-code', apiOnly: false },
       resolvedAllowedUsers: [], botOpenId: 'ou_bot',
     } as any);
@@ -91,11 +95,13 @@ describe('API-only: aux-UI card patch produces zero Feishu calls', () => {
   });
 
   it('sanity: a normal bot in a real chat DOES patch (gate is not over-broad)', () => {
-    getBotMock.mockReturnValueOnce({
+    getBotMock.mockReturnValue({
       config: { larkAppId: 'app_normal', larkAppSecret: 's', cliId: 'claude-code', apiOnly: false },
       resolvedAllowedUsers: [], botOpenId: 'ou_bot',
     } as any);
     const ds = makeNoTransportSession({ larkAppId: 'app_normal', chatId: 'oc_real', streamCardId: 'om_real_card' });
+    ds.session.chatId = ds.chatId;
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
     expect(scheduleCardPatch(ds, JSON.stringify({ type: 'streaming', content: 'x' }))).toBe(true);
     expect(updateMessageMock).toHaveBeenCalledTimes(1);
   });

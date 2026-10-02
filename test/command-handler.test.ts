@@ -1862,6 +1862,22 @@ describe('handleCommand', () => {
       const result = await startForkSubtopicSession('task', parent(), makeLarkMessage('/fork task', { threadId: 'omt_parent' }), LARK_APP_ID);
       expect(result.ok).toBe(false); expect(writes).toEqual(['attempt']); expect(forkSession).not.toHaveBeenCalled();
     });
+    it.each(['thread lookup', 'bot lookup'] as const)('rechecks the source after %s before starting fork', async lookup => {
+      let unavailable = false;
+      vi.mocked(getMessageDetail).mockImplementation(async (_app, id) => ({ items: [{ message_id: id, deleted: unavailable }] }) as any);
+      if (lookup === 'thread lookup') {
+        vi.mocked(getMessageThreadId).mockImplementationOnce(async () => { unavailable = true; return 'omt_child'; });
+      } else {
+        vi.mocked(getAvailableBots).mockImplementationOnce(async () => { unavailable = true; return []; });
+      }
+      const ds = parent();
+      const result = await startForkSubtopicSession('task', ds, makeLarkMessage('/fork task', { threadId: 'omt_parent' }), LARK_APP_ID);
+      expect(result).toEqual({ ok: false, error: 'fork_subtopic_failed', orphanTopic: false });
+      expect(writes).toEqual(['send']);
+      expect(forkSession).not.toHaveBeenCalled();
+      expect(deleteMessage).toHaveBeenCalledExactlyOnceWith(LARK_APP_ID, 'om_child_seed');
+      expect(ds.session.forkPanelCardId).toBe('om_old_panel');
+    });
     it('keeps the original command as the source of the post-fork panel refresh', async () => {
       let forked = false;
       vi.mocked(forkSession).mockImplementationOnce(async () => { forked = true; return { ok: true, childSessionId: 'child-sess-1' }; });

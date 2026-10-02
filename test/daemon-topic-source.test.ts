@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -41,6 +41,7 @@ const APP = 'cli_topic_source';
 const oldDataDir = config.session.dataDir;
 const originalRegistry = getActiveSessionsRegistry();
 let root: string;
+let fixtureHome: string;
 let unavailable: boolean;
 let ds: DaemonSession;
 
@@ -49,7 +50,9 @@ beforeEach(() => {
   vi.stubEnv('BOTMUX_LARK_QPS', '100000');
   vi.stubEnv('BOTMUX_LARK_GATE_RETRY_BASE_MS', '1');
   vi.stubEnv('BOTMUX_MULTI_TOPIC_ENABLED', 'true');
-  root = mkdtempSync(join(tmpdir(), 'daemon-topic-source-'));
+  fixtureHome = mkdtempSync(join(tmpdir(), 'daemon-topic-source-'));
+  root = join(fixtureHome, 'data');
+  mkdirSync(root, { mode: 0o700 });
   config.session.dataDir = root;
   unavailable = false;
   activeSessions.clear(); setActiveSessionsRegistry(activeSessions);
@@ -74,7 +77,7 @@ beforeEach(() => {
 afterEach(() => {
   activeSessions.clear(); __vcMeetingAgentTest.setSelfDaemonLarkAppIdForTest(undefined);
   config.session.dataDir = oldDataDir; setActiveSessionsRegistry(originalRegistry);
-  rmSync(root, { recursive: true, force: true });
+  rmSync(fixtureHome, { recursive: true, force: true });
   vi.unstubAllEnvs(); __testOnly_resetLarkGate();
 });
 

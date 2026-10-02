@@ -365,6 +365,13 @@ describe('report CLI recipient root and authenticated relay', () => {
 
 
 describe('report source topic preservation', () => {
+  it('refuses top-level publication when the thread source message identity is missing', async () => {
+    const result = await runReport({ args: ['--top-level'], current: { rootMessageId: '' }, topicPolicy: 'stop' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('TOPIC_SEND_CHECK_FAILED');
+    expect(result.outbound).toBeUndefined();
+  });
+
   it.each([['--top-level'], ['--into', 'om_other'], ['--legacy-dispatch']])(
     'blocks a withdrawn thread before publishing despite %j', async (...args) => {
       const result = await runReport({ args, topicPolicy: 'stop', unavailableMessage: THREAD });

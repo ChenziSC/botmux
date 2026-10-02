@@ -9,7 +9,6 @@ export interface DispatchArgs {
   chatId?: string;
   repo?: string;
   into?: string;
-  resultDelivery?: string;
   standby: boolean;
   steer: boolean;
   bots: string[];
@@ -26,7 +25,7 @@ export type DispatchArgsResult =
   | { ok: false; errorCode: DispatchArgsErrorCode; error: string; option?: string };
 
 const VALUE_FLAGS = new Map<string, keyof Pick<DispatchArgs,
-  'sessionId' | 'title' | 'brief' | 'briefFile' | 'chatId' | 'repo' | 'into' | 'resultDelivery'
+  'sessionId' | 'title' | 'brief' | 'briefFile' | 'chatId' | 'repo' | 'into'
 >>([
   ['--session-id', 'sessionId'],
   ['--title', 'title'],
@@ -35,7 +34,6 @@ const VALUE_FLAGS = new Map<string, keyof Pick<DispatchArgs,
   ['--chat-id', 'chatId'],
   ['--repo', 'repo'],
   ['--into', 'into'],
-  ['--result-delivery', 'resultDelivery'],
 ]);
 
 const REPEATABLE_VALUE_FLAGS = new Map<string, 'bots' | 'botApps'>([

@@ -505,7 +505,8 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
  * botmux ever sets, same contract as GROK_HOME; BOTS_CONFIG /
  * SESSION_DATA_DIR / BOTMUX_LARK_LIST_BOTS_API_* are documented ambient or
  * ecosystem-block config). The reverse also holds: session/sandbox routing
- * keys the pane transport never carries (BOTMUX_SEND_RELAY) still need scrubbing here. Every entry below is
+ * keys the pane transport never carries (BOTMUX_SEND_RELAY) still need
+ * scrubbing here. Every entry below is
  * session-scoped BY CONSTRUCTION: the daemon/worker computes and injects it
  * per session AFTER every boundary scrub, and no ambient/env-file channel for
  * it exists.

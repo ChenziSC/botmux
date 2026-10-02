@@ -57,7 +57,6 @@ export class CodexUpdateDialogGuard {
   }
 }
 
-
 export type CodexUpdatePickerKey = 'Down' | 'Enter' | 'wait' | 'gone';
 
 /** Inspect the current viewport, never a concatenation of old redraws. */

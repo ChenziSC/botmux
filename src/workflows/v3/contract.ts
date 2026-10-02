@@ -159,7 +159,7 @@ export interface BotSnapshot {
   larkAppId: string;
   cliId: CliId;
   cliPathOverride?: string;
-  /** Frozen launch prefix such as `aiden x codex`.  Workflow workers must use
+  /** Frozen configured launch prefix.  Workflow workers must use
    *  the same gateway/runtime selection as ordinary bot sessions. */
   wrapperCli?: string;
   model?: string;

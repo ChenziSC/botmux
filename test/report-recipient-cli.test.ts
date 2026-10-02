@@ -96,7 +96,7 @@ async function runReport(options: {
   }), { mode: 0o600 });
   const requests: Array<{ url?: string; body: Record<string, unknown> }> = [];
   const server = createServer(async (req, res) => {
-    // The fork also probes session context over authenticated read-only routes.
+    // A read-only context probe is not a report submission.
     if (req.method !== 'POST') {
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'not_found' }));

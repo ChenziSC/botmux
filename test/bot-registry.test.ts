@@ -2784,3 +2784,15 @@ describe('parseBotConfigsFromText — askOptionLayout 冷读', () => {
     expect(mod.loadBotConfigAtIndex(0).askOptionLayout).toBe('vertical');
   });
 });
+
+
+describe('topic write policy configuration', () => {
+  it('enables source checks only for an explicit stop policy', async () => {
+    const mod = await freshImport();
+    const inputs = ['stop', 'legacy', undefined, 'STOP', true, null];
+    const parsed = mod.parseBotConfigsFromText(JSON.stringify(inputs.map((policy, i) =>
+      makeCfg({ larkAppId: `app_policy_${i}`, topicUnavailablePolicy: policy }))));
+    expect(parsed.map(config => config.topicUnavailablePolicy))
+      .toEqual(['stop', undefined, undefined, undefined, undefined, undefined]);
+  });
+});

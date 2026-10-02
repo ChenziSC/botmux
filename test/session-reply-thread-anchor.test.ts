@@ -22,7 +22,6 @@ const mocks = vi.hoisted(() => ({
   replyMessage: vi.fn(async () => 'om_reply'),
   sendMessage: vi.fn(async () => 'om_top'),
   getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
-  getMessageDetail: vi.fn(),
   topicRoots: new Map<string, string>(),
   topicQueues: new Map<string, Promise<void>>(),
 }));
@@ -34,7 +33,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 vi.mock('../src/im/lark/client.js', async () => {
   const actual = await vi.importActual<any>('../src/im/lark/client.js');
-  return { ...actual, getMessageDetail: mocks.getMessageDetail, replyMessage: mocks.replyMessage, sendMessage: mocks.sendMessage, getChatMode: mocks.getChatMode };
+  return { ...actual, replyMessage: mocks.replyMessage, sendMessage: mocks.sendMessage, getChatMode: mocks.getChatMode };
 });
 
 vi.mock('../src/services/vc-meeting-listener-topic-store.js', () => ({
@@ -78,6 +77,7 @@ import { registerBot } from '../src/bot-registry.js';
 import { activeSessionKey, sessionKey } from '../src/core/types.js';
 import { __testOnly_sessionReply as sessionReply, __testOnly_activeSessions as activeSessions } from '../src/daemon.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
+import { TopicSendError } from '../src/im/lark/topic-send-guard.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 const APP = 'session_reply_anchor_app';
@@ -147,14 +147,13 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
   it.each(['deleted', 'network', 'race'] as const)('strict policy prevents automatic top-level fallback: %s', async failure => {
     registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', topicUnavailablePolicy: 'stop' });
     seedSharedSession();
-    mocks.getMessageDetail.mockImplementation(async (_app, id) => {
-      if (failure === 'network') throw new Error('network unavailable');
-      return { items: [{ message_id: id, deleted: failure === 'deleted' }] };
-    });
-    mocks.replyMessage.mockRejectedValueOnce(new MessageWithdrawnError('om_human_a'));
-    await expect(sessionReply(CHAT, 'answer', 'text', APP, 'turn-a', { quoteMessageId: 'om_human_a' })).rejects.toThrow();
+    const error = failure === 'race'
+      ? new MessageWithdrawnError('om_human_a')
+      : new TopicSendError(failure === 'deleted' ? 'TOPIC_SEND_BLOCKED' : 'TOPIC_SEND_CHECK_FAILED', failure);
+    mocks.replyMessage.mockRejectedValueOnce(error);
+    await expect(sessionReply(CHAT, 'answer', 'text', APP, 'turn-a', { quoteMessageId: 'om_human_a' })).rejects.toBe(error);
     expect(mocks.sendMessage).not.toHaveBeenCalled();
-    expect(mocks.replyMessage).toHaveBeenCalledTimes(failure === 'race' ? 1 : 0);
+    expect(mocks.replyMessage).toHaveBeenCalledTimes(1);
   });
 
   it('repo-card-style send (interactive, NO turnId) threads into the shared topic, not top-level', async () => {

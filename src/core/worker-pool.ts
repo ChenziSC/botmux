@@ -1,7 +1,6 @@
 import { recordConversationInputCommitted, recordConversationExecutionChanged } from './ask-conversation.js';
 import { withHandoffPreview, handoffNeedsAttachment } from './handoff-preview.js';
 import { automaticStatusCardHidden, commitTurnStatusPolicy, rejectTurnStatusPolicy, currentTurnStatusPolicy, statusCardTitle, captureStatusCardFence } from './turn-status-policy.js';
-import { assertSendTopicsAvailable } from '../im/lark/topic-send-guard.js';
 import { recordManagedAskTerminal, advanceManagedAskPresentation } from './ask-broker.js';
 import { getMessageDetail as getTopicMessageDetail } from '../im/lark/client.js';
 import { trackStartingCardPublication } from './starting-card-publication.js';
@@ -17579,13 +17578,6 @@ function deliverFinalOutput(
               : {}),
           }
         : codexAppSettlementReply ?? { uuid: bridgeFinalOutputUuid(ds, msg) };
-      if (!managedReceiver && getBot(ds.larkAppId).config.topicUnavailablePolicy === 'stop') {
-        const topicTarget = frozenReplyTarget ?? resolveSessionReplyTarget(ds, fallbackTurnId(ds, msg.replyTurnId ?? msg.turnId));
-        await assertSendTopicsAvailable(ds.larkAppId,
-          [topicTarget.mode === 'thread' || topicTarget.mode === 'quote' ? topicTarget.rootMessageId : undefined],
-          getTopicMessageDetail, 'stop');
-        if (!isStillOwned()) { onComplete?.(false); return; }
-      }
       if (!managedReceiver && (!msg.kind || msg.kind === 'bridge') && replyCardModeFor(ds, msg.turnId) !== 'legacy') {
         await flushTurnReplyTools(ds, msg.turnId, msg.dispatchAttempt).catch(error => {
           logger.warn(`[${t}] reply-card final tool flush: ${error.message}`);

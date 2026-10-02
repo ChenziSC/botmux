@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, it, expect, vi } from 'vitest';
-import { assertSendTopicsAvailable } from '../src/cli/topic-send-guard.js';
+import { assertSendTopicsAvailable } from '../src/im/lark/topic-send-guard.js';
 describe('topic send guard', () => {
   it.each([undefined, 'legacy'] as const)('preserves legacy behavior without extra queries for %s', async policy => {
     const get = vi.fn(async () => { throw new Error('network'); });

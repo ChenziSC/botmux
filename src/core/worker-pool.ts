@@ -1,6 +1,6 @@
 import { withHandoffPreview, handoffNeedsAttachment } from './handoff-preview.js';
 import { automaticStatusCardHidden, commitTurnStatusPolicy, rejectTurnStatusPolicy, currentTurnStatusPolicy, statusCardTitle, captureStatusCardFence } from './turn-status-policy.js';
-import { assertSendTopicsAvailable } from '../cli/topic-send-guard.js';
+import { assertSendTopicsAvailable } from '../im/lark/topic-send-guard.js';
 import { recordManagedAskTerminal, advanceManagedAskPresentation } from './ask-broker.js';
 import { getMessageDetail as getTopicMessageDetail } from '../im/lark/client.js';
 import { handoffCardClosed, handoffCardBlocksStreaming, applyHandoffCardEvent, type HandoffCardEvent } from './handoff-card-lifecycle.js';

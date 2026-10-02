@@ -1267,10 +1267,14 @@ export async function deleteEphemeralCard(larkAppId: string, messageId: string):
   });
 }
 
-export async function updateMessage(larkAppId: string, messageId: string, cardJson: string): Promise<void> {
+export async function updateMessage(
+  larkAppId: string, messageId: string, cardJson: string,
+  options?: Pick<OutboundMessageOptions, 'beforeWrite'>,
+): Promise<void> {
   assertLarkTransport(larkAppId, 'updateMessage');
   return executeWithLarkGate(larkAppId, 'updateMessage', async () => {
     await assertMessageWriteAllowed(larkAppId, messageId);
+    if (options?.beforeWrite) await options.beforeWrite();
     const c = getBotClient(larkAppId);
     let res: any;
     try {

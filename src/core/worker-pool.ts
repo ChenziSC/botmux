@@ -791,6 +791,8 @@ function syncWorkerDisplayMode(ds: DaemonSession): void {
 // ─── Callbacks set by daemon at startup ─────────────────────────────────────
 
 export interface WorkerSessionReplyOptions {
+  /** Recheck caller ownership inside each provider write attempt. */
+  beforeWrite?: () => void | Promise<void>;
   uuid?: string;
   quoteMessageId?: string;
   beforeQuoteFallback?: () => void | Promise<void>;
@@ -17060,14 +17062,16 @@ function deliverFinalOutput(
     content: string,
     msgType?: string,
     turnId?: string,
-    opts?: Omit<WorkerSessionReplyOptions, 'sourceSessionId'>,
+    opts?: Omit<WorkerSessionReplyOptions, 'sourceSessionId' | 'beforeWrite'>,
   ) => cb.sessionReply(
     sessionAnchorId(ds),
     content,
     msgType,
     ds.larkAppId,
     fallbackTurnId(ds, turnId),
-    { ...opts, sourceSessionId: ds.session.sessionId },
+    { ...opts, sourceSessionId: ds.session.sessionId, beforeWrite: () => {
+      if (!isStillOwned()) throw new Error('Final output no longer owns delivery');
+    } },
   );
   setTimeout(async () => {
     if (!isStillOwned()) {

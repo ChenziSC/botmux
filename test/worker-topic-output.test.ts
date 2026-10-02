@@ -4,11 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { FrozenSessionReplyTarget } from '../src/types.js';
 
-const mocks = vi.hoisted(() => ({ request: vi.fn(), create: vi.fn(), reply: vi.fn() }));
+const mocks = vi.hoisted(() => ({ request: vi.fn(), create: vi.fn(), reply: vi.fn(), patch: vi.fn() }));
 vi.mock('@larksuiteoapi/node-sdk', () => ({ Client: class {
   request = mocks.request;
   im = { v1: {
-    message: { create: mocks.create, reply: mocks.reply },
+    message: { create: mocks.create, reply: mocks.reply, patch: mocks.patch },
     chat: { get: async () => ({ code: 0, data: { chat_mode: 'group' } }) },
   } };
 } }));
@@ -16,6 +16,7 @@ import {
   initWorkerPool, setActiveSessionsRegistry, getActiveSessionsRegistry,
   __testOnly_deliverFinalOutput as deliverFinalOutput,
 } from '../src/core/worker-pool.js';
+import { updateTurnReplyCard } from '../src/core/turn-reply-card.js';
 import { registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
@@ -52,10 +53,11 @@ beforeEach(() => {
     if (method !== 'GET' || !url.includes('/im/v1/messages/')) throw new Error('Unexpected provider request');
     const id = url.split('/').at(-1);
     return { code: 0, data: { items: [{ message_id: id, chat_id: 'oc_source',
-      deleted: id === 'om_source' && unavailable }] } };
+      ...(id === 'om_sent' ? { root_id: 'om_source' } : {}), deleted: id === 'om_source' && unavailable }] } };
   });
   mocks.create.mockReset().mockResolvedValue({ code: 0, data: { message_id: 'om_sent' } });
   mocks.reply.mockReset().mockResolvedValue({ code: 0, data: { message_id: 'om_sent' } });
+  mocks.patch.mockReset().mockResolvedValue({ code: 0 });
 });
 afterEach(() => {
   activeSessions.clear(); setActiveSessionsRegistry(originalRegistry);
@@ -64,10 +66,10 @@ afterEach(() => {
   vi.unstubAllEnvs(); __testOnly_resetLarkGate();
 });
 
-function final(target?: FrozenSessionReplyTarget): Promise<{ owned: boolean; messageId?: string }> {
+function final(target?: FrozenSessionReplyTarget, owns: () => boolean = () => true): Promise<{ owned: boolean; messageId?: string }> {
   return new Promise(resolve => deliverFinalOutput(ds, {
-    type: 'final_output', turnId: 'turn-old', content: 'answer', lastUuid: 'output-1',
-  }, 'fixture', 0, (owned, messageId) => resolve({ owned, messageId }), () => true, target));
+    type: 'final_output', turnId: 'om_turn_old', content: 'answer', lastUuid: 'output-1',
+  }, 'fixture', 0, (owned, messageId) => resolve({ owned, messageId }), owns, target));
 }
 
 describe('worker final-output topic transport', () => {
@@ -105,7 +107,7 @@ describe('worker final-output topic transport', () => {
   }, 30000);
 
   it('freezes the ordinary final target before a daemon retry outlives its turn record', async () => {
-    ds.currentReplyTarget = { turnId: 'turn-old', rootMessageId: 'om_source' };
+    ds.currentReplyTarget = { turnId: 'om_turn_old', rootMessageId: 'om_source' };
     mocks.reply.mockImplementationOnce(async () => {
       unavailable = true;
       ds.currentReplyTarget = { turnId: 'turn-new', rootMessageId: 'om_new' };
@@ -115,6 +117,50 @@ describe('worker final-output topic transport', () => {
     expect(mocks.reply).toHaveBeenCalledOnce();
     expect(mocks.create).not.toHaveBeenCalled();
   }, 30000);
+
+
+  it.each(['lookup', 'retry'])('rechecks worker ownership before the final reply after %s', async timing => {
+    let owns = true;
+    const read = mocks.request.getMockImplementation()!;
+    if (timing === 'lookup') {
+      mocks.request.mockImplementationOnce(async input => { const result = await read(input); owns = false; return result; });
+    } else {
+      mocks.reply.mockImplementationOnce(async () => {
+        owns = false;
+        throw { isAxiosError: true, response: { status: 429 } };
+      });
+    }
+    await final({ mode: 'thread', rootMessageId: 'om_source' }, () => owns);
+    expect(mocks.reply).toHaveBeenCalledTimes(timing === 'retry' ? 1 : 0);
+    expect(mocks.create).not.toHaveBeenCalled();
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+  });
+
+  it.each(['lookup', 'retry'])('rechecks worker ownership before patching an existing reply after %s', async timing => {
+    registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: 'claude-code',
+      topicUnavailablePolicy: 'stop', replyCardMode: 'unified' });
+    let owns = true;
+    const target = { mode: 'thread' as const, rootMessageId: 'om_source' };
+    await updateTurnReplyCard(ds, 'om_turn_old', { kind: 'progress', text: 'Working' }, (body, type, uuid) =>
+      sessionReply('oc_source', body, type, APP, 'om_turn_old', {
+        uuid, sourceSessionId: ds.session.sessionId, replyTarget: target,
+      }), { owns: () => owns, forceVisible: true });
+    expect(mocks.reply).toHaveBeenCalledOnce();
+    mocks.reply.mockClear(); mocks.patch.mockClear(); mocks.request.mockClear();
+    const read = mocks.request.getMockImplementation()!;
+    if (timing === 'lookup') {
+      mocks.request.mockImplementationOnce(async input => { const result = await read(input); owns = false; return result; });
+    } else {
+      mocks.patch.mockImplementationOnce(async () => {
+        owns = false;
+        throw { isAxiosError: true, response: { status: 429 } };
+      });
+    }
+    await final(target, () => owns);
+    expect(mocks.patch).toHaveBeenCalledTimes(timing === 'retry' ? 1 : 0);
+    expect(mocks.reply).not.toHaveBeenCalled();
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
 
   it('keeps an explicitly unthreaded final at the chat level', async () => {
     unavailable = true;

@@ -4049,8 +4049,11 @@ async function sessionReply(
     scope: ds.scope,
     anchor: sessionAnchorId(ds),
   } : undefined;
-  const outboundOptions = opts?.suppressHook || ds?.session.vcMeetingReceiver
-    ? { suppressHook: true }
+  const outboundOptions = opts?.suppressHook || ds?.session.vcMeetingReceiver || opts?.beforeWrite
+    ? {
+        ...(opts?.suppressHook || ds?.session.vcMeetingReceiver ? { suppressHook: true } : {}),
+        ...(opts?.beforeWrite ? { beforeWrite: opts.beforeWrite } : {}),
+      }
     : undefined;
   const persistPrincipalLaneOutbound = (messageId: string): string => {
     if (!ds?.session.principalLane || !turnId || !messageId) return messageId;

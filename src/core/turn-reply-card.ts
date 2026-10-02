@@ -114,7 +114,8 @@ export async function updateTurnReplyCard(
   }
   const transport = {
     usage,
-    beforeEffect, send: (body, uuid) => send(body, 'interactive', uuid), patch: (messageId, card) => updateMessage(ds.larkAppId, messageId, card),
+    beforeEffect, send: (body, uuid) => send(body, 'interactive', uuid),
+    patch: (messageId, card) => updateMessage(ds.larkAppId, messageId, card, { beforeWrite: beforeEffect }),
     isWithdrawn: error => error instanceof MessageWithdrawnError,
     forceVisible: options.forceVisible || ds.cotForced,
     render: (record: import('../services/turn-reply-card.js').TurnReplyCardRecord) => {

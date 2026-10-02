@@ -7643,13 +7643,13 @@ const server = createServer(async (req, res) => {
     let mBotTopicUnavailablePolicy: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotTopicUnavailablePolicy = url.pathname.match(/^\/api\/bots\/([^/]+)\/topic-unavailable-policy$/))) {
       const appId = decodeURIComponent(mBotTopicUnavailablePolicy[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      let body: unknown;
+      try { body = await readJsonBody(req); }
+      catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
       const upstream = await proxyToDaemon(appId, `/api/bot-topic-unavailable-policy`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: raw,
+        body: JSON.stringify(body),
       });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());

@@ -4883,9 +4883,6 @@ export function EnvelopeInjectionSection(props: { bot: BotDefaultsRow; patchBot:
   );
 }
 
-/** 最终回复投递方式：on = transcript（daemon 从 CLI 转写自动取最终回复，模型不再被
- *  要求 botmux send），off = send（模型自己 botmux send）。开关显示的是生效值：缺省
- *  为 send；两个方向都显式落盘。当前 CLI 没有转写采集通道时开关禁用并说明。 */
 function TopicUnavailablePolicySection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const [busy, setBusy] = useState(false);
@@ -4927,6 +4924,9 @@ function TopicUnavailablePolicySection(props: { bot: BotDefaultsRow; patchBot: P
   );
 }
 
+/** 最终回复投递方式：on = transcript（daemon 从 CLI 转写自动取最终回复，模型不再被
+ *  要求 botmux send），off = send（模型自己 botmux send）。开关显示的是生效值：缺省
+ *  为 send；两个方向都显式落盘。当前 CLI 没有转写采集通道时开关禁用并说明。 */
 export function ReplyDeliverySection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const [transcript, setTranscript] = useState(props.bot.replyDelivery === 'transcript');

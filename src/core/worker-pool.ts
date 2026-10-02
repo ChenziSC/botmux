@@ -793,6 +793,8 @@ function syncWorkerDisplayMode(ds: DaemonSession): void {
 // ─── Callbacks set by daemon at startup ─────────────────────────────────────
 
 export interface WorkerSessionReplyOptions {
+  /** Recheck caller ownership inside each provider write attempt. */
+  beforeWrite?: () => void | Promise<void>;
   uuid?: string;
   quoteMessageId?: string;
   beforeQuoteFallback?: () => void | Promise<void>;
@@ -17055,20 +17057,30 @@ function deliverFinalOutput(
     onComplete?.(true);
     return;
   }
+  // Capture before the first deferred attempt. Legacy/adopted turns do not
+  // necessarily retain a durable reply context after a newer turn starts.
+  // Meeting-driven output has its own audited placement and quote policy.
+  if (!managedReceiver && !isMeetingDrivenTurn(ds, msg.turnId, msg.dispatchAttempt)) {
+    frozenReplyTarget = { ...(frozenReplyTarget ?? frozenReplyContextForTurn(
+      ds, fallbackTurnId(ds, msg.replyTurnId ?? msg.turnId),
+    ).target) };
+  }
   const cb = requireCallbacks();
   const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
   const scopedReply = (
     content: string,
     msgType?: string,
     turnId?: string,
-    opts?: Omit<WorkerSessionReplyOptions, 'sourceSessionId'>,
+    opts?: Omit<WorkerSessionReplyOptions, 'sourceSessionId' | 'beforeWrite'>,
   ) => cb.sessionReply(
     sessionAnchorId(ds),
     content,
     msgType,
     ds.larkAppId,
     fallbackTurnId(ds, turnId),
-    { ...opts, sourceSessionId: ds.session.sessionId },
+    { ...opts, sourceSessionId: ds.session.sessionId, beforeWrite: () => {
+      if (!isStillOwned()) throw new Error('Final output no longer owns delivery');
+    } },
   );
   setTimeout(async () => {
     if (!isStillOwned()) {

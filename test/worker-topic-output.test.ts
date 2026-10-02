@@ -66,10 +66,10 @@ afterEach(() => {
   vi.unstubAllEnvs(); __testOnly_resetLarkGate();
 });
 
-function final(target?: FrozenSessionReplyTarget, owns: () => boolean = () => true): Promise<{ owned: boolean; messageId?: string }> {
+function final(target?: FrozenSessionReplyTarget, owns: () => boolean = () => true, attempt = 0): Promise<{ owned: boolean; messageId?: string }> {
   return new Promise(resolve => deliverFinalOutput(ds, {
     type: 'final_output', turnId: 'om_turn_old', content: 'answer', lastUuid: 'output-1',
-  }, 'fixture', 0, (owned, messageId) => resolve({ owned, messageId }), owns, target));
+  }, 'fixture', attempt, (owned, messageId) => resolve({ owned, messageId }), owns, target));
 }
 
 describe('worker final-output topic transport', () => {
@@ -82,6 +82,17 @@ describe('worker final-output topic transport', () => {
     expect(ds.lastBridgeEmittedUuid).toBeUndefined();
     expect(ds.session.status).toBe('active');
   }, 30000);
+
+  it('does not publish when the original topic cannot be checked', async () => {
+    mocks.request.mockRejectedValue(new Error('network unavailable'));
+    expect(await final({ mode: 'thread', rootMessageId: 'om_source' }, () => true, 2))
+      .toEqual({ owned: false, messageId: undefined });
+    expect(mocks.request).toHaveBeenCalled();
+    expect(mocks.reply).not.toHaveBeenCalled();
+    expect(mocks.create).not.toHaveBeenCalled();
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    expect(ds.session.status).toBe('active');
+  });
 
   it.each(['thread', 'quote'] as const)('preserves an available frozen %s target despite a newer live turn', async mode => {
     expect(await final({ mode, rootMessageId: 'om_source' })).toMatchObject({ owned: true, messageId: 'om_sent' });

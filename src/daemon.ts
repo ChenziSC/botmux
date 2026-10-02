@@ -213,7 +213,7 @@ import {
   storedSessionAnchorId,
   larkTransportEnabled,
 } from './core/types.js';
-import { assertSendTopicsAvailable, assertMessageTopicAvailable, TopicSendError } from './im/lark/topic-send-guard.js';
+import { assertMessageTopicAvailable, TopicSendError } from './im/lark/topic-send-guard.js';
 import { getMessageDetail as getTopicMessageDetail } from './im/lark/client.js';
 import { computeSoloSessionForBot, effectiveReplyDelivery } from './core/reply-delivery.js';
 import {
@@ -4116,7 +4116,6 @@ async function sessionReply(
     replyInThread: boolean,
     uuid?: string,
   ): Promise<string> => {
-    await assertSendTopicsAvailable(appId, [messageId], getTopicMessageDetail, getBot(appId).config.topicUnavailablePolicy);
     return persistPrincipalLaneOutbound(await (outboundOptions
       ? replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext, outboundOptions)
       : replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext)));

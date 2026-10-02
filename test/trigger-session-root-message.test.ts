@@ -390,12 +390,12 @@ describe('triggerSessionTurn rootMessageId target', () => {
     incumbent.session.rootMessageId = CHAT;
     const activeSessions = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), incumbent]]);
     const req = request({ rootMessageId: undefined });
-    req.presentation = { topicMessage: '开发机器人' };
+    req.presentation = { topicMessage: 'Background job' };
 
     const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
 
     expect(result).toMatchObject({ ok: true, target: { sessionId: 'sess_new' } });
-    expect(mockSendMessage).toHaveBeenCalledWith(APP, CHAT, '开发机器人');
+    expect(mockSendMessage).toHaveBeenCalledWith(APP, CHAT, 'Background job');
     expect(mockCreateSession).toHaveBeenCalledWith(CHAT, 'om_new_topic', '[External] alerts', 'group', undefined, { source: 'http' });
     expect(activeSessions.get(sessionKey(CHAT, APP))).toBe(incumbent);
     expect(activeSessions.get(sessionKey('om_new_topic', APP))?.scope).toBe('thread');

@@ -365,7 +365,7 @@ export async function deliverReportSessionRelay(input: {
   }>;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
   const { decision } = input;
-  await input.beforeWrite?.();
+  if (input.beforeWrite) await input.beforeWrite();
   const response = await input.fetchTarget('/api/trigger', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -449,7 +449,7 @@ export async function deliverReportSessionRelay(input: {
     };
   }
 
-  await input.beforeWrite?.();
+  if (input.beforeWrite) await input.beforeWrite();
   const fallbackResponse = await input.fetchTarget('/api/trigger', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },

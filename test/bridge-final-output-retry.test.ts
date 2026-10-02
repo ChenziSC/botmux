@@ -1,3 +1,4 @@
+import * as registrationStore from '../src/services/idempotency-store.js';
 /**
  * P2: daemon-side retry of `final_output` on transient Lark failures.
  *
@@ -3544,28 +3545,28 @@ describe('Worker turn_terminal routing', () => {
 
   it('keeps an internal receipt private after human interruption while preserving progress and later replies', async () => {
     const ds = makeDs();
-    ds.suppressedTriggerFinalTurns = new Map([['trg_deployment', Date.now()]]);
+    ds.suppressedTriggerFinalTurns = new Map([['trg_background', Date.now()]]);
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
     const emit = (msg: WorkerToDaemon) => (ds.worker as any).emit('message', msg);
 
-    emit({ type: 'active_turn_envelope_changed', previousTurnId: 'trg_deployment', turnId: 'om_human_update' });
+    emit({ type: 'active_turn_envelope_changed', previousTurnId: 'trg_background', turnId: 'om_human_update' });
     emit({ type: 'active_turn_envelope_changed', previousTurnId: 'om_human_update', turnId: 'om_second_update' });
-    const receipt = 'IP_HANDOFF_RECEIPT {"status":"deployment_succeeded_validation_queued"}';
+    const receipt = 'TASK_RESULT {"status":"completed"}';
     emit({ type: 'final_output', sessionId: ds.session.sessionId,
       content: receipt, lastUuid: 'private-receipt', turnId: 'om_second_update' });
     await Promise.resolve();
     expect(sessionReply).not.toHaveBeenCalled();
 
-    emit({ type: 'user_notify', message: 'Deployment succeeded', turnId: 'om_second_update' });
+    emit({ type: 'user_notify', message: 'Background task completed', turnId: 'om_second_update' });
     await Promise.resolve();
     expect(sessionReply).toHaveBeenCalledTimes(1);
     emit({ type: 'final_output', sessionId: ds.session.sessionId,
       content: 'Answer to a later question', lastUuid: 'later-answer', turnId: 'om_later_question' });
     await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(2));
     expect(sessionReply.mock.calls[1][1]).toContain('Answer to a later question');
-    expect(sessionReply.mock.calls.some(call => String(call[1]).includes('IP_HANDOFF_RECEIPT'))).toBe(false);
+    expect(sessionReply.mock.calls.some(call => String(call[1]).includes('TASK_RESULT'))).toBe(false);
   });
 
   it('drops only the final_output of a suppressed trigger turn while other turns and its aux UI stay loud', async () => {
@@ -3874,5 +3875,44 @@ describe('Worker turn_terminal routing', () => {
       turnId: 'om_replacement',
     });
     expect(onCliExit).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('keyed turn input-commit observation', () => {
+  it('records only matching live commit ACKs and leaves write failures unknown', async () => {
+    const ds = makeDs();
+    ds.workerGeneration = ds.session.workerGeneration = 1;
+    ds.idempotentAsyncTurns = new Map([['trg_keyed', {
+      ownerLarkAppId: ds.larkAppId, key: 'original-key', kind: 'turn', workerGeneration: 1,
+    }]]);
+    const record = vi.spyOn(registrationStore, 'recordTurnInputCommit').mockReturnValue(true);
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker, undefined, 1);
+    try {
+      worker.emit('message', { type: 'turn_input_received', turnId: 'trg_keyed' });
+      worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_other' });
+      await Promise.resolve();
+      expect(record).not.toHaveBeenCalled();
+      worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_keyed' });
+      await Promise.resolve();
+      expect(record).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        ownerLarkAppId: ds.larkAppId, sessionId: ds.session.sessionId, triggerId: 'trg_keyed',
+        key: 'original-key', workerGeneration: 1, ownerBootId: expect.any(String),
+      }));
+      record.mockImplementationOnce(() => { throw new Error('disk full'); });
+      worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_keyed' });
+      await Promise.resolve();
+      expect(ds.idempotentAsyncTurns.has('trg_keyed')).toBe(true);
+      ds.workerGeneration = ds.session.workerGeneration = 2;
+      worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_keyed' });
+      await Promise.resolve();
+      expect(record).toHaveBeenCalledTimes(2);
+      ds.worker = new EventEmitter() as any;
+      worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_keyed' });
+      await Promise.resolve();
+      expect(record).toHaveBeenCalledTimes(2);
+    } finally { record.mockRestore(); }
   });
 });

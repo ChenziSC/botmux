@@ -1,4 +1,3 @@
-import { TopicSendError } from './topic-send-guard.js';
 /**
  * Native CoT (thinking process) message — Feishu `im.v1 message_cot` bridge.
  *
@@ -41,13 +40,14 @@ import { TopicSendError } from './topic-send-guard.js';
  * Per-bot master switch `cotEnabled` (default ON — only an explicit false
  * disables; per-chat opt-out via `/cot off`).
  */
-import { pendingStartingCardPublication } from '../../core/starting-card-publication.js';
 import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getBot, getBotClient } from '../../bot-registry.js';
 import { boundSubjectForTitle, subjectFromArgsString, type ToolSubject } from '../../services/cot-subject.js';
 import { fallbackTurnId, frozenReplyContextForTurn } from '../../core/reply-target.js';
 import { isSilentScheduledTurn } from '../../core/silent-schedule-turns.js';
+import { TopicSendError } from './topic-send-guard.js';
+import { pendingStartingCardPublication } from '../../core/starting-card-publication.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 import { localeForBot, t } from '../../i18n/index.js';

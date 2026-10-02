@@ -221,6 +221,12 @@ describe('daemon dispatch and report source topics', () => {
     expect(result.body).toMatchObject({ error: 'TOPIC_SEND_BLOCKED', publishedMessageId: 'om_published', relayConfirmed: false });
     expect(mocks.create).toHaveBeenCalledOnce(); expect(mocks.fetchTarget).not.toHaveBeenCalled();
   });
+  it('does not relay a report when its authenticated source was withdrawn', async () => {
+    seedReportBinding(); unavailable = true;
+    const result = await invoke(REPORT_SESSION_RELAY_ROUTE, { dispatchRoot: 'om_source', content: 'result' });
+    expect(result.status).toBe(502); expect(result.body.error).toBe('TOPIC_SEND_BLOCKED');
+    expect(mocks.create).not.toHaveBeenCalled(); expect(mocks.fetchTarget).not.toHaveBeenCalled();
+  });
   it('does not add source queries under legacy policy', async () => {
     registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: 'claude-code', topicUnavailablePolicy: 'legacy' });
     unavailable = true;

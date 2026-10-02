@@ -4594,6 +4594,7 @@ function captureStreamingCardPatchFence(ds: DaemonSession, cardId: string, turnI
   const generation = ds.workerGeneration ?? session.workerGeneration;
   const currentTurnId = ds.currentTurnId;
   const runtimeKey = activeSessionKey(ds);
+  const statusFence = status === 'closed' ? undefined : captureStatusCardFence(ds, turnId);
   return () => ds.session === session && ds.session.sessionId === sessionId && ds.session.status === status
     && ds.larkAppId === appId && ds.chatId === chatId && sessionAnchorId(ds) === anchor
     && ds.streamCardId === cardId && ds.streamCardNonce === nonce
@@ -4601,9 +4602,10 @@ function captureStreamingCardPatchFence(ds: DaemonSession, cardId: string, turnI
     && !streamingCardDisabled(ds, turnId)
     && (status === 'closed'
       ? !getBot(appId).config.privateCard
-      : activeSessionsRegistry?.get(runtimeKey) === ds
+      : activeSessionKey(ds) === runtimeKey && activeSessionsRegistry?.get(runtimeKey) === ds
+        && !isSessionTransferring(ds) && remoteRetirementAdmissionPhase(ds) === null
         && (ds.workerGeneration ?? ds.session.workerGeneration) === generation
-        && ds.currentTurnId === currentTurnId);
+        && ds.currentTurnId === currentTurnId && statusFence!());
 }
 
 /**
@@ -4638,8 +4640,6 @@ async function publishHandoffAttachment(ds: DaemonSession, turnId: string, messa
   finally { active.delete(turnId); }
 }
 
-const pendingStatusPatchFence = new WeakMap<DaemonSession, () => boolean>();
-
 export function scheduleCardPatch(
   ds: DaemonSession,
   cardJson: string,
@@ -4660,7 +4660,6 @@ export function scheduleCardPatch(
   if (streamingCardDisabled(ds, turnId)) return false;
   const cardId = ds.streamCardId;
   if (!cardId || cardId === CARD_POSTING_SENTINEL) return false;
-  pendingStatusPatchFence.set(ds, captureStatusCardFence(ds, turnId));
   pendingStreamingCardPatchFence.set(ds, captureStreamingCardPatchFence(ds, cardId, turnId));
   ds.pendingCardJson = withHandoffPreview(cardJson, currentTurnStatusPolicy(ds, turnId)?.handoffPreview);
   // Capture the card ID now — by the time flushCardPatch runs, ds.streamCardId
@@ -4679,12 +4678,10 @@ function flushCardPatch(ds: DaemonSession): void {
   const json = ds.pendingCardJson;
   const cardId = ds.pendingCardId;
   const userInitiated = ds.pendingCardUserInitiated === true;
-  const fence = pendingStatusPatchFence.get(ds);
-  pendingStatusPatchFence.delete(ds);
   const writeFence = pendingStreamingCardPatchFence.get(ds);
   pendingStreamingCardPatchFence.delete(ds);
   const appId = ds.larkAppId;
-  if (!json || !cardId || cardId === CARD_POSTING_SENTINEL || (fence && !fence())) {
+  if (!json || !cardId || cardId === CARD_POSTING_SENTINEL || !writeFence?.()) {
     ds.pendingCardJson = undefined;
     ds.pendingCardId = undefined;
     ds.pendingCardUserInitiated = undefined;
@@ -4696,7 +4693,7 @@ function flushCardPatch(ds: DaemonSession): void {
   ds.cardPatchInFlight = true;
   let patchSucceeded = false;
   updateMessage(appId, cardId, json, { beforeWrite: () => {
-    if (!writeFence?.() || (fence && !fence())) throw new Error('Streaming-card PATCH no longer owns its original card');
+    if (!writeFence?.()) throw new Error('Streaming-card PATCH no longer owns its original card');
   } })
     .then(() => {
       patchSucceeded = true;
@@ -7895,7 +7892,6 @@ export async function closeSession(
       const botCfg = getBot(ds.larkAppId).config;
       if (!botCfg.privateCard && !streamingCardDisabled(ds)
           && larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly })) {
-        pendingStatusPatchFence.delete(ds);
         pendingStreamingCardPatchFence.set(ds, captureStreamingCardPatchFence(ds, ds.streamCardId));
         ds.pendingCardId = ds.streamCardId;
         ds.pendingCardJson = buildClosedSessionCard(ds, localeForBot(ds.larkAppId));
@@ -13488,9 +13484,8 @@ function setupWorkerHandlers(
           const restoredAppId = ds.larkAppId;
           const restoredDisplayAnchor = sessionAnchorId(ds);
           const restoredRuntimeKey = activeSessionKey(ds);
-          const statusFence = captureStatusCardFence(ds, msg.turnId);
           const ownsRestoredCard = (): boolean =>
-            statusFence() && ds.session === restoredSession
+            ds.session === restoredSession
             && ds.session.status === 'active'
             && ds.larkAppId === restoredAppId
             && sessionAnchorId(ds) === restoredDisplayAnchor
@@ -13498,10 +13493,12 @@ function setupWorkerHandlers(
             && !isSessionTransferring(ds)
             && ds.streamCardId === restoredCardId
             && activeSessionsRegistry?.get(restoredRuntimeKey) === ds;
+          let ownsRestoredWrite = (): boolean => false;
           try {
             const initTitle = statusCardTitle(ds, sessionCliDisplayName(ds, botCfg));
             // Reuse persisted nonce so existing card buttons (toggle/etc) keep working.
             if (!ds.streamCardNonce) ds.streamCardNonce = randomBytes(4).toString('hex');
+            ownsRestoredWrite = captureStreamingCardPatchFence(ds, restoredCardId, msg.turnId);
             // Prefer the last-known screen status when we have one — for /relay
             // resume the worker was idle/limited at transfer time and the
             // CLI didn't actually stop, so showing "starting" right after
@@ -13535,9 +13532,13 @@ function setupWorkerHandlers(
               dshRuntimeForSession(ds),
               resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
             );
-            if (!ownsLifecycleMutation() || !ownsRestoredCard()) break;
-            await updateMessage(restoredAppId, restoredCardId, withHandoffPreview(streamCardJson, currentTurnStatusPolicy(ds, msg.turnId)?.handoffPreview));
-            if (!ownsLifecycleMutation() || !ownsRestoredCard()) break;
+            if (!ownsLifecycleMutation() || !ownsRestoredCard() || !ownsRestoredWrite()) break;
+            await updateMessage(restoredAppId, restoredCardId, withHandoffPreview(streamCardJson, currentTurnStatusPolicy(ds, msg.turnId)?.handoffPreview), { beforeWrite: () => {
+              if (!ownsLifecycleMutation() || !ownsRestoredCard() || !ownsRestoredWrite()) {
+                throw new Error('Restored card no longer owns delivery');
+              }
+            } });
+            if (!ownsLifecycleMutation() || !ownsRestoredCard() || !ownsRestoredWrite()) break;
             ds.parkedStreamCardNonce = undefined;
             // Worker IPC handlers may run while the direct restore PATCH is in
             // flight. Re-queue readiness after it completes so an older
@@ -13561,7 +13562,7 @@ function setupWorkerHandlers(
             if (!ownsRestoredCard()) break;
             break;
           } catch (err) {
-            if (!ownsLifecycleMutation() || !ownsRestoredCard()) break;
+            if (!ownsLifecycleMutation() || !ownsRestoredCard() || !ownsRestoredWrite()) break;
             // PATCH failed (withdrawn, expired, etc.) — fall through to POST a fresh card.
             logger.info(`[${t}] Failed to reuse existing streaming card (${err instanceof Error ? err.message : err}), posting new one`);
             ds.streamCardId = undefined;
@@ -13582,10 +13583,13 @@ function setupWorkerHandlers(
         const cardReplyTarget = captureStreamingCardReplyTarget(ds, msg.turnId);
         const statusRevisionAtPost = ds.streamCardStatusRevision ?? 0;
         const postingSession = ds.session;
+        const postingTurnId = ds.currentTurnId;
+        const postingChatId = ds.chatId;
         const postingAppId = ds.larkAppId;
         const postingDisplayAnchor = sessionAnchorId(ds);
         const postingRuntimeKey = activeSessionKey(ds);
         ds.streamCardId = CARD_POSTING_SENTINEL;
+        const statusFence = captureStatusCardFence(ds, msg.turnId);
         let ownsFreshReadyPost = (): boolean => false;
         let restoreFreshReadyPrePostIdentityForRetirement = (): boolean => false;
         let stillOwnsFreshReadyPost = (): boolean => false;
@@ -13608,7 +13612,6 @@ function setupWorkerHandlers(
             persistStreamCardState(ds);
             return true;
           };
-          const statusFence = captureStatusCardFence(ds, msg.turnId);
           stillOwnsFreshReadyPost = (): boolean =>
             ownsFreshReadyPost() && statusFence()
             && remoteRetirementAdmissionPhase(ds) === null
@@ -13717,6 +13720,19 @@ function setupWorkerHandlers(
           clearPendingLocalCliOpenReadinessPatch(ds);
           ds.pendingCodexTierCardRefresh = undefined;
           persistStreamCardState(ds);
+          // A static fallback belongs to the same failed ready publication.
+          // Freeze its identity before either the POST or readiness PATCH yields.
+          const fallbackNonce = ds.streamCardNonce;
+          const ownsFallbackCard = (): boolean => ownsLifecycleMutation() && statusFence()
+            && ds.streamCardId === undefined && ds.streamCardNonce === fallbackNonce
+            && ds.currentTurnId === postingTurnId && ds.chatId === postingChatId
+            && (ds.streamCardTurnGeneration ?? 0) === postingGeneration
+            && activeSessionKey(ds) === postingRuntimeKey
+            && !streamingCardDisabled(ds, msg.turnId) && retainsLarkStreamingCardTransport(ds)
+            && remoteRetirementAdmissionPhase(ds) === null;
+          const beforeFallbackWrite = (): void => {
+            if (!ownsFallbackCard()) throw new Error('Fallback card no longer owns delivery');
+          };
           // Fallback: send static session card
           try {
             const localCliReadyAtBuild = isLocalCliOpenReady(ds, { cliId: effectiveCliId });
@@ -13732,9 +13748,10 @@ function setupWorkerHandlers(
               localCliReadyAtBuild,
               sessionRuntimeDisplayName(ds, botCfg),
             );
-            const fallbackCardId = await scopedReply(cardJson, 'interactive', msg.turnId);
-            if (!ownsLifecycleMutation()) {
-              void deleteMessage(ds.larkAppId, fallbackCardId).catch(() => { /* best-effort stale-card cleanup */ });
+            const fallbackCardId = await scopedReplyTo(postingDisplayAnchor, postingAppId, cardJson,
+              'interactive', cardReplyTarget.turnId, { replyTarget: cardReplyTarget.target, beforeWrite: beforeFallbackWrite });
+            if (!ownsFallbackCard()) {
+              void deleteMessage(postingAppId, fallbackCardId).catch(() => { /* best-effort stale-card cleanup */ });
               break;
             }
             if (!localCliReadyAtBuild && isLocalCliOpenEnabled()
@@ -13752,13 +13769,13 @@ function setupWorkerHandlers(
                 sessionRuntimeDisplayName(ds, botCfg),
               );
               try {
-                await updateMessage(ds.larkAppId, fallbackCardId, readyCardJson);
+                await updateMessage(postingAppId, fallbackCardId, readyCardJson, { beforeWrite: beforeFallbackWrite });
               } catch (patchErr) {
                 logger.debug(`[${t}] Failed to add local CLI button to fallback card: ${patchErr}`);
               }
             }
           } catch (fallbackErr) {
-            if (!ownsLifecycleMutation()) break;
+            if (!ownsFallbackCard()) break;
             if (fallbackErr instanceof MessageWithdrawnError) {
               await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while creating fallback worker-ready card');
               break;

@@ -391,7 +391,7 @@ describe('restoreUsageLimitRuntimeState', () => {
   it('marks restored limit sessions limited and re-arms the retry timer', () => {
     vi.useFakeTimers();
     const now = Date.now();
-    const ds = makeDs();
+    const ds = makeDs(); activate(ds);
     ds.streamCardId = 'om_live_limit';
     ds.streamCardNonce = 'nonce_limit';
     ds.session.webPort = 8080;
@@ -473,7 +473,7 @@ describe('restoreUsageLimitRuntimeState', () => {
   it('Plan B: a meeting-agent session patches its Lark card on retry-ready like a normal session', () => {
     vi.useFakeTimers();
     const now = Date.now();
-    const ds = makeDs();
+    const ds = makeDs(); activate(ds);
     // The vcMeetingReceiver marker is now pure delivery metadata — it no longer
     // suppresses the streaming card, so a meeting agent's usage-limit card patch
     // proceeds exactly like any ordinary chat-scope session.
@@ -1326,7 +1326,7 @@ describe('scheduleCardPatch adjacent duplicate handling', () => {
   it('warns once per minute for user-triggered PATCH failures with sanitized Lark fields', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-09-25T00:00:00Z'));
-    const ds = makeDs();
+    const ds = makeDs(); activate(ds);
     ds.streamCardId = 'om_USER';
     const failure = Object.assign(new Error('request failed'), {
       response: {
@@ -1350,7 +1350,7 @@ describe('scheduleCardPatch adjacent duplicate handling', () => {
   });
 
   it('drops an identical PATCH queued for the same card after the in-flight PATCH succeeds', async () => {
-    const ds = makeDs();
+    const ds = makeDs(); activate(ds);
     ds.streamCardId = 'om_SAME';
 
     let resolvePatch!: () => void;
@@ -1382,7 +1382,7 @@ describe('scheduleCardPatch adjacent duplicate handling', () => {
   });
 
   it('retries an identical queued PATCH when the in-flight PATCH fails', async () => {
-    const ds = makeDs();
+    const ds = makeDs(); activate(ds);
     ds.streamCardId = 'om_RETRY';
 
     let rejectPatch!: (error: Error) => void;
@@ -1414,7 +1414,7 @@ describe('scheduleCardPatch adjacent duplicate handling', () => {
   });
 
   it('does not deduplicate identical JSON queued for a different card', async () => {
-    const ds = makeDs();
+    const ds = makeDs(); activate(ds);
     ds.streamCardId = 'om_OLD';
 
     let resolveOldPatch!: () => void;
@@ -1524,7 +1524,7 @@ describe('refreshStreamingCardUsage (interval tick)', () => {
   }
 
   it('re-renders and PATCHes the live card while working', () => {
-    const ds = workingDs();
+    const ds = workingDs(); activate(ds);
     refreshStreamingCardUsage(ds);
     expect(buildStreamingCard).toHaveBeenCalledTimes(1);
     expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_live', expect.any(String));
@@ -1692,7 +1692,7 @@ describe('managed governance automatic status boundaries', () => {
     expect(scheduleCardPatch(ds, '{}', 'governance')).toBe(false);
   });
   it('drops a queued old PATCH when a governance turn commits while the first PATCH is in flight', async () => {
-    const ds = makeDs(); ds.streamCardId = 'om_before';
+    const ds = makeDs(); activate(ds); ds.streamCardId = 'om_before';
     let finish!: () => void;
     updateMessageMock.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
     scheduleCardPatch(ds, '{"revision":1}');

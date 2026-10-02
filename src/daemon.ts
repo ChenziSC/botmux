@@ -4149,12 +4149,12 @@ async function sessionReply(
         return sendWithHookPolicy(chatId, content, msgType, opts.uuid);
       }
     }
-    if (opts?.replyTarget?.mode === 'thread') {
+    if (opts?.replyTarget?.mode === 'thread' || opts?.replyTarget?.mode === 'quote') {
       return replyWithHookPolicy(
         opts.replyTarget.rootMessageId,
         content,
         msgType,
-        true,
+        opts.replyTarget.mode === 'thread',
         opts.uuid,
       );
     }
@@ -4222,8 +4222,8 @@ async function sessionReply(
   if (opts?.replyTarget?.mode === 'plain') {
     throw new Error('plain frozen reply target is invalid for a thread-scoped session');
   }
-  if (opts?.replyTarget?.mode === 'thread') {
-    return replyWithHookPolicy(opts.replyTarget.rootMessageId, content, msgType, true, opts.uuid);
+  if (opts?.replyTarget?.mode === 'thread' || opts?.replyTarget?.mode === 'quote') {
+    return replyWithHookPolicy(opts.replyTarget.rootMessageId, content, msgType, opts.replyTarget.mode === 'thread', opts.uuid);
   }
   return replyWithHookPolicy(anchor, content, msgType, true, opts?.uuid);
 }

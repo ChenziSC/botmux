@@ -17046,6 +17046,14 @@ function deliverFinalOutput(
     onComplete?.(true);
     return;
   }
+  // Capture before the first deferred attempt. Legacy/adopted turns do not
+  // necessarily retain a durable reply context after a newer turn starts.
+  // Meeting-driven output has its own audited placement and quote policy.
+  if (!managedReceiver && !isMeetingDrivenTurn(ds, msg.turnId, msg.dispatchAttempt)) {
+    frozenReplyTarget = { ...(frozenReplyTarget ?? frozenReplyContextForTurn(
+      ds, fallbackTurnId(ds, msg.replyTurnId ?? msg.turnId),
+    ).target) };
+  }
   const cb = requireCallbacks();
   const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
   const scopedReply = (

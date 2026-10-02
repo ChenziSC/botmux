@@ -50,6 +50,17 @@ function createFixture(topicUnavailablePolicy?: 'stop', session: Record<string, 
 }
 
 describe('botmux send per-turn final idempotency', () => {
+  it('does not reserve or publish when a thread source has no message identity', () => {
+    const f = createFixture('stop', { rootMessageId: '' });
+    try {
+      const attempt = f.run('final', 'answer', ['--top-level']);
+      expect(attempt.result.status).not.toBe(0);
+      expect(String(attempt.result.stderr)).toContain('TOPIC_SEND_CHECK_FAILED');
+      expect(attempt.requests).toHaveLength(0);
+      expect(existsSync(join(f.dataDir, 'turn-send-ledger'))).toBe(false);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 30_000);
+
   it.each([['--top-level'], ['--top-level', '--chat-id', 'oc_other'], ['--into', 'om_other']])(
     'does not erase a chat turn quote source with destination arguments %j', (...args) => {
       const f = createFixture('stop', { scope: 'chat', replyTargets: {

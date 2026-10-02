@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { assertSendTopicsAvailable } from './cli/topic-send-guard.js';
+import { assertMessageTopicAvailable, assertSendTopicsAvailable } from './im/lark/topic-send-guard.js';
 /**
  * CLI entry point for botmux.
  *
@@ -10204,11 +10204,12 @@ async function cmdSend(rest: string[]): Promise<void> {
         binding: readDeferredTopicBinding(dataDir, topicSourceSession.sessionId),
         explicitTopLevel: false,
       });
-      await assertSendTopicsAvailable(sourceAppId, [
-        scheduledRoot,
-        !topicSourceSession.deferredScheduleRun && sourceTopicTarget.mode !== 'plain'
-          ? sourceTopicTarget.rootMessageId : undefined,
-      ], (app, id) => getTopicMessageDetail(app, id, { userCardContent: false, timeoutMs: 10000 }), 'stop');
+      await assertSendTopicsAvailable(sourceAppId, [scheduledRoot],
+        (app, id) => getTopicMessageDetail(app, id, { userCardContent: false, timeoutMs: 10000 }), 'stop');
+      if (!topicSourceSession.deferredScheduleRun && sourceTopicTarget.mode !== 'plain') {
+        await assertMessageTopicAvailable(sourceAppId, sourceTopicTarget.rootMessageId,
+          (app, id) => getTopicMessageDetail(app, id, { userCardContent: false, timeoutMs: 10000 }));
+      }
     }
     await assertSendTopicsAvailable(appId, [sendInto],
       (app, id) => getTopicMessageDetail(app, id, { userCardContent: false, timeoutMs: 10000 }),
@@ -12613,11 +12614,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   });
   const dispatchWriteOptions = { beforeWrite: async () => {
     const { getBot } = await import('./bot-registry.js');
+    if (getBot(dispatchSourceAppId).config.topicUnavailablePolicy !== 'stop' || dispatchSource.mode === 'plain') return;
     const { getMessageDetail } = await import('./im/lark/client.js');
-    await assertSendTopicsAvailable(dispatchSourceAppId,
-      [dispatchSource.mode === 'plain' ? undefined : dispatchSource.rootMessageId],
-      (appId, id) => getMessageDetail(appId, id, { userCardContent: false, timeoutMs: 10000 }),
-      getBot(dispatchSourceAppId).config.topicUnavailablePolicy);
+    await assertMessageTopicAvailable(dispatchSourceAppId, dispatchSource.rootMessageId,
+      (appId, id) => getMessageDetail(appId, id, { userCardContent: false, timeoutMs: 10000 }));
   } };
 
   const targetChatId = overrideChatId ?? s.chatId;
@@ -13151,11 +13151,10 @@ async function cmdReport(rest: string[]): Promise<void> {
   });
   const reportWriteOptions = { beforeWrite: async () => {
     const { getBot } = await import('./bot-registry.js');
+    if (getBot(reportSourceAppId).config.topicUnavailablePolicy !== 'stop' || reportSource.mode === 'plain') return;
     const { getMessageDetail } = await import('./im/lark/client.js');
-    await assertSendTopicsAvailable(reportSourceAppId,
-    [reportSource.mode === 'plain' ? undefined : reportSource.rootMessageId],
-    (appId, id) => getMessageDetail(appId, id, { userCardContent: false, timeoutMs: 10000 }),
-    getBot(reportSourceAppId).config.topicUnavailablePolicy);
+    await assertMessageTopicAvailable(reportSourceAppId, reportSource.rootMessageId,
+      (appId, id) => getMessageDetail(appId, id, { userCardContent: false, timeoutMs: 10000 }));
   } };
 
 

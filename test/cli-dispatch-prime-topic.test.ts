@@ -15,12 +15,12 @@ const SEED = 'om_dispatch_seed';
 
 async function dispatch(options: {
   policy?: 'stop' | 'legacy'; unavailable?: string; state?: 'deleted' | 'unknown' | 'error';
-  retry?: boolean; overrideSession?: boolean; chatScope?: boolean; unthreaded?: boolean;
+  retry?: boolean; overrideSession?: boolean; chatScope?: boolean; unthreaded?: boolean; missingRoot?: boolean;
 }) {
   const root = mkdtempSync(join(tmpdir(), 'dispatch-prime-'));
   const data = join(root, 'data'); const home = join(root, 'home');
   for (const p of [data, home, join(data, '.botmux-cli-pids')]) mkdirSync(p, { recursive: true });
-  const current = { sessionId: 'current', larkAppId: APP, chatId: 'oc_origin', rootMessageId: ROOT,
+  const current = { sessionId: 'current', larkAppId: APP, chatId: 'oc_origin', rootMessageId: options.missingRoot ? '' : ROOT,
     scope: options.chatScope ? 'chat' : 'thread', status: 'active', ownerOpenId: 'ou_owner',
     createdAt: '2026-08-07T07:30:00.000Z', workingDir: root,
     currentReplyTarget: { rootMessageId: 'om_stale', turnId: 'stale' },
@@ -113,6 +113,12 @@ describe('dispatch repo prime source topic', () => {
   it('keeps an explicitly unthreaded chat origin independent of its stale root', async () => {
     const result = await dispatch({ chatScope: true, unthreaded: true, unavailable: ROOT });
     expect(result.status, result.stderr).toBe(0); expect(result.writes).toHaveLength(1); expect(result.reads).not.toContain(ROOT);
+  });
+  it('refuses a thread source whose original message identity is missing', async () => {
+    const result = await dispatch({ missingRoot: true });
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.stderr).toContain('TOPIC_SEND_CHECK_FAILED');
+    expect(result.writes).toEqual([]);
   });
   it('keeps only the existing receipt metadata query in legacy mode', async () => {
     const result = await dispatch({ policy: 'legacy', unavailable: ROOT });

@@ -1614,3 +1614,18 @@ describe('gateway quota classification', () => {
     expect(codexTaskFailureCode('429 Too Many Requests')).toBe(CODEX_RATE_LIMIT_ERROR_CODE);
   });
 });
+
+
+describe('Chinese limit classification keeps the constrained resource', () => {
+  it.each([
+    '400 invalid_request: 输入长度超过模型上限',
+    '400 invalid_request: 上下文token数量达到上限',
+  ])('does not treat a per-request context limit as a quota: %s', error => {
+    expect(codexTaskFailureCode(error)).toBe(CODEX_INVALID_REQUEST_ERROR_CODE);
+  });
+  it.each(['429: 请求频率达到上限', '429 Too Many Requests: 请求数达到上限'])(
+    'keeps retryable rate limiting: %s', error => {
+      expect(codexTaskFailureCode(error)).toBe(CODEX_RATE_LIMIT_ERROR_CODE);
+    },
+  );
+});

@@ -1823,8 +1823,8 @@ describe('XPI cross-app human classification identity', () => {
       expect(ds.session.crossPrincipalInterruptions).toEqual([
         expect.objectContaining({ phase: 'awaiting_owner' }),
       ]);
-      // Queue advancement completes before the detached proposer notification.
-      // Observe actual delivery instead of treating the driving promise as its ACK.
+      // The proposer notice is sent in the background after the queue is saved;
+      // awaiting the driver only guarantees the state transition has completed.
       await vi.waitFor(() => {
         expect(repliedText()).toContain('建议已暂存，将在当前任务结束后由原任务发起人确认。');
       });

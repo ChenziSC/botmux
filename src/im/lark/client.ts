@@ -1,4 +1,4 @@
-import { assertMessageTopicAvailable, TopicSendError } from './topic-send-guard.js';
+import { assertMessageTopicAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../../cli/topic-send-guard.js';
 import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync } from 'node:fs';
 import { dirname, extname, basename, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
@@ -266,7 +266,7 @@ const listBotsApiFailures = new Map<string, { reason: string; expiresAt: number 
  */
 export interface OutboundMessageOptions {
   /** Revalidate the frozen source immediately before every provider attempt. */
-  beforeWrite?: () => void | Promise<void>;
+  beforeWrite?: (topicMessageLookup?: TopicMessageLookup) => void | Promise<void>;
   /** The provider request is reconciling an already-attempted stable UUID.
    * Lark deduplicates the message, but the local outbound hook is a separate
    * side effect and must not be fired twice. */
@@ -300,10 +300,14 @@ async function emitOutboundHookIfAllowed(
 
 // Inside the API gate callback so rate-limit waits and retries cannot reuse
 // an earlier available observation. Policy refusals are not provider failures.
-export async function assertMessageWriteAllowed(larkAppId: string, messageId?: string): Promise<void> {
+const lookupWriteTopic: TopicMessageLookup = (appId, id) =>
+  getMessageDetail(appId, id, { userCardContent: false, timeoutMs: 10000 });
+
+export async function assertMessageWriteAllowed(
+  larkAppId: string, messageId?: string, lookup: TopicMessageLookup = lookupWriteTopic,
+): Promise<void> {
   if (getBot(larkAppId)?.config?.topicUnavailablePolicy !== 'stop') return;
-  await assertMessageTopicAvailable(larkAppId, messageId, (appId, id) =>
-    getMessageDetail(appId, id, { userCardContent: false, timeoutMs: 10000 }));
+  await assertMessageTopicAvailable(larkAppId, messageId, lookup);
 }
 
 function withdrawnWriteError(larkAppId: string, messageId: string): Error {
@@ -323,7 +327,10 @@ export async function sendMessage(
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendMessage');
   return executeWithLarkGate(larkAppId, 'sendMessage', async () => {
-    if (options?.beforeWrite) await options.beforeWrite();
+    // A retry gets a new cache after the gate wait, never a previous attempt's
+    // available result. Destination and source checks may share this lookup.
+    const topicLookup = createTopicMessageLookupCache(lookupWriteTopic);
+    if (options?.beforeWrite) await options.beforeWrite(topicLookup.lookup);
     const c = getBotClient(larkAppId);
     const body = msgType === 'text'
       ? JSON.stringify({ text: content })
@@ -387,9 +394,10 @@ export async function replyMessage(
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'replyMessage');
   return executeWithLarkGate(larkAppId, 'replyMessage', async () => {
-    await assertMessageWriteAllowed(larkAppId, messageId);
+    const topicLookup = createTopicMessageLookupCache(lookupWriteTopic);
+    await assertMessageWriteAllowed(larkAppId, messageId, topicLookup.lookup);
     // The source/authority fence follows the awaited destination lookup.
-    if (options?.beforeWrite) await options.beforeWrite();
+    if (options?.beforeWrite) await options.beforeWrite(topicLookup.lookup);
     const c = getBotClient(larkAppId);
     const body = msgType === 'text'
       ? JSON.stringify({ text: content })
@@ -1273,8 +1281,9 @@ export async function updateMessage(
 ): Promise<void> {
   assertLarkTransport(larkAppId, 'updateMessage');
   return executeWithLarkGate(larkAppId, 'updateMessage', async () => {
-    await assertMessageWriteAllowed(larkAppId, messageId);
-    if (options?.beforeWrite) await options.beforeWrite();
+    const topicLookup = createTopicMessageLookupCache(lookupWriteTopic);
+    await assertMessageWriteAllowed(larkAppId, messageId, topicLookup.lookup);
+    if (options?.beforeWrite) await options.beforeWrite(topicLookup.lookup);
     const c = getBotClient(larkAppId);
     let res: any;
     try {
@@ -1445,7 +1454,7 @@ export async function getMessageDetail(
     with_sender_name: 'true',
   }, options);
   if (res.code !== 0) {
-    throw new Error(`Failed to get message: ${res.msg} (code: ${res.code})`);
+    throw Object.assign(new Error(`Failed to get message: ${res.msg} (code: ${res.code})`), { code: res.code });
   }
   return res.data;
 }

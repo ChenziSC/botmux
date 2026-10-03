@@ -144,7 +144,7 @@ vi.mock('../src/services/session-group-title.js', async () => {
   return { ...actual, scheduleSessionGroupTitle: (...args: any[]) => mocks.scheduleSessionGroupTitle(...args) };
 });
 
-import { TopicSendError } from '../src/im/lark/topic-send-guard.js';
+import { TopicSendError } from '../src/cli/topic-send-guard.js';
 import { registerBot, getBot } from '../src/bot-registry.js';
 import {
   __testOnly_activeSessions as activeSessions,

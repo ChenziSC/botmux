@@ -46,7 +46,7 @@ import { getBot, getBotClient } from '../../bot-registry.js';
 import { boundSubjectForTitle, subjectFromArgsString, type ToolSubject } from '../../services/cot-subject.js';
 import { fallbackTurnId, frozenReplyContextForTurn } from '../../core/reply-target.js';
 import { isSilentScheduledTurn } from '../../core/silent-schedule-turns.js';
-import { TopicSendError } from './topic-send-guard.js';
+import { TopicSendError } from '../../cli/topic-send-guard.js';
 import { pendingStartingCardPublication } from '../../core/starting-card-publication.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';

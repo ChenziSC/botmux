@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { spawnSyncTsScript } from './helpers/ts-runner.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
+import { TurnSendLedger } from '../src/services/turn-send-ledger.js';
 
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
 const repo = fileURLToPath(new URL('..', import.meta.url));
@@ -57,7 +58,9 @@ describe('botmux send per-turn final idempotency', () => {
       expect(attempt.result.status).not.toBe(0);
       expect(String(attempt.result.stderr)).toContain('TOPIC_SEND_CHECK_FAILED');
       expect(attempt.requests).toHaveLength(0);
-      expect(existsSync(join(f.dataDir, 'turn-send-ledger'))).toBe(false);
+      // Official read/maintenance paths may create directories and a prune marker.
+      // They must not create a reservation or delivery record for this refusal.
+      expect(new TurnSendLedger(f.dataDir).inspect()).toEqual([]);
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 30_000);
 
@@ -71,7 +74,9 @@ describe('botmux send per-turn final idempotency', () => {
         expect(attempt.result.status).not.toBe(0);
         expect(String(attempt.result.stderr)).toContain('TOPIC_SEND_BLOCKED');
         expect(attempt.requests).toHaveLength(0);
-        expect(existsSync(join(f.dataDir, 'turn-send-ledger'))).toBe(false);
+        // Official read/maintenance paths may create directories and a prune marker.
+        // They must not create a reservation or delivery record for this refusal.
+        expect(new TurnSendLedger(f.dataDir).inspect()).toEqual([]);
       } finally { rmSync(f.root, { recursive: true, force: true }); }
     }, 30_000,
   );
@@ -86,11 +91,13 @@ describe('botmux send per-turn final idempotency', () => {
       expect(attempt.result.status).not.toBe(0);
       expect(String(attempt.result.stderr)).toContain('TOPIC_SEND_BLOCKED');
       expect(attempt.requests).toHaveLength(0);
-      expect(existsSync(join(f.dataDir, 'turn-send-ledger'))).toBe(false);
+      // Official read/maintenance paths may create directories and a prune marker.
+      // They must not create a reservation or delivery record for this refusal.
+      expect(new TurnSendLedger(f.dataDir).inspect()).toEqual([]);
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 30_000);
 
-  it.each(['deleted', 'missing', 'unknown'])('keeps the stop policy before a ledger replay when the source is %s', state => {
+  it.each(['deleted', 'missing', 'unknown'])('returns the existing final without a new effect when the source is %s', state => {
     const f = createFixture('stop');
     try {
       const first = f.run('final', 'answer');
@@ -99,8 +106,10 @@ describe('botmux send per-turn final idempotency', () => {
       const recordPath = readdirLedger(f.dataDir);
       const original = readFileSync(recordPath, 'utf8');
       const retry = f.run('final', 'answer', [], state);
-      expect(retry.result.status).not.toBe(0);
-      expect(String(retry.result.stderr)).toContain(state === 'deleted' ? 'TOPIC_SEND_BLOCKED' : 'TOPIC_SEND_CHECK_FAILED');
+      expect(retry.result.status, String(retry.result.stderr)).toBe(0);
+      expect(JSON.parse(String(retry.result.stdout).trim())).toMatchObject({
+        messageId: 'om_separate_message', replayed: true,
+      });
       expect(retry.requests).toHaveLength(0);
       expect(readFileSync(recordPath, 'utf8')).toBe(original);
       const restored = f.run('final', 'answer');
@@ -117,9 +126,34 @@ describe('botmux send per-turn final idempotency', () => {
       expect(attempt.result.status).not.toBe(0);
       expect(String(attempt.result.stderr)).toContain('TOPIC_SEND_BLOCKED');
       expect(attempt.requests).toHaveLength(0);
-      expect(existsSync(join(f.dataDir, 'turn-send-ledger'))).toBe(false);
+      // Official read/maintenance paths may create directories and a prune marker.
+      // They must not create a reservation or delivery record for this refusal.
+      expect(new TurnSendLedger(f.dataDir).inspect()).toEqual([]);
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 30_000);
+
+  it.each(['deleted', 'missing', 'unknown'])('retains an unknown provider checkpoint without sending when the source is %s', async state => {
+    const f = createFixture('stop');
+    try {
+      const ledger = new TurnSendLedger(f.dataDir);
+      const key = { larkAppId: 'cli_test', sessionId: f.sessionId, turnId: f.turnId };
+      await expect(ledger.executeNonIdempotentSequence(key, 'final', 'original request', 1,
+        async (_index, effects) => {
+          effects.providerRequestStarted();
+          throw new Error('unknown test provider response');
+        }, 'original-target')).rejects.toThrow('unknown test provider response');
+      const path = ledger.recordPath(key);
+      const original = readFileSync(path, 'utf8');
+      const before = ledger.inspect();
+      expect(before).toHaveLength(1);
+      const retry = f.run('final', 'answer', [], state);
+      expect(retry.result.status).not.toBe(0);
+      expect(String(retry.result.stderr)).toContain(state === 'deleted' ? 'TOPIC_SEND_BLOCKED' : 'TOPIC_SEND_CHECK_FAILED');
+      expect(retry.requests).toEqual([]);
+      expect(readFileSync(path, 'utf8')).toBe(original);
+      expect(ledger.inspect()).toEqual(before);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 40_000);
 
   it('reuses the original id for the same final and blocks final/progress changes', () => {
     const f = createFixture();

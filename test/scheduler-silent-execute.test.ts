@@ -198,7 +198,7 @@ import { recordDispatchInputCommit, foldableChatSessionAppIds } from '../src/cor
 import { sessionKey } from '../src/core/types.js';
 import { writeDeferredTopicBinding, removeDeferredTopicBinding } from '../src/core/deferred-topic-binding.js';
 import { config } from '../src/config.js';
-import { TopicSendError } from '../src/im/lark/topic-send-guard.js';
+import { TopicSendError } from '../src/cli/topic-send-guard.js';
 import {
   __testOnly_activeSessions as daemonActiveSessions,
   __testOnly_promoteMaterializedTaskPositionSession as promoteTaskPositionSession,

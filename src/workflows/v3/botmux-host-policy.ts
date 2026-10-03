@@ -1,5 +1,5 @@
 import type { OutboundMessageOptions } from '../../im/lark/client.js';
-import { assertMessageTopicAvailable, TopicSendError } from '../../im/lark/topic-send-guard.js';
+import { assertMessageTopicAvailable, TopicSendError } from '../../cli/topic-send-guard.js';
 import type {
   ExecutionContextSnapshot,
   HostExecutorPolicy,

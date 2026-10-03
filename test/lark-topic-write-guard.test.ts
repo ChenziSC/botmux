@@ -20,7 +20,7 @@ vi.mock('../src/services/hook-runner.js', () => ({ emitHookEvent: mocks.hook }))
 import { sendMessage, replyMessage, updateMessage, forwardMessage, urgentMessage,
   updateCardStreamingSettings, updateCardStreamElementContent, patchCardStreamElement,
   resolveCardKitId, MessageWithdrawnError, addReaction, removeReaction, pinMessage, unpinMessage } from '../src/im/lark/client.js';
-import { assertSendTopicsAvailable, TopicSendError } from '../src/im/lark/topic-send-guard.js';
+import { assertSendTopicsAvailable, TopicSendError, type TopicMessageLookup } from '../src/cli/topic-send-guard.js';
 import { __testOnly_resetLarkGate } from '../src/im/lark/api-gate.js';
 
 const operations = [
@@ -57,6 +57,42 @@ beforeEach(() => {
 afterEach(() => { vi.unstubAllEnvs(); __testOnly_resetLarkGate(); });
 
 describe('stop policy at the actual Lark write boundary', () => {
+  it.each(['reply', 'patch'] as const)('%s shares a lookup only within the current provider attempt', async operation => {
+    const beforeWrite = vi.fn(async (lookup?: TopicMessageLookup) => {
+      expect(lookup).toBeTypeOf('function');
+      await assertSendTopicsAvailable('app', ['om_root'], lookup!, 'stop');
+    });
+    const run = () => operation === 'reply'
+      ? replyMessage('app', 'om_root', 'answer', 'text', true, 'stable', undefined, { beforeWrite })
+      : updateMessage('app', 'om_root', '{}', { beforeWrite });
+    await run();
+    expect(mocks.request).toHaveBeenCalledOnce();
+    expect(beforeWrite).toHaveBeenCalledOnce();
+    rootDeleted = true;
+    await expect(run()).rejects.toMatchObject({ code: 'TOPIC_SEND_BLOCKED' });
+    expect(mocks.request).toHaveBeenCalledTimes(2);
+    expect(operation === 'reply' ? mocks.reply : mocks.patch).toHaveBeenCalledOnce();
+  });
+  it.each(['send', 'reply', 'patch'] as const)('%s refreshes its shared source lookup after rate limiting', async operation => {
+    const beforeWrite = async (lookup?: TopicMessageLookup) => {
+      await assertSendTopicsAvailable('app', ['om_root'], lookup!, 'stop');
+    };
+    const provider = operation === 'send' ? mocks.create : operation === 'reply' ? mocks.reply : mocks.patch;
+    provider.mockImplementationOnce(async () => {
+      rootDeleted = true;
+      throw { isAxiosError: true, response: { status: 429 } };
+    });
+    const run = operation === 'send'
+      ? sendMessage('app', 'oc_other', 'answer', 'text', 'stable', undefined, { beforeWrite })
+      : operation === 'reply'
+        ? replyMessage('app', 'om_root', 'answer', 'text', true, 'stable', undefined, { beforeWrite })
+        : updateMessage('app', 'om_root', '{}', { beforeWrite });
+    await expect(run).rejects.toMatchObject({ code: 'TOPIC_SEND_BLOCKED' });
+    expect(mocks.request).toHaveBeenCalledTimes(2);
+    expect(provider).toHaveBeenCalledOnce();
+    expect(mocks.hook).not.toHaveBeenCalled();
+  });
+
   it.each(['send', 'reply'] as const)('%s rechecks the source after a rate-limit retry without firing the hook', async operation => {
     const beforeWrite = vi.fn(() => assertSendTopicsAvailable('app', ['om_root'],
       async () => ({ items: [{ message_id: 'om_root', deleted: rootDeleted }] }), 'stop'));

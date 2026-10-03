@@ -2,11 +2,31 @@ export interface TopicMessageDetail {
   items?: { message_id?: string; deleted?: boolean; root_id?: string }[];
 }
 
+export type TopicMessageLookup = (appId: string, messageId: string) => Promise<TopicMessageDetail>;
+
 export class TopicSendError extends Error {
   constructor(readonly code: 'TOPIC_SEND_BLOCKED' | 'TOPIC_SEND_CHECK_FAILED', message: string, options?: ErrorOptions) {
     super(`${code}: ${message}`, options);
     this.name = 'TopicSendError';
   }
+}
+
+/** One delivery owns this cache; failed/unknown/deleted lookups are never cached. */
+export function createTopicMessageLookupCache(getMessage: TopicMessageLookup, ttlMs = 1000) {
+  const cache = new Map<string, { at: number; detail: Awaited<ReturnType<TopicMessageLookup>> }>();
+  return {
+    clear: () => cache.clear(),
+    lookup: async (appId: string, root: string) => {
+      const key = JSON.stringify([appId, root]);
+      const prior = cache.get(key);
+      if (prior && Date.now() - prior.at < ttlMs) return prior.detail;
+      const detail = await getMessage(appId, root);
+      if (detail?.items?.find(item => item.message_id === root)?.deleted === false) {
+        cache.set(key, { at: Date.now(), detail });
+      } else cache.delete(key);
+      return detail;
+    },
+  };
 }
 
 /** Opt-in protection: legacy skips lookup; stop never changes the destination. */
@@ -29,6 +49,10 @@ async function readAvailableMessage(
   let detail: TopicMessageDetail;
   try { detail = await getMessage(appId, messageId); }
   catch (cause) {
+    const error = cause as { name?: string; code?: unknown; response?: { data?: { code?: unknown } } };
+    if (error?.name === 'MessageWithdrawnError' || (error?.response?.data?.code ?? error?.code) === 230011) {
+      throw new TopicSendError('TOPIC_SEND_BLOCKED', `原话题 ${messageId} 已撤回，停止发送。不要重试或改发其他位置。`, { cause });
+    }
     throw new TopicSendError('TOPIC_SEND_CHECK_FAILED', `查询原话题 ${messageId} 失败，暂停发送；不要改发顶层、跨群或新建话题。`, { cause });
   }
   const matches = detail?.items?.filter(item => item.message_id === messageId) ?? [];

@@ -116,8 +116,10 @@ export type BotDefaultsRow = {
     gitHost?: string;
     gitTokenExchangeUrl?: string;
   } | null;
-  /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer).
-   *  null/absent = none configured (pure deny-by-default baseline). */
+  /** Opt-in policy, configured for future sessions; absence retains legacy behavior. */
+  sandboxNetworkPolicy?: import('../../core/sandbox-network-policy.js').SandboxNetworkPolicy | null;
+  sandboxNetworkPolicyPlatform?: string | null;
+  /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer). */
   sandboxPaths?: { readWrite: string[]; readOnly: string[]; deny: string[] } | null;
   /** Whether the unified file sandbox ALSO applies cross-bot read isolation for
    *  this bot's sessions — true when the CLI (claude/codex) + platform (macOS/Linux)
@@ -192,6 +194,8 @@ export type BotDefaultsRow = {
   canTalkDaemonCommands?: string;
   launchShell?: string;
   env?: string;
+  envKeys?: string[];
+  envPolicy?: { mode: 'inherit' | 'strict'; inherit?: string[] };
   riff?: Record<string, unknown> | null;
   /** 被动入群时自动把 owner 拉进群。缺省 ON —— 只有显式 false 表示关闭。 */
   autoInviteOwnerOnGroupAdd?: boolean;

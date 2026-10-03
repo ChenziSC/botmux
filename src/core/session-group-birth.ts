@@ -43,7 +43,7 @@ import { scheduleSessionGroupTitle } from '../services/session-group-title.js';
 import { tagSessionGroup } from '../services/feed-group-tagger.js';
 import { applySessionGroupAvatar } from '../services/session-group-avatar.js';
 import { sendMessage, replyMessage, forwardMessage, getMessageDetail } from '../im/lark/client.js';
-import { assertMessageTopicAvailable, TopicSendError } from '../im/lark/topic-send-guard.js';
+import { assertMessageTopicAvailable, TopicSendError } from '../cli/topic-send-guard.js';
 import { evaluateTalk, extractMessageTextForRouting, type RoutingContext } from '../im/lark/event-dispatcher.js';
 import { stripLeadingMentions } from '../im/lark/message-parser.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';

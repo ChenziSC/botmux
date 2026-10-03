@@ -34,7 +34,7 @@ import { resolveCliRuntime, runtimeInstallationKey, snapshotCliRuntime } from '.
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, getMessageDetail, uploadFile, uploadImage, UserTokenMissingError } from '../im/lark/client.js';
 import type { OutboundMessageOptions } from '../im/lark/client.js';
-import { assertSendTopicsAvailable, TopicSendError } from '../im/lark/topic-send-guard.js';
+import { assertSendTopicsAvailable, TopicSendError } from '../cli/topic-send-guard.js';
 import { prepareForkTopic } from '../im/lark/fork-topic.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
@@ -212,7 +212,7 @@ function cliSelectionSnapshot(cliId: CliId): SessionCliLaunchSnapshotV1 {
   };
 }
 
-function cliSelectionSecurityError(botCfg: { env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean }, cliId: string, promptInjection: PromptInjection): string | undefined {
+function cliSelectionSecurityError(botCfg: { env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean; sandbox?: boolean | 'off' | 'oncall' | 'scratch' }, cliId: string, promptInjection: PromptInjection): string | undefined {
   if (promptInjection === 'none' && !supportsZeroPromptInjection(cliId, botCfg)) return 'zero prompt injection requires a CLI with automatic final reply capture';
   if (cliId === 'riff') return 'Riff requires bot-level backend configuration and cannot be selected per session';
   if (botCfg.env && Object.keys(botCfg.env).length > 0) return 'CLI-selected sessions cannot use bot env';

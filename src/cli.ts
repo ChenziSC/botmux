@@ -14005,7 +14005,7 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
   return postAskRequest(body, '/api/asks');
 }
 
-async function postAskRequest<T>(body: Record<string, unknown>, path: '/api/asks' | '/api/asks/lookup'): Promise<T> {
+async function postAskRequest<T>(body: Record<string, unknown>, path: '/api/asks' | '/api/asks/lookup' | '/api/asks/conversation'): Promise<T> {
   type AskError = Error & { exitCode: number; retryable: boolean };
   const mkErr = (message: string, retryable: boolean): AskError =>
     Object.assign(new Error(message), { exitCode: 3, retryable });
@@ -14091,7 +14091,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   // Only `buttons` shipped in v0.1.7. The bare alias (`botmux ask --options`)
   // routes here with sub='' — accept it and behave identically. `ask text` /
   // `ask confirm` are reserved for later versions.
-  if (sub && sub !== 'buttons' && sub !== 'lookup') {
+  if (sub && sub !== 'buttons' && sub !== 'lookup' && sub !== 'conversation') {
     console.error(
       `botmux ask: 未知 subcommand "${sub}"（支持 buttons、lookup 或省略）`,
     );
@@ -14112,6 +14112,25 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     process.exit(2);
   }
 
+  if (sub === 'conversation') {
+    const operation = rest[0] ?? 'create';
+    if (!['create', 'read', 'commit', 'revise', 'applied'].includes(operation)) throw new Error('Unknown Ask conversation operation');
+    const inputFile = argValue(rest, '--input-file');
+    if (!inputFile) throw new Error('botmux ask conversation requires --input-file JSON');
+    const rawText = readFileSync(inputFile, 'utf8');
+    if (Buffer.byteLength(rawText) > 256 * 1024) throw new Error('Ask conversation input exceeds 256 KiB');
+    const raw = JSON.parse(rawText);
+    const { managedAskRootFromEnv } = await import('./core/managed-ask-args.js');
+    const sessionId = process.env.BOTMUX_SESSION_ID!;
+    const origin = resolveSessionContext(resolveDataDir(), sessionId);
+    const result = await postAskRequest({ ...raw, operation,
+      ...(raw.askRef ?? {}), sessionId, larkAppId: process.env.BOTMUX_LARK_APP_ID,
+      chatId: process.env.BOTMUX_CHAT_ID, rootMessageId: managedAskRootFromEnv(process.env), originKind: 'explicit',
+      originTurnId: origin?.turnId, originDispatchAttempt: origin?.dispatchAttempt,
+    }, '/api/asks/conversation');
+    process.stdout.write(JSON.stringify(result) + '\n');
+    return;
+  }
   if (sub === 'lookup') {
     const { parseAskLookup } = await import('./core/managed-ask-api.js');
     const { managedAskRootFromEnv } = await import('./core/managed-ask-args.js');

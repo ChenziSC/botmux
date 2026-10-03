@@ -406,8 +406,8 @@ export function buildProjectGroupCard(
     : new Intl.DateTimeFormat('zh-CN', {
         timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
       }).format(updated).replace('/', '-');
-  const awaitingUser = project.status !== 'completed' && (!!project.userAction
-    || ['awaiting_confirmation', 'awaiting_user_input', 'waiting_user'].includes(project.phase));
+  const awaitingUser = project.status !== 'completed' && (project.userAction?.state === 'pending'
+    || !project.userAction && ['awaiting_confirmation', 'awaiting_user_input', 'waiting_user'].includes(project.phase));
   const statusMeta = project.status === 'completed'
     ? { label: '已完成', color: 'green', header: 'green' }
     : awaitingUser
@@ -416,7 +416,7 @@ export function buildProjectGroupCard(
       ? { label: '已暂停', color: 'neutral', header: 'grey' }
       : { label: '进行中', color: 'blue', header: 'blue' };
   const body = TEMPLATE_BODY_BUILDERS[config.templateId]({ project, brand, config });
-  if (awaitingUser) {
+  if (awaitingUser || project.userAction) {
     const action = project.userAction;
     body.unshift({ tag: 'markdown', text_size: 'normal', content: [
       `**${statusMeta.label}**`,

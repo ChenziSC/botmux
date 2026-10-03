@@ -4404,7 +4404,7 @@ const server = createServer(async (req, res) => {
       } catch { return jsonRes(res, 503, { ok: false, error: 'daemon_unavailable' }); }
     }
 
-    const managedAskLookup = url.pathname.match(/^\/api\/sessions\/([^/]+)\/asks\/(lookup|continue)$/);
+    const managedAskLookup = url.pathname.match(/^\/api\/sessions\/([^/]+)\/asks\/(lookup|continue|conversation)$/);
     if (req.method === 'POST' && managedAskLookup) {
       if (!legacyAuthed) return jsonRes(res, 403, { ok: false, error: 'core_owner_required' });
       let raw: unknown;
@@ -4412,7 +4412,7 @@ const server = createServer(async (req, res) => {
       catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
       const result = await lookupAskForOwner({ ownerAuthenticated: legacyAuthed,
         sessionId: decodeURIComponent(managedAskLookup[1]), raw, proxyToDaemon,
-        operation: managedAskLookup[2] as 'lookup' | 'continue' });
+        operation: managedAskLookup[2] as 'lookup' | 'continue' | 'conversation' });
       return jsonRes(res, result.status, result.body);
     }
 

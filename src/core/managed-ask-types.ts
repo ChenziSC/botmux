@@ -105,7 +105,7 @@ export function validAskResult(value: unknown): value is AskResult {
 }
 
 export class ManagedAskError extends Error {
-  constructor(readonly code: string, readonly status: 400 | 403 | 409 | 503 = 503) {
+  constructor(readonly code: string, readonly status: 400 | 403 | 404 | 409 | 413 | 503 = 503) {
     super(code);
     this.name = 'ManagedAskError';
   }

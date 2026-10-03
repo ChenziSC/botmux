@@ -233,3 +233,27 @@ describe('botmux ask — CLI boundary', () => {
     }
   });
 });
+
+it('conversation commands reach the real IPC path and return registration without a legacy waiter', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'botmux-conversation-cli-')); tempDirs.push(dataDir);
+  const input = join(dataDir, 'input.json');
+  writeFileSync(input, JSON.stringify({ requestId: 'question', policyKey: 'test-policy', subjectRef: 'opaque', subjectRevision: '1',
+    title: 'Question', questions: [{ id: 'q', prompt: 'Explain?', options: [], multiSelect: false }], sessionId: 'forged-session' }));
+  const received: any[] = [];
+  const server = createServer(async (req, res) => {
+    let body = ''; for await (const chunk of req) body += chunk;
+    received.push({ url: req.url, body: JSON.parse(body) });
+    res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: true, result: { registered: true } }));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const registry = join(dataDir, 'dashboard-daemons'); mkdirSync(registry);
+    writeFileSync(join(registry, 'cli_test.json'), JSON.stringify({ larkAppId: 'cli_test', ipcPort: (server.address() as AddressInfo).port, lastHeartbeat: Date.now() }));
+    for (const op of ['create', 'read', 'commit', 'revise', 'applied']) {
+      const result = await runAsk(dataDir, ['ask', 'conversation', op, '--input-file', input]);
+      expect(result.status, result.stderr).toBe(0); expect(JSON.parse(result.stdout).result.registered).toBe(true);
+    }
+    expect(received.every(r => r.url === '/api/asks/conversation' && r.body.sessionId === 'sess_test')).toBe(true);
+    expect(received.map(r => r.body.operation)).toEqual(['create', 'read', 'commit', 'revise', 'applied']);
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+});

@@ -2847,6 +2847,8 @@ export function markForwardFollowupsSessionsReady(larkAppId: string): void {
 }
 
 export interface EventHandlers {
+  /** Exact registered Ask anchors, after human access checks and before topic routing. */
+  handleAskConversation?: (data: any, larkAppId: string) => Promise<boolean>;
   /** Exact host-installed capture. Must synchronously persist before returning
    * true; thrown persistence errors must not fall through to ordinary routing. */
   captureHumanInput?: (data: any) => boolean;
@@ -4308,6 +4310,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // 人的路径（bot 发送方已在上面的分支 return）：union 走 memberUnionId 腿，
       // 不进 bot-trust 腿——teamBot 只认 bot-locked union。
       const isAllowed = canTalk(larkAppId, chatId, senderOpenId, undefined, humanSenderUnionId, chatType);
+      if (isAllowed && await handlers.handleAskConversation?.(data, larkAppId)) return;
       // Trusted creator metadata affects addressing only. Unauthorized senders
       // must not trigger Lark/registry I/O; operation gates stay unchanged.
       if (isAllowed) {

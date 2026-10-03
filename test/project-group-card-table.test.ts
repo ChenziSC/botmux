@@ -64,12 +64,11 @@ describe('buildProjectGroupCard workstream table', () => {
   it.each(['status-dashboard', 'compact-list'] as const)('keeps user action and document visible in %s', templateId => {
     const card = buildProjectGroupCard(makeProject({ status: 'active', phase: 'awaiting_confirmation',
       userAction: { requestId: 'revision-5', summary: '方案已完成', question: '请确认 revision 5',
-        documentUrl: 'https://example.com/doc', state: 'delivery_failed' },
+        documentUrl: 'https://example.com/doc', state: 'pending' },
     }), 'feishu', { templateId, sections: [] } as any) as any;
     expect(card.header.text_tag_list[0].text.content).toBe('需要你');
     expect(card.header.template).toBe('orange');
     expect(card.body.elements[0].content).toContain('[技术方案](https://example.com/doc)');
-    expect(card.body.elements[0].content).toContain('受阻');
     expect(card.config.summary.content).toContain('需要你');
   });
   it('recognizes legacy confirmation waits but never treats internal blockers as user input', () => {
@@ -86,4 +85,14 @@ it('validates action documents and explicit clears at the API boundary', () => {
   }
   expect(parseProjectCoordinatorAction({ action: 'update', userAction: null, expectedUserActionId: 'req' }))
     .toMatchObject({ userAction: null, expectedUserActionId: 'req' });
+});
+
+it.each(['delivery_failed', 'preparing', 'processing'] as const)('does not ask the user to act while %s', state => {
+  const card = buildProjectGroupCard(makeProject({ status: 'active', phase: 'awaiting_confirmation',
+    userAction: { requestId: 'request', summary: '方案已完成', question: '请确认',
+      documentUrl: 'https://example.com/doc', state },
+  })) as any;
+  expect(card.header.text_tag_list[0].text.content).toBe('进行中');
+  expect(card.body.elements[0].content).toContain('[技术方案](https://example.com/doc)');
+  expect(card.config.summary.content).not.toContain('需要你');
 });

@@ -1,3 +1,4 @@
+import { recordConversationInputCommitted, recordConversationExecutionChanged } from './ask-conversation.js';
 import { withHandoffPreview, handoffNeedsAttachment } from './handoff-preview.js';
 import { automaticStatusCardHidden, commitTurnStatusPolicy, rejectTurnStatusPolicy, currentTurnStatusPolicy, statusCardTitle, captureStatusCardFence } from './turn-status-policy.js';
 import { recordManagedAskTerminal, advanceManagedAskPresentation } from './ask-broker.js';
@@ -13267,6 +13268,7 @@ function setupWorkerHandlers(
         ds.failedIdleTurnId = undefined;
         ds.settledHttpTerminalTurns?.delete(msg.turnId);
         commitTurnStatusPolicy(ds, msg.turnId, workerGeneration);
+        recordConversationInputCommitted(ds.larkAppId, ds.session.sessionId, msg.turnId, `${workerGeneration}:${msg.turnId}`);
         advanceManagedAskPresentation({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId,
           turnId: msg.turnId, workerGeneration, phase: 'running' });
         sessionStore.updateSession(ds.session);
@@ -14095,6 +14097,7 @@ function setupWorkerHandlers(
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit);
+        if (ds.lastScreenStatus === 'idle') recordConversationExecutionChanged(ds.larkAppId);
         stampIdleSinceAt(ds, prevStatus);
         bumpStreamCardStatusRevision(ds);
         if (['working', 'limited', 'stalled'].includes(msg.status)) advanceManagedAskPresentation({ larkAppId: ds.larkAppId,
@@ -14519,6 +14522,7 @@ function setupWorkerHandlers(
         const prevStatus = ds.lastScreenStatus;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit);
+        if (ds.lastScreenStatus === 'idle') recordConversationExecutionChanged(ds.larkAppId);
         stampIdleSinceAt(ds, prevStatus);
         bumpStreamCardStatusRevision(ds);
         // Same deferred-suspend checkpoint as the screen_update branch, and
@@ -17150,6 +17154,7 @@ function deliverFinalOutput(
     // (with content + usage) after a daemon restart drops the in-memory Map.
     // Stamp the owning bot for cross-bot isolation.
     asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, msg.content, completedAt, ds.larkAppId, msg.usage);
+    recordConversationExecutionChanged(ds.larkAppId);
     // This idempotent async turn produced its terminal output — drop its
     // worker-exit convergence entry so a later graceful exit of this generation
     // is not retro-failed (codex #776 round-6 finding #1). Per-triggerId delete so

@@ -10500,7 +10500,7 @@ async function cmdSend(rest: string[]): Promise<void> {
                 },
                 sendTitleSeed: async (title, uuid) => {
                   await revalidateIsolatedOrigin();
-                  return sendMessage(appId, targetChatId, title, 'text', uuid, undefined, outboundMessageOptions());
+                  return sendMessage(appId, targetChatId, title, 'text', uuid, undefined, outboundMessageOptions(true));
                 },
                 replyRoot: async (root, body, type, uuid) => {
                   await revalidateIsolatedOrigin();
@@ -11055,7 +11055,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         // only seed text; the alert itself still goes through the hook path.
         sendTitleSeed: async (title, rootUuid) => {
           await revalidateIsolatedOrigin();
-          return sendMessage(appId, targetChatId, title, 'text', rootUuid, undefined, outboundMessageOptions());
+          return sendMessage(appId, targetChatId, title, 'text', rootUuid, undefined, outboundMessageOptions(true));
         },
         replyRoot: async (root, body, type, replyUuid) => {
           await revalidateIsolatedOrigin();

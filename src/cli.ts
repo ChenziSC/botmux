@@ -2869,7 +2869,7 @@ async function cmdStop(): Promise<void> {
     await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
       cleanupLegacyPm2('stop'); // reap any pre-migration pm2 God still holding botmux procs
       const { stopFleet } = await import('./core/fleet-runtime.js');
-      const result = stopFleet();
+      const result = stopFleet(FLEET_DAEMON_EXIT_WAIT_MS);
       if (result.action === 'not-running') {
         cleanupStaleDaemonDescriptors();
         if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
@@ -2950,7 +2950,11 @@ async function cmdRestart(): Promise<void> {
       const { restartFleet, fleetMemberNames, waitFleetOnline } = await import('./core/fleet-runtime.js');
       let health: ReturnType<typeof waitFleetOnline>;
       try {
-        const r = restartFleet({ refreshPersistedEnv, readFailureFallback });
+        const r = restartFleet({
+          timeoutMs: FLEET_DAEMON_EXIT_WAIT_MS,
+          refreshPersistedEnv,
+          readFailureFallback,
+        });
         if (r.stop.action === 'timeout') {
           throw new Error(
             `[restart] 旧 supervisor (pid ${r.stop.supervisorPid}) 未在超时时间内退出；已 SIGKILL 后仍存活，中止重启。`,
@@ -4634,8 +4638,8 @@ function sessionBackingInfo(s: SessionData, snapshot?: BackingProbeSnapshot): {
   if (s.backendType === 'pty') {
     return { backendType: 'pty', probe: 'missing', label: 'pty' };
   }
-  if (s.backendType === 'riff' || s.backendType === 'mojo') {
-    // A remote backend (riff / mojo) runs its agent off-box, not in a local
+  if (s.backendType === 'riff' || s.backendType === 'mojo' || s.backendType === 'remote-runner') {
+    // A remote backend runs its agent off-box, not in a local
     // multiplexer pane: there is nothing to probe, attach to, or name as a
     // PersistentBackendTarget (sessionPersistentTarget returns undefined for it, by
     // design). Surface a stable label and report the nonexistent local backing as
@@ -6562,9 +6566,11 @@ async function cmdResume(): Promise<void> {
   let body: any = {};
   try { body = await res.json(); } catch { /* */ }
   if (res.ok && body?.ok) {
-    console.log(`✅ 会话已恢复: ${session.sessionId.substring(0, 12)}  ${session.title}`);
+    console.log(`${body.recoveryPending ? '🔄 远程恢复已启动' : '✅ 会话已恢复'}: ${session.sessionId.substring(0, 12)}  ${session.title}`);
     if (body.workingDir) console.log(`   工作目录: ${body.workingDir}`);
-    console.log('   下一条消息会以 --resume 拉起 CLI；已在原话题留通知。');
+    console.log(body.recoveryPending
+      ? '   正在创建新的远端运行环境并恢复原会话；新任务会在就绪后执行。已在原话题留通知。'
+      : '   下一条消息会以 --resume 拉起 CLI；已在原话题留通知。');
     return;
   }
   const errCode = body?.error ?? `HTTP ${res.status}`;
@@ -6581,6 +6587,10 @@ async function cmdResume(): Promise<void> {
     console.error('❌ 该静默定时轮次未创建话题，隐藏会话只保留审计记录，不能 resume。');
   } else if (errCode === 'resume_cancelled') {
     console.error('❌ 恢复过程中会话被关闭，本次 resume 已取消。');
+  } else if (errCode === 'resume_start_failed') {
+    console.error('❌ 远程后端恢复进程未能启动，会话已恢复为 closed；请稍后重试。');
+  } else if (errCode === 'resume_reconciliation_required') {
+    console.error('❌ 远程恢复启动失败，且无法证明已回到 closed；会话保持保护状态，请先重试关闭或检查远端状态。');
   } else {
     console.error(`❌ 恢复失败: ${errCode}`);
   }
@@ -6806,8 +6816,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   delete <id>      关闭指定会话（支持 ID 前缀匹配）
   delete all       关闭所有活跃会话
   delete stopped   清理所有进程已退出的僵尸会话
-  resume <id>      恢复一个已关闭的会话（支持 ID 前缀匹配）— 会话标记回 active，
-                   下条消息会以 --resume 重新拉起 CLI 进程
+  resume <id>      恢复一个已关闭的会话（支持 ID 前缀匹配）— 远程后端立即启动恢复，
+                   本地后端在下条消息时以 --resume 重新拉起 CLI 进程
   suspend <id|all>     挂起活跃会话：杀 CLI/pane 但会话保持 active，下条消息冷启动续上下文
        --bot <appId>   挂起该 bot 的全部活跃会话
        --isolated      挂起所有读隔离 bot（凭证轮换后用；下次冷启动自动同步最新凭证）
@@ -9178,6 +9188,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     return;
   }
   const ancestorCtx = findAncestorSessionContext();
+  const remoteRunnerOutbound = rest.includes('--remote-runner-outbound');
   // Workflow subagents cannot own chat-facing effects: those belong to a
   // hostExecutor so retries/resumes can reconcile them. Keep this gate ahead
   // of both the sandbox relay and VC-origin store reads; neither path may turn
@@ -9867,6 +9878,33 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.exit(2);
   }
 
+  // Host-only re-exec for provider-requested interim output.  The public
+  // Remote Runner event deliberately carries no destination override; freeze
+  // that contract again at the final CLI boundary so a forged flag cannot turn
+  // this path into cross-chat delivery or a richer platform side effect.
+  if (remoteRunnerOutbound) {
+    const mentionDecisionCount = Number(mentionBack) + Number(noMention);
+    if (!trustedRelayCtx
+      || trustedRelayCtx.sessionId !== sid
+      || !currentTurnId
+      || trustedRelayCtx.turnId !== currentTurnId) {
+      console.error('botmux send refused: --remote-runner-outbound requires the owning worker\'s live turn authority');
+      process.exit(2);
+    }
+    if (responseKind === undefined || !['progress', 'auxiliary'].includes(responseKind)) {
+      console.error('botmux send refused: --remote-runner-outbound requires --response-kind progress|auxiliary');
+      process.exit(2);
+    }
+    if (sendTopLevel || overrideChatId || sendInto || explicitQuote !== undefined || noQuote
+      || customCardRequested || asVoice || isSlashSend || asChoice || replyLayout
+      || images.length > 0 || files.length > 0 || videos.length > 0 || videoCovers.length > 0
+      || mentionArgs.length > 0 || mentionDecisionCount !== 1
+      || attention.requested || urgent.requested || expectedLinks.length > 0) {
+      console.error('botmux send refused: --remote-runner-outbound supports only current-session Markdown with one none/requester mention decision');
+      process.exit(2);
+    }
+  }
+
   // A proof is a point-in-time liveness check, not a five-second send lease.
   // Re-challenge immediately before observable provider effects so lengthy
   // local parsing/card preparation cannot carry an old capability across a
@@ -10041,7 +10079,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   let content = '';
   let customCard: Record<string, unknown> | undefined;
   if (customCardRequested) {
-    const unexpectedText = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent']);
+    const unexpectedText = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--remote-runner-outbound']);
     if (unexpectedText.length > 0) {
       console.error('botmux send: --card-file/--card-json 发送自定义卡片时不接受正文参数；卡片内容请写入 JSON');
       process.exit(2);
@@ -10119,7 +10157,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
   } else {
-    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash']);
+    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash', '--remote-runner-outbound']);
     if (pos.length > 0) {
       content = pos.join(' ');
     } else {
@@ -11119,6 +11157,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         ...(originTurnId ? { turnId: originTurnId } : {}),
         ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
         ...(unifiedReplyUsed ? { replyCardResponseKind: effectiveResponseKind } : {}),
+        ...(remoteRunnerOutbound ? { terminalIndependent: true } : {}),
       };
       Object.assign(marker, buildBridgeSendMarkerContent(sentContent));
       const line = JSON.stringify(marker) + '\n';

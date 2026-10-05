@@ -12,6 +12,10 @@ import {
 import type { BackendType } from './adapters/backend/types.js';
 import { normalizeMojoConfig, type MojoConfig } from './adapters/backend/mojo-types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
+import {
+  normalizeRemoteRunnerConfig,
+  type RemoteRunnerConfig,
+} from './adapters/backend/remote-runner-config.js';
 import type { CliId } from './adapters/cli/types.js';
 import {
   normalizeCliRuntimeConfig,
@@ -1736,6 +1740,9 @@ export interface BotConfig {
    * model, inject a JWT, or force `--cloud` execution.
    */
   mojo?: MojoConfig;
+  /** Protocol expectations for the external provider selected by
+   * `cliPathOverride`. No provider credentials belong in this block. */
+  remoteRunner?: RemoteRunnerConfig;
   /**
    * Max simultaneously-LIVE sessions for this bot. When the bot's live session
    * count exceeds this, the idle-worker sweeper suspends its longest-idle,
@@ -3870,6 +3877,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Missing keeps the historical every-cold-spawn global auth refresh.
       codexAuthSync: entry.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
       credentialsSourceDir,
+      remoteRunner: entry.remoteRunner === undefined
+        ? undefined
+        : normalizeRemoteRunnerConfig(entry.remoteRunner),
       codexInstancePool,
       ...(triggerUserAuth ? { triggerUserAuth } : {}),
       // Wire representation stays backwards compatible: oncall = legacy `true`;

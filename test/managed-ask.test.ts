@@ -290,8 +290,8 @@ describe('read-only queries and schema compatibility', () => {
   });
 
   it('requires scope for Project/Issue contexts and strips caller-supplied authority fields', () => {
-    expect(parseAskBody({ ...input, managedDelivery: { ...input.managedDelivery, scopeRevision: undefined } })).toEqual({ error: 'bad_managedDelivery' });
-    const parsed = parseAskBody({ ...input, managedDelivery: { ...input.managedDelivery, trusted: true, originalTurn: 'forged' } });
+    expect(parseAskBody({ ...input, originalTurn: undefined, managedDelivery: { ...input.managedDelivery, scopeRevision: undefined } })).toEqual({ error: 'bad_managedDelivery' });
+    const parsed = parseAskBody({ ...input, originalTurn: undefined, managedDelivery: { ...input.managedDelivery, trusted: true, originalTurn: 'forged' } });
     expect(parsed).toMatchObject({ managedDelivery: input.managedDelivery });
     expect('error' in parsed ? null : parsed.managedDelivery).not.toHaveProperty('trusted');
   });

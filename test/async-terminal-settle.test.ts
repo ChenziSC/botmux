@@ -271,21 +271,37 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
     expect(resolve).not.toHaveBeenCalled(); expect(ds.failedIdleTurnId).toBeUndefined();
   });
 
-  it('does not leak late output into chat after rejecting an HTTP waiter', async () => {
+  it.each([0, 1, 2])('does not leak late output after rejecting an HTTP waiter (%s delayed input ACKs)', async ackCount => {
     const ds = makeDs();
+    ds.workerGeneration = ds.session.workerGeneration = 1;
     const reject = vi.fn();
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
     ds.pendingWaitPromises = new Map([['wait-failure', { resolve: vi.fn(), reject }]]);
-    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any, undefined, 1);
     const emit = (msg: any) => (ds.worker as any).emit('message', {
       type: 'final_output', sessionId: ds.session.sessionId, turnId: 'wait-failure', ...msg,
     });
     emit({ lastUuid: 'failure', content: 'diagnostic', turnFailed: true });
     await vi.waitFor(() => expect(reject).toHaveBeenCalledOnce());
+    // Codex can acknowledge after the adapter returns, while transcript output
+    // has already settled this turn. An input receipt cannot reopen that result.
+    for (let i = 0; i < ackCount; i++) {
+      (ds.worker as any).emit('message', { type: 'turn_input_committed', turnId: 'wait-failure' });
+    }
     emit({ lastUuid: 'late-final', content: 'late model output' });
     emit({ lastUuid: 'late-diagnostic', content: 'diagnostic', turnFailed: true });
     await new Promise(resolve => setTimeout(resolve, 20));
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.failedIdleTurnId).toBe('wait-failure');
+
+    const resolveNext = vi.fn();
+    ds.pendingWaitPromises.set('next-turn', { resolve: resolveNext });
+    (ds.worker as any).emit('message', { type: 'turn_input_committed', turnId: 'next-turn' });
+    (ds.worker as any).emit('message', { type: 'final_output', sessionId: ds.session.sessionId,
+      turnId: 'next-turn', lastUuid: 'next-output', content: 'next answer' });
+    await vi.waitFor(() => expect(resolveNext).toHaveBeenCalledExactlyOnceWith('next answer'));
+    expect(ds.failedIdleTurnId).toBeUndefined();
     expect(sessionReply).not.toHaveBeenCalled();
   });
 

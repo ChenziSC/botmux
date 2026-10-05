@@ -13264,8 +13264,11 @@ function setupWorkerHandlers(
             logger.warn('Could not persist keyed turn input-commit observation');
           }
         }
+        // An input ACK proves acceptance, not a new execution. Codex can emit
+        // it after transcript failure while awaiting submit confirmation. Keep
+        // that HTTP terminal and its failed UI closed to late/repeated ACKs.
+        if (ds.settledHttpTerminalTurns?.has(msg.turnId)) break;
         ds.failedIdleTurnId = undefined;
-        ds.settledHttpTerminalTurns?.delete(msg.turnId);
         commitTurnStatusPolicy(ds, msg.turnId, workerGeneration);
         advanceManagedAskPresentation({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId,
           turnId: msg.turnId, workerGeneration, phase: 'running' });

@@ -2709,7 +2709,7 @@ export async function restoreActiveSessions(
       // as an ordinary session, NOT an adopt row. Doing the conversion here (not
       // via a worker-pool side-effect after announceSessionRow) keeps daemon
       // orchestration state consistent.
-      let adoptBotCfg: { sandbox?: boolean; readIsolation?: boolean; apiOnly?: boolean } = {};
+      let adoptBotCfg: { sandbox?: boolean | 'off' | 'oncall' | 'scratch'; readIsolation?: boolean; apiOnly?: boolean } = {};
       try { adoptBotCfg = getBot(session.larkAppId ?? '').config; } catch { /* unknown bot → only the frozen decision matters */ }
       if (adoptSandboxBlocked(adoptBotCfg, session)) {
         logger.warn(`[${session.sessionId.substring(0, 8)}] isolated/no-transport session persisted as adopt — converting to cold-start (a sandbox / apiOnly bot can't wrap a live external CLI)`);
@@ -3507,8 +3507,8 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
 export async function resumeSession(
   sessionId: string,
   activeSessions: Map<string, DaemonSession>,
-): Promise<{ ok: true; ds: DaemonSession }
-| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled'; activeSessionId?: string }> {
+): Promise<{ ok: true; ds: DaemonSession; recoveryPending?: true }
+| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled' | 'resume_start_failed' | 'resume_reconciliation_required'; activeSessionId?: string }> {
   let session = sessionStore.getSession(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
@@ -3534,6 +3534,8 @@ export async function resumeSession(
   if (session.title?.startsWith('Adopt:') || isSharedAdoptPersistedSession(session)) {
     return { ok: false, error: 'adopt_unsupported' };
   }
+  let remoteRunnerResume = session.backendType === 'remote-runner'
+    || session.cliId === 'remote-runner';
 
   const scope: 'thread' | 'chat' = session.scope === 'chat' ? 'chat' : 'thread';
   const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
@@ -3554,6 +3556,8 @@ export async function resumeSession(
     return { ok: false as const, error: 'adopt_unsupported' as const };
   }
   session = latest;
+  remoteRunnerResume = session.backendType === 'remote-runner'
+    || session.cliId === 'remote-runner';
 
   // In-memory occupant check. A daemon-command scratch (e.g. an unconfirmed
   // `/relay` picker, a bare `/help`) parks a worker:null placeholder at this
@@ -3726,8 +3730,76 @@ export async function resumeSession(
     }
     return { ok: false, error: 'resume_cancelled' };
   }
+  if (remoteRunnerResume) {
+    // Local sessions may stay worker-less until the next message. A remote
+    // Resume button has stronger semantics: start the provider immediately so
+    // it can materialize a replacement remote generation (for example a new
+    // sandbox) from the persisted opaque state. Merely flipping the durable row
+    // to active recreates the ghost-active failure this path is meant to avoid.
+    let admission: 'accepted' | 'deferred' | 'rejected' | undefined;
+    const preResumeRemoteState = JSON.stringify(session.remoteBackendState ?? null);
+    const rollbackUnstartedRemoteResume = (): boolean => {
+      const current = sessionStore.getOwnedSession(sessionId);
+      if (!current || current.status !== 'active') return current?.status === 'closed';
+      if (JSON.stringify(current.remoteBackendState ?? null) !== preResumeRemoteState) {
+        logger.error(
+          `Remote resume ${sessionId.substring(0, 8)} changed lineage before startup failed; `
+          + 'leaving the row active for explicit reconciliation',
+        );
+        return false;
+      }
+      try {
+        sessionStore.closeSession(sessionId);
+      } catch (error) {
+        logger.error(
+          `Remote resume ${sessionId.substring(0, 8)} could not restore the durable closed row: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+        return false;
+      }
+      const closed = sessionStore.getOwnedSession(sessionId);
+      if (!closed || closed.status !== 'closed') return false;
+      Object.assign(ds.session, closed);
+      for (const [registeredKey, candidate] of activeSessions) {
+        if (candidate === ds) activeSessions.delete(registeredKey);
+      }
+      dashboardEventBus.publish({
+        type: 'session.update',
+        body: { sessionId, patch: { status: 'closed', workerPid: null, webPort: null } },
+      });
+      return true;
+    };
+    let started = false;
+    try {
+      started = forkWorker(ds, '', { resume: true, remoteResumeMode: 'rebuild' }, {
+        deferDuringDeviceIsolation: false,
+        onAdmission: value => { admission = value; },
+        onPreReadyExit: () => { rollbackUnstartedRemoteResume(); },
+        onRemoteBackendStartupExit: rollbackUnstartedRemoteResume,
+      });
+    } catch (error) {
+      logger.warn(
+        `Remote resume ${sessionId.substring(0, 8)} failed to start: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (!started || admission !== 'accepted' || !ds.worker || ds.worker.killed) {
+      // No provider process was synchronously admitted, so no remote recovery
+      // can be in flight. Restore the row directly instead of calling the
+      // generic close path: that path may wake a worker-less remote session to
+      // cancel it, which would create a second rebuild attempt during rollback.
+      if (!rollbackUnstartedRemoteResume()) {
+        return { ok: false, error: 'resume_reconciliation_required' };
+      }
+      return { ok: false, error: 'resume_start_failed' };
+    }
+  }
   logger.info(`Resumed session ${sessionId.substring(0, 8)} (scope: ${scope}, anchor: ${anchor.substring(0, 12)})`);
-  return { ok: true, ds };
+  return {
+    ok: true,
+    ds,
+    ...(remoteRunnerResume ? { recoveryPending: true as const } : {}),
+  };
   });
 }
 

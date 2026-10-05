@@ -421,6 +421,22 @@ describe('validateRelayRequest', () => {
     })).toMatchObject({ ok: false, error: 'flag --response-kind must be progress, final, or auxiliary' });
   });
 
+  it('preserves every validated expected link through the sandbox relay', () => {
+    const first = 'https://example.test/problem';
+    const second = 'https://example.test/problem';
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--expected-link', first, '--expected-link', second, '--no-mention'],
+    })).toMatchObject({
+      ok: true,
+      value: { flags: ['--expected-link', first, '--expected-link', second, '--no-mention'] },
+    });
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--expected-link', 'not-a-url'],
+    })).toMatchObject({ ok: false, error: 'flag --expected-link must be an http(s) URL' });
+  });
+
   it('allows only the two cross-principal --as choices through the sandbox relay', () => {
     expect(validateRelayRequest({
       contentFile: 'c.content',

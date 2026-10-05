@@ -207,6 +207,8 @@ import {
   storedSessionAnchorId,
   larkTransportEnabled,
 } from './core/types.js';
+import { assertSendTopicsAvailable } from './cli/topic-send-guard.js';
+import { getMessageDetail as getTopicMessageDetail } from './im/lark/client.js';
 import { computeSoloSessionForBot, effectiveReplyDelivery } from './core/reply-delivery.js';
 import {
   bindPrincipalLaneAdmissionKeys,
@@ -295,6 +297,10 @@ import {
   ensurePrincipalLaneInboundTurnBinding,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
+import {
+  allFinalOutputDeliveryCount,
+  snapshotAllFinalOutputDeliveries,
+} from './core/final-output-delivery-drain.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
@@ -457,6 +463,7 @@ import { sendSessionOwnerThreadNotification } from './services/session-owner-not
 import {
   getSessionPersistentBackendType,
   isRemoteBackendSession,
+  isRemoteBackendType,
   killPersistentBackendTarget,
   killPersistentSession,
   probePersistentBackendTarget,
@@ -2915,6 +2922,7 @@ async function ensureVcMeetingReceiverSession(
     session.sandboxHidePaths = receiverSandboxed ? (bot.config.sandboxHidePaths ?? []) : [];
     session.sandboxReadonlyPaths = receiverSandboxed ? (bot.config.sandboxReadonlyPaths ?? []) : [];
     session.sandboxNetwork = receiverSandboxed ? (bot.config.sandboxNetwork !== false) : true;
+    session.sandboxNetworkPolicy = bot.config.sandboxNetworkPolicy ? structuredClone(bot.config.sandboxNetworkPolicy) : undefined;
     session.backendType = isolation.backendType;
     sessionStore.updateSession(session);
 
@@ -3454,8 +3462,8 @@ function scheduleDeferredScheduleSettlement(
   // Remote backends (riff / mojo) report their turn boundary over the network,
   // so allow the same longer grace as the screen-only path instead of the 300ms
   // local-filesystem one.
-  const remoteTerminal = ds.session.backendType === 'riff'
-    || ds.session.backendType === 'mojo';
+  const remoteTerminal = ds.session.backendType !== undefined
+    && isRemoteBackendType(ds.session.backendType);
   const delayMs = context.source === 'terminal'
     ? (remoteTerminal ? 1_500 : 300)
     : 1_500;
@@ -4056,9 +4064,12 @@ async function sessionReply(
     type: string,
     replyInThread: boolean,
     uuid?: string,
-  ): Promise<string> => persistPrincipalLaneOutbound(await (outboundOptions
-    ? replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext, outboundOptions)
-    : replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext)));
+  ): Promise<string> => {
+    await assertSendTopicsAvailable(appId, [messageId], opts?.topicMessageLookup ?? getTopicMessageDetail, getBot(appId).config.topicUnavailablePolicy);
+    return persistPrincipalLaneOutbound(await (outboundOptions
+      ? replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext, outboundOptions)
+      : replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext)));
+  };
 
   // Chat-scope: post a plain message to the chat. No reply_in_thread → keeps
   // the conversation flat in 普通群. The card layer carries chatId in its button
@@ -4086,7 +4097,7 @@ async function sessionReply(
           opts.uuid,
         );
       } catch (err) {
-        if (!(err instanceof MessageWithdrawnError)) throw err;
+        if (!(err instanceof MessageWithdrawnError) || getBot(appId).config.topicUnavailablePolicy === 'stop') throw err;
         await opts.beforeQuoteFallback?.();
         logger.warn(
           `[routing] VC IM quote target withdrawn (${opts.quoteMessageId}); `
@@ -20031,6 +20042,7 @@ function cloneIndependentLaunchPosture(source: Session, child: Session): void {
   child.sandboxHidePaths = source.sandboxHidePaths;
   child.sandboxReadonlyPaths = source.sandboxReadonlyPaths;
   child.sandboxNetwork = source.sandboxNetwork;
+  child.sandboxNetworkPolicy = source.sandboxNetworkPolicy ? structuredClone(source.sandboxNetworkPolicy) : undefined;
   child.reasoningEffort = source.reasoningEffort;
   child.modelBackendVariant = source.modelBackendVariant;
   child.model = source.model;
@@ -20904,7 +20916,7 @@ function coldStartPassthroughCommands(larkAppId: string): ReadonlySet<string> {
 function fastToggleUnsupportedBackend(ds: DaemonSession | undefined): boolean {
   if (!ds) return false;
   const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
-  if (backendType === 'riff' || backendType === 'mojo') return true;
+  if (backendType !== undefined && isRemoteBackendType(backendType)) return true;
   return ds.initConfig?.codexRpcInput === true;
 }
 
@@ -28698,6 +28710,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           finishedAt,
           durationMs: Math.max(0, Date.parse(finishedAt) - Date.parse(executionContext.startedAt)),
           additionalPrompt: precondition.additionalPrompt,
+          calendarCheck: task.lastCalendarCheck,
           ...(errorDetails?.errorCode ? { errorCode: errorDetails.errorCode } : {}),
           ...(errorDetails?.error !== undefined ? { error: errorDetails.error } : {}),
           ...(targetResults !== undefined ? { targetResults } : {}),
@@ -29195,9 +29208,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // within the shared absolute deadline:
     //   (1) every worker IPC channel disconnected — no NEW terminal message can
     //       be delivered; and
-    //   (2) every in-flight Codex App final-settlement resolved — an already
-    //       delivered final_output whose handler is awaiting network delivery
-    //       has finished its cb.onTurnTerminal (which synchronously enqueues).
+    //   (2) every in-flight final delivery resolved — both ordinary bridge
+    //       replies and Codex App settlements awaiting network delivery have
+    //       finished before their worker generation can disappear.
     // If either fence is not quiescent by the deadline we DO NOT close admission
     // (closing it would refuse a terminal a still-live producer may yet emit —
     // strictly worse than the pre-feature behaviour). We keep admission open,
@@ -29240,12 +29253,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     const disconnectQuiesced = await waitAllWithin(producerClosed, shutdownDeadlineMs);
 
     // Settlement fence: only meaningful once IPC is confirmed disconnected (no
-    // new settlement can be created). Await the snapshot, then re-read the count
-    // — 0 confirms every in-flight settlement (and its enqueue) has completed.
+    // new settlement or ordinary final delivery can be created). Await both
+    // snapshots, then re-read both counts — 0 confirms every daemon-owned
+    // external delivery and terminal enqueue has completed.
     let settlementQuiesced = false;
     if (disconnectQuiesced) {
-      await waitAllWithin(snapshotCodexAppFinalSettlements(), shutdownDeadlineMs);
-      settlementQuiesced = codexAppFinalSettlementCount() === 0;
+      await waitAllWithin([
+        ...snapshotCodexAppFinalSettlements(),
+        ...snapshotAllFinalOutputDeliveries(),
+      ], shutdownDeadlineMs);
+      settlementQuiesced = codexAppFinalSettlementCount() === 0
+        && allFinalOutputDeliveryCount() === 0;
     }
 
     if (disconnectQuiesced && settlementQuiesced) {

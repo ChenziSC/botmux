@@ -601,6 +601,21 @@ export interface CliAdapter {
    *  capability; `queued` and `final_output` are not completion receipts. */
   readonly reliableTurnTerminal?: boolean;
 
+  /** A structured terminal closes the business turn but does not by itself
+   *  prove the PTY composer is writable. On an authoritative local screen,
+   *  require fresh composer evidence (`staticBusyClearPattern`, falling back
+   *  to `readyPattern`) before publishing prompt-ready or flushing successors.
+   *  Snapshot-only/non-authoritative backends retain the structured-terminal
+   *  behavior because their scrollback cannot safely prove current PTY state. */
+  readonly postTerminalPromptFence?: boolean;
+
+  /** A `{ submitted:false }` result has unknown side effects for this CLI.
+   *  Quarantine the current backend generation until exact transcript/receipt
+   *  evidence confirms that turn or a restart installs a fresh generation.
+   *  The ambiguous item is never replayed by this fence; only later queued
+   *  inputs survive for explicit recovery. */
+  readonly quarantineUnconfirmedSubmits?: boolean;
+
   /** The adapter PUBLISHES a structured `limited` screen_update from a machine
    *  rate-limit signal in its transcript (not from scraping screen text). When
    *  true, `isStructuredRateLimitAuthoritative` treats it as the sole rate-limit
@@ -805,4 +820,4 @@ export interface CliAdapter {
   buildSessionRenameCommand?(title: string): string;
 }
 
-export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'opencode2' | 'mimocode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax';
+export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'opencode2' | 'mimocode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax' | 'remote-runner';

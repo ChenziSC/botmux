@@ -52,6 +52,7 @@ export const messages: Record<string, string> = {
   'card.status.working': '工作中',
   'card.status.idle': '等待输入',
   'card.status.idle_silent': '已处理 · 判定无需回复',
+  'card.status.idle_failed': '执行失败',
   'card.status.idle_completed': '已完成',
   'card.status.dormant': '休眠',
   'card.status.analyzing': '正在分析…',

@@ -49,6 +49,7 @@ export const messages: Record<string, string> = {
   'card.status.working': 'Working',
   'card.status.idle': 'Awaiting input',
   'card.status.idle_silent': 'Handled · no reply needed',
+  'card.status.idle_failed': 'Failed',
   'card.status.idle_completed': 'Completed',
   'card.status.dormant': 'Dormant',
   'card.status.analyzing': 'Analyzing…',

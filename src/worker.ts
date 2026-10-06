@@ -3278,7 +3278,10 @@ let currentBotmuxTurnId: string | undefined;
 let currentBotmuxDispatchAttempt: number | undefined;
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
 let durableTurnInFlight = false;
-const activeTurnAuthority = new ActiveTurnAuthority();
+const activeTurnAuthority = new ActiveTurnAuthority((previousTurnId, turnId) => {
+  // Ordered IPC reaches the daemon before any output attributed to the steer.
+  send({ type: 'active_turn_envelope_changed', previousTurnId, turnId });
+});
 
 function turnAuthorityIdentity(input: {
   turnId?: string;
@@ -8877,7 +8880,11 @@ function emitReadyCodexTurns(): void {
       // Failure-fallback notice (not a model answer): lets the daemon add a
       // human @mention so e.g. a model-gateway outage doesn't scroll by
       // silently in bot-to-bot sessions.
-      ...(fallbackKind === 'failed' ? { turnFailed: true } : {}),
+      ...(fallbackKind === 'failed' ? {
+        turnFailed: true,
+        turnFailureCode: turn.terminalErrorCode || 'worker_turn_failed',
+        turnFailureNotice: failedBridgeFailureText(turn.terminalErrorCode, turn.terminalErrorSummary),
+      } : {}),
     });
   }
   for (const turn of ready) {
@@ -16856,7 +16863,10 @@ async function spawnCli(
   // never less. Mirrors what the riff path already does via mergedEnv.
   if (cfg.apiOnly) childEnv.BOTMUX_API_ONLY = '1';
   else delete childEnv.BOTMUX_API_ONLY;
-  childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
+  // Scope and topic identity come from this Worker, after configurable envs.
+  childEnv.BOTMUX_SESSION_SCOPE = cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat';
+  if (childEnv.BOTMUX_SESSION_SCOPE === 'thread') childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
+  else delete childEnv.BOTMUX_ROOT_MESSAGE_ID;
   applySessionOwnerEnv(childEnv, cfg.ownerOpenId);
   // This bot's resolved brandLabel template, injected so a SANDBOXED `botmux
   // send` renders the role-name footer without reading bots.json (deny-by-

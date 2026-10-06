@@ -220,3 +220,51 @@ describe('exact plugin input capture', () => {
     expect(() => parseInputCaptureCommand(['revoke', '--bot', 'cli_example', '--session', 's', '--binding', 'id', '--revision', 'NaN'])).toThrow();
   });
 });
+
+it('drains only pending inputs among retained inactive history and preserves order after lost ACK', async () => {
+  const delivered: string[] = []; let loseAck = true;
+  const f = fixture({ deliver: async (binding, input) => {
+    expect(binding.active).toBe(false); delivered.push(input.id);
+    if (loseAck) throw new Error('lost ack');
+  } });
+  f.store.transact(state => {
+    state.bindings[0].active = false;
+    for (let i = 0; i < 5000; i++) {
+      const id = `history${i}`;
+      state.bindings.push({ ...f.binding, id, active: false, anchor: `om_history${i}` });
+      state.inputs.push({ id, bindingId: id, sequence: 1, messageId: `om_history${i}`,
+        senderOpenId: 'ou_owner', text: 'retained', receivedAt: '2026-10-05T00:00:00Z', delivery: 'acknowledged' });
+      if (i === 2000 || i === 4000) state.inputs.push({ id: `pending${i}`, bindingId: f.binding.id,
+        sequence: i / 2000, messageId: `om_pending${i}`, senderOpenId: 'ou_owner', text: 'pending',
+        receivedAt: '2026-10-05T00:00:00Z', delivery: 'pending' });
+    }
+  });
+  const before = f.store.read();
+  await f.runtime.drain(); expect(delivered).toEqual(['pending2000']);
+  loseAck = false; await f.runtime.drain();
+  expect(delivered).toEqual(['pending2000', 'pending2000', 'pending4000']);
+  const after = f.store.read();
+  expect(after.bindings).toEqual(before.bindings);
+  expect(after.inputs.filter(i => i.bindingId !== f.binding.id)).toEqual(before.inputs.filter(i => i.bindingId !== f.binding.id));
+  expect(after.inputs.every(i => i.delivery === 'acknowledged')).toBe(true);
+  await f.runtime.drain(); expect(delivered).toHaveLength(3);
+});
+
+it.each(['duplicate', 'sequence', 'owner', 'attachments', 'thread', 'alias'])('rejects corrupted %s facts when building the capture index', async kind => {
+  const f = fixture(); f.runtime.capture(f.event); await f.runtime.drain();
+  f.store.transact(state => {
+    const input = state.inputs[0], binding = state.bindings[0];
+    if (kind === 'duplicate') state.bindings.push({ ...binding });
+    if (kind === 'sequence') input.sequence = 3;
+    if (kind === 'owner') input.bindingId = 'missing';
+    if (kind === 'attachments') input.attachments = [{ messageId: 'om_reply', type: 'file', key: 'file_example' }];
+    if (kind === 'thread') {
+      state.schemaVersion = 3; binding.inputThreadId = 'omt_one'; input.threadId = 'omt_two';
+    }
+    if (kind === 'alias') {
+      state.schemaVersion = 3; input.threadId = 'omt_one';
+      state.bindings.push({ ...binding, id: 'another', inputThreadId: 'omt_one', anchor: 'om_another' });
+    }
+  });
+  expect(() => f.store.read()).toThrow();
+});

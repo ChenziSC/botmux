@@ -1,4 +1,4 @@
-import { captureDigest, createInputCaptureStore, type CapturedInput, type InputBinding, type CaptureJournal } from './store.js';
+import { captureDigest, createInputCaptureStore, type CapturedInput, type InputBinding, type CaptureSnapshot } from './store.js';
 import { parseInputCaptureConditions } from './conditions.js';
 import { parseCaptureAttachments, type CaptureAttachment } from './attachments.js';
 
@@ -18,9 +18,8 @@ export interface InputCaptureOptions {
 const valid = (s: unknown, max = 200): s is string => typeof s === 'string'
   && !!s.trim() && s.length <= max && !/[\u0000-\u001f\u007f]/.test(s);
 const validThread = (s: unknown): s is string => typeof s === 'string' && /^omt_[A-Za-z0-9_-]{1,196}$/.test(s);
-function bindingThreads(state: CaptureJournal, binding: InputBinding): Set<string> {
-  return new Set([binding.inputThreadId, ...state.inputs.filter(i => i.bindingId === binding.id).map(i => i.threadId)]
-    .filter((id): id is string => id !== undefined));
+function bindingThreads(snapshot: CaptureSnapshot, binding: InputBinding): Set<string> {
+  return snapshot.threadsByBinding.get(binding.id)!;
 }
 
 export function createInputCaptureRuntime(options: InputCaptureOptions) {
@@ -34,11 +33,11 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
       && session.anchor === binding.sourceAnchor && session.ownerOpenId === binding.ownerOpenId;
   async function flush() {
     // Preserve source order per binding. Offline / rejected inputs remain pending.
-    const journal = store.read(); const blocked = new Set<string>();
+    const snapshot = store.readIndexed(); const journal = snapshot.state; const blocked = new Set<string>();
     for (const input of journal.inputs) {
       if (stopped) return;
       if (input.delivery !== 'pending' || blocked.has(input.bindingId)) continue;
-      const binding = journal.bindings.find(b => b.id === input.bindingId)!;
+      const binding = snapshot.bindingsById.get(input.bindingId)!;
       if (!options.pluginEnabled(binding.pluginId)) { blocked.add(binding.id); continue; }
       try {
         // Previously accepted input is delivered even after capture revocation.
@@ -72,7 +71,7 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
       const anchor = (body.inputAnchor ?? session.anchor) as string;
       if (body.inputThreadId !== undefined && !anchor.startsWith('om_')) throw new Error('invalid_input_capture_request');
       const id = captureDigest([larkAppId, sessionId, body.pluginId, body.requestId]);
-      return store.transact(state => {
+      return store.transact((state, snapshot) => {
         const prior = state.bindings.find(b => b.id === id);
         if (prior) {
           if (!matchesSession(prior, session) || prior.providerRef !== body.providerRef || prior.anchor !== anchor
@@ -82,7 +81,7 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
         }
         if (state.bindings.some(b => b.active && b.chatId === session.chatId
           && b.ownerOpenId === session.ownerOpenId && (b.anchor === anchor
-            || typeof body.inputThreadId === 'string' && bindingThreads(state, b).has(body.inputThreadId)))) throw new Error('input_capture_anchor_conflict');
+            || typeof body.inputThreadId === 'string' && bindingThreads(snapshot, b).has(body.inputThreadId)))) throw new Error('input_capture_anchor_conflict');
         const binding: InputBinding = { id, revision: 1, active: true, larkAppId, sessionId,
           chatId: session.chatId, anchor, sourceAnchor: session.anchor, ownerOpenId: session.ownerOpenId,
           pluginId: body.pluginId as string, requestId: body.requestId as string, providerRef: body.providerRef as string,
@@ -118,7 +117,7 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
       return { binding, inputs: selected, throughSequence: through, nextSequence: last < through ? last : null };
     },
     revoke(sessionId: string, bindingId: string, expectedRevision: number) {
-      return store.transact(state => {
+      return store.transact((state, snapshot) => {
         const binding = state.bindings.find(b => b.id === bindingId && b.sessionId === sessionId);
         if (!binding || binding.revision !== expectedRevision) throw new Error('input_capture_revision_conflict');
         if (binding.active) { binding.active = false; binding.revision++; }
@@ -127,13 +126,13 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
     },
     revokeSet(sessionId: string, value: unknown) {
       const conditions = parseInputCaptureConditions(value);
-      return store.transact(state => {
+      return store.transact((state, snapshot) => {
         // Check every stream before changing any of them. A new input does not
         // increment the binding revision, so both preconditions are necessary.
         const entries = conditions.map(condition => {
           const binding = state.bindings.find(b => b.id === condition.bindingId && b.sessionId === sessionId);
           if (!binding || binding.revision !== condition.expectedRevision) throw new Error('input_capture_revision_conflict');
-          const inputCount = state.inputs.filter(input => input.bindingId === binding.id).length;
+          const inputCount = snapshot.inputCounts.get(binding.id) ?? 0;
           if (inputCount !== condition.expectedInputCount) throw new Error('input_capture_inputs_conflict');
           return { binding, inputCount };
         });
@@ -145,18 +144,18 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
     },
     resolveThreadAnchor(event: { messageId: string; chatId: string; senderOpenId: string; threadId: string }): string | undefined {
       if (!validThread(event.threadId)) return undefined;
-      const state = store.read();
+      const snapshot = store.readIndexed(); const state = snapshot.state;
       const owns = (b: InputBinding) => b.chatId === event.chatId && b.ownerOpenId === event.senderOpenId;
       const historical = state.inputs.find(i => i.messageId === event.messageId
-        && state.bindings.some(b => b.id === i.bindingId && owns(b)));
+        && owns(snapshot.bindingsById.get(i.bindingId)!));
       if (historical) {
-        const binding = state.bindings.find(b => b.id === historical.bindingId)!;
-        const thread = historical.threadId ?? [...bindingThreads(state, binding)][0];
+        const binding = snapshot.bindingsById.get(historical.bindingId)!;
+        const thread = historical.threadId ?? [...bindingThreads(snapshot, binding)][0];
         if (thread && thread !== event.threadId) throw new Error('input_capture_message_conflict');
         return thread && binding.anchor !== event.messageId ? binding.anchor : undefined;
       }
       const bindings = state.bindings.filter(b => b.active && owns(b) && b.anchor !== event.messageId
-        && bindingThreads(state, b).has(event.threadId));
+        && bindingThreads(snapshot, b).has(event.threadId));
       if (bindings.length > 1) throw new Error('input_capture_anchor_conflict');
       return bindings[0]?.anchor;
     },
@@ -165,11 +164,14 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
       if (event.botSender || !valid(event.messageId) || !valid(event.senderOpenId)
         || event.threadId !== undefined && (!validThread(event.threadId) || !event.anchor.startsWith('om_'))
         || typeof event.text !== 'string' || !event.text.trim() && !event.attachments?.length) return false;
-      const state = store.read();
-      const historical = state.inputs.find(row => row.messageId === event.messageId && state.bindings.some(b =>
-        b.id === row.bindingId && b.chatId === event.chatId && b.anchor === event.anchor && b.ownerOpenId === event.senderOpenId));
+      const snapshot = store.readIndexed(); const state = snapshot.state;
+      const historical = state.inputs.find(row => {
+        if (row.messageId !== event.messageId) return false;
+        const b = snapshot.bindingsById.get(row.bindingId)!;
+        return b.chatId === event.chatId && b.anchor === event.anchor && b.ownerOpenId === event.senderOpenId;
+      });
       if (historical) {
-        const threads = bindingThreads(state, state.bindings.find(b => b.id === historical.bindingId)!);
+        const threads = bindingThreads(snapshot, snapshot.bindingsById.get(historical.bindingId)!);
         if (historical.text !== event.text
           || event.threadId && threads.size && !threads.has(event.threadId)
           || JSON.stringify(parseCaptureAttachments(historical.attachments)) !== JSON.stringify(parseCaptureAttachments(event.attachments))) {
@@ -189,13 +191,13 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
         throw new Error('input_capture_authority_changed');
       }
       if (Buffer.byteLength(event.text, 'utf8') > 64 * 1024) throw new Error('input_capture_text_too_large');
-      store.transact(current => {
+      store.transact((current, index) => {
         const active = current.bindings.find(b => b.id === binding.id);
         if (!active?.active || active.revision !== binding.revision) throw new Error('input_capture_revision_conflict');
         if (event.threadId) {
-          const known = bindingThreads(current, active);
+          const known = bindingThreads(index, active);
           if (known.size && !known.has(event.threadId) || current.bindings.some(b => b.id !== binding.id && b.active
-            && b.chatId === event.chatId && b.ownerOpenId === event.senderOpenId && bindingThreads(current, b).has(event.threadId!))) {
+            && b.chatId === event.chatId && b.ownerOpenId === event.senderOpenId && bindingThreads(index, b).has(event.threadId!))) {
             throw new Error('input_capture_anchor_conflict');
           }
         }
@@ -209,7 +211,7 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
         }
         if (event.threadId) current.schemaVersion = 3;
         current.inputs.push({ id, bindingId: binding.id,
-          sequence: current.inputs.filter(row => row.bindingId === binding.id).length + 1,
+          sequence: (index.inputCounts.get(binding.id) ?? 0) + 1,
           messageId: event.messageId, senderOpenId: event.senderOpenId, text: event.text,
           ...(event.threadId ? { threadId: event.threadId } : {}),
           ...(attachments.length ? { attachments } : {}),

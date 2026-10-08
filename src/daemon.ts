@@ -25891,6 +25891,7 @@ async function handleThreadReplyAdmitted(
     // re-fork and mislabels THIS turn's idle card 「已处理 · 判定无需回复」.
     ds.silentIdleTurnId = undefined;
     ds.completedIdleTurnId = undefined;
+    ds.failedIdleTurnId = undefined;
     ds.currentTurnId = parsed.messageId;
     ds.currentImageKey = undefined;
     persistStreamCardState(ds);
@@ -27163,6 +27164,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       // see the Lark-message re-fork branch above.
       ds.silentIdleTurnId = undefined;
       ds.completedIdleTurnId = undefined;
+      ds.failedIdleTurnId = undefined;
       ds.currentTurnId = turnId;
       ds.currentImageKey = undefined;
       persistStreamCardState(ds);

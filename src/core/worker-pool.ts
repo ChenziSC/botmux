@@ -13986,7 +13986,7 @@ function setupWorkerHandlers(
             resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
           );
           if (!ownsLifecycleMutation() || !stillOwnsFreshReadyPost()) break;
-          const postedCardId = await scopedReplyTo(
+          const readyPost = scopedReplyTo(
             postingDisplayAnchor,
             postingAppId,
             streamCardJson,
@@ -13996,6 +13996,8 @@ function setupWorkerHandlers(
               if (!ownsLifecycleMutation() || !stillOwnsFreshReadyPost()) throw new Error('Ready card no longer owns delivery');
             } },
           );
+          trackStartingCardPublication(ds, readyPost);
+          const postedCardId = await readyPost;
           if (!ownsLifecycleMutation() || !stillOwnsFreshReadyPost()) {
             void deleteMessage(postingAppId, postedCardId).catch(() => { /* best-effort stale-card cleanup */ });
             restoreFreshReadyPrePostIdentityForRetirement();
@@ -14081,8 +14083,10 @@ function setupWorkerHandlers(
               localCliReadyAtBuild,
               sessionRuntimeDisplayName(ds, botCfg),
             );
-            const fallbackCardId = await scopedReplyTo(postingDisplayAnchor, postingAppId, cardJson,
+            const fallbackPost = scopedReplyTo(postingDisplayAnchor, postingAppId, cardJson,
               'interactive', cardReplyTarget.turnId, { replyTarget: cardReplyTarget.target, beforeWrite: beforeFallbackWrite });
+            trackStartingCardPublication(ds, fallbackPost);
+            const fallbackCardId = await fallbackPost;
             if (!ownsFallbackCard()) {
               void deleteMessage(postingAppId, fallbackCardId).catch(() => { /* best-effort stale-card cleanup */ });
               break;
@@ -14693,7 +14697,7 @@ function setupWorkerHandlers(
             && retainsLarkStreamingCardTransport(ds);
           const cardReplyTarget = captureStreamingCardReplyTarget(ds, msg.turnId);
           if (!ownsLifecycleMutation() || !stillOwnsFreshScreenPost()) break;
-          scopedReplyTo(
+          const screenPost = scopedReplyTo(
             postingDisplayAnchor,
             postingAppId,
             cardJson,
@@ -14702,7 +14706,9 @@ function setupWorkerHandlers(
             { replyTarget: cardReplyTarget.target, beforeWrite: () => {
               if (!ownsLifecycleMutation() || !stillOwnsFreshScreenPost()) throw new Error('Screen card no longer owns delivery');
             } },
-          )
+          );
+          trackStartingCardPublication(ds, screenPost);
+          screenPost
             .then(async msgId => {
               if (!ownsLifecycleMutation() || !stillOwnsFreshScreenPost()) {
                 void deleteMessage(postingAppId, msgId).catch(() => { /* best-effort stale-card cleanup */ });

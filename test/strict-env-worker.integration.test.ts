@@ -5,6 +5,7 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { findMissingAskEnv } from '../src/core/ask-args.js';
 import { inheritBotEnv } from '../src/core/env-policy.js';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 
@@ -36,7 +37,8 @@ fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify({
  unknownAbsent: !('UNLISTED_CLOUD_CREDENTIAL' in process.env) && !('HOUSEHOLD_API_CREDENTIAL' in process.env) && !('FINANCE_SERVICE_SECRET' in process.env),
  runtimeContext: process.env.BOTS_CONFIG === ${JSON.stringify(bots)} && process.env.BOTMUX_CHAT_ID === 'virtual_probe',
  sessionScope: process.env.BOTMUX_SESSION_SCOPE === ${JSON.stringify(scope)},
- topicRoot: ${JSON.stringify(scope)} === 'thread' ? process.env.BOTMUX_ROOT_MESSAGE_ID === 'om_probe' : !('BOTMUX_ROOT_MESSAGE_ID' in process.env),
+ topicRoot: process.env.BOTMUX_ROOT_MESSAGE_ID === ${JSON.stringify(scope === 'thread' ? 'om_probe' : 'oc_probe')},
+ askEnv: Object.fromEntries(['BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_LARK_APP_ID', 'BOTMUX_ROOT_MESSAGE_ID'].map(key => [key, process.env[key]])),
  modelKeyPresent: process.env.OPENAI_API_KEY === 'own-model-auth',
  workingDir: process.cwd() === fs.realpathSync(${JSON.stringify(dir)}),
  codexHome: ${JSON.stringify(cliId)} !== 'codex' || (fs.realpathSync(process.env.CODEX_HOME) === fs.realpathSync(${JSON.stringify(codexHome)}) && JSON.parse(fs.readFileSync(process.env.CODEX_HOME + '/auth.json')).OPENAI_API_KEY === 'own-file-auth'),
@@ -64,14 +66,16 @@ console.log('Ready >'); setTimeout(() => {}, 30000);
     worker.stdout?.on('data', data => diagnostics += String(data));
     worker.stderr?.on('data', data => diagnostics += String(data));
     try {
-      worker.send({ type: 'init', sessionId, chatId: 'virtual_probe', rootMessageId: scope === 'thread' ? 'om_probe' : 'probe',
+      worker.send({ type: 'init', sessionId, chatId: 'virtual_probe', rootMessageId: scope === 'thread' ? 'om_probe' : 'oc_probe',
         workingDir: dir, cliId, cliPathOverride: script, backendType: restore ? 'tmux' : 'pty', prompt: '',
         apiOnly: true, larkAppId: 'app_probe', larkAppSecret: '', ownerOpenId: 'ou_owner',
         envPolicy: { mode: 'strict', inherit: ['HTTPS_PROXY'] }, env: { MODEL_AUTH: 'bot-sentinel', OPENAI_API_KEY: 'own-model-auth' },
         ...(cliId === 'codex' ? { codexAuthSync: 'isolated' } : {}),
         loadedBotsConfigPath: bots, loadedBotsConfigProvenance: 'loaded', promptInjection: 'none' });
       await vi.waitFor(() => expect(existsSync(report), diagnostics).toBe(true), { timeout: 20000 });
-      for (const [key, ok] of Object.entries(JSON.parse(readFileSync(report, 'utf8')))) expect(ok, `${key}\n${diagnostics}`).toBe(true);
+      const { askEnv, ...checks } = JSON.parse(readFileSync(report, 'utf8'));
+      expect(findMissingAskEnv(askEnv)).toBeNull();
+      for (const [key, ok] of Object.entries(checks)) expect(ok, `${key}\n${diagnostics}`).toBe(true);
       if (restore) {
         expect(() => process.kill(oldPid!, 0)).toThrow();
         await vi.waitFor(() => expect(existsSync(join(dir, `data/sessions/${sessionId}.env-policy`))).toBe(true));

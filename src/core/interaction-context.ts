@@ -1,3 +1,5 @@
+import { isDocNativeSession, isHttpVirtualSession } from './types.js';
+
 /** Read-only host observation for external interaction providers.
  * No data paths, credentials, mutable grants, or business state are exposed. */
 export interface InteractionSession {
@@ -26,9 +28,13 @@ export function observeInteractionContext(
   if (!session || session.sessionId !== request.sessionId || session.status !== 'active'
     || (session.larkAppId && session.larkAppId !== request.daemonAppId)) return fail(404, 'active_session_not_found');
   if (!id(session.chatId) || !/^ou_[A-Za-z0-9_-]+$/.test(session.ownerOpenId ?? '')
-    || !['chat', 'thread'].includes(session.scope ?? '') || session.vcMeetingReceiver
+    || (session.scope !== 'chat' && session.scope !== 'thread') || session.vcMeetingReceiver
     || !['group', 'p2p'].includes(session.chatType ?? '')
     || session.scope === 'thread' && !/^om_[A-Za-z0-9_-]+$/.test(session.rootMessageId ?? '')) return fail(409, 'interaction_origin_unavailable');
+  // This registry contains live IM/document/HTTP sessions; v3 runs use a separate registry.
+  if (isDocNativeSession({ scope: session.scope, chatId: session.chatId }) || isHttpVirtualSession(session.chatId)) {
+    return fail(409, 'interaction_origin_unavailable');
+  }
   const actorOpenId = (body.actorOpenId ?? session.ownerOpenId) as string;
   const canTalk = deps.canTalk(request.daemonAppId, session.chatId, actorOpenId, session.chatType as 'group' | 'p2p') === true;
   return { status: 200, body: { ok: true, schemaVersion: 1, context: {

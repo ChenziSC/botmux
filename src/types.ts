@@ -1165,6 +1165,8 @@ export interface CrossPrincipalInterruption {
   /** Persisted retry identity/deadline for a confirmation that could not be delivered. */
   confirmationRetryCount?: number;
   confirmationRetryAt?: number;
+  /** Bounded source lookup retries; confirmed resources remain reusable. */
+  sourceCheckRetry?: { attempts: number; retryAt: number };
   ownerTurnId: string;
   owner: TrustedCaller;
   /** Business prompt of the active owner turn, captured before daemon-owned

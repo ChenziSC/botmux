@@ -19769,6 +19769,8 @@ function deferTransientXpiIdentityResolution(
 const XPI_TERMINAL_ALERT_MAX_ATTEMPTS = 3;
 const XPI_TERMINAL_ALERT_RETRY_DELAYS_MS = [0, 250, 1_000];
 const XPI_TERMINAL_ALERT_AUDIT_LIMIT = 50;
+const XPI_SOURCE_CHECK_MAX_ATTEMPTS = 3;
+const XPI_SOURCE_CHECK_RETRY_MS = 5_000;
 const XPI_TERMINAL_NOTICE_MAX_CYCLES = 3;
 const XPI_TERMINAL_NOTICE_RETRY_MS = 5_000;
 
@@ -21002,6 +21004,10 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
       return;
     }
     if (record.phase === 'preparing_independent' || record.phase === 'independent_queued') {
+      if (record.sourceCheckRetry && record.sourceCheckRetry.retryAt > Date.now()) {
+        scheduleCrossPrincipalOwnerWait(ds, record.sourceCheckRetry.retryAt);
+        return;
+      }
       await prepareIndependentCrossPrincipalSession(ds, record);
       return;
     }
@@ -21203,6 +21209,22 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
       if (!(await dispatchApprovedCrossPrincipalSuggestion(ds, current))) return;
     }
   } catch (err) {
+    if (err instanceof TopicSendError) {
+      const current = ds.session.crossPrincipalInterruptions?.find(item => item.id === record.id);
+      if (ds.session.status !== 'active' || findActiveBySessionId(ds.session.sessionId) !== ds
+        || !current || !['preparing_independent', 'independent_queued'].includes(current.phase)) return;
+      const attempts = (current.sourceCheckRetry?.attempts ?? 0) + 1;
+      if (err.code === 'TOPIC_SEND_CHECK_FAILED' && attempts < XPI_SOURCE_CHECK_MAX_ATTEMPTS) {
+        current.sourceCheckRetry = { attempts, retryAt: Date.now() + XPI_SOURCE_CHECK_RETRY_MS };
+        persistCrossPrincipalQueue(ds);
+        scheduleCrossPrincipalOwnerWait(ds, current.sourceCheckRetry.retryAt);
+      } else {
+        await settleCrossPrincipalTerminal(ds, current, err.code === 'TOPIC_SEND_BLOCKED'
+          ? '独立请求的原话题已不可用，本次未执行。'
+          : '多次重试后仍无法核验独立请求的原话题，本次未执行。');
+      }
+      return;
+    }
     if (err instanceof XpiSharedCwdQueueFullError) {
       // Keep the record on the same durable terminal-notice path as every
       // other terminal outcome. The business action is not retried; only the

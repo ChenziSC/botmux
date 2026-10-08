@@ -1,5 +1,7 @@
+import { compileSavedWorkflowFromRun, materializeSavedWorkflowRun } from '../src/workflows/v3/library-materialize.js';
+import { createSavedWorkflow, loadCurrentSavedWorkflow } from '../src/workflows/v3/library-store.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cpSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 const mocks = vi.hoisted(() => ({ request: vi.fn(), create: vi.fn(), reply: vi.fn() }));
@@ -47,6 +49,32 @@ function input(kind: 'send' | 'reply') {
 }
 
 describe('workflow IM source factories', () => {
+  it.each(['legacy', 'stop'] as const)('supports sparse reply identity for %s invoke and recovery without relaxing send', async policy => {
+    registerBot({ ...bot, topicUnavailablePolicy: policy });
+    const snapshot = { params: {}, context: { larkAppId: APP, rootMessageId: SOURCE } };
+    const send = chatBoundWorkflowWriteOptions(snapshot, 'send');
+    const reply = chatBoundWorkflowWriteOptions(snapshot, 'reply');
+    const registry = createDefaultHostExecutorRegistry(send, reply);
+    const replyInput = { larkAppId: APP, rootMessageId: SOURCE, content: 'sparse reply' };
+    await registry.get('feishu-reply')!.executor.invoke(replyInput, 'reply-key');
+    await expect(createDefaultProviderReconcilers(send, reply).get('feishu-im')!.idempotentSubmit!('reply-key', replyInput))
+      .resolves.toMatchObject({ ok: true });
+    expect(mocks.reply).toHaveBeenCalledTimes(2);
+    expect(mocks.reply.mock.calls.map(([r]) => r.data.uuid)).toEqual(['reply-key', 'reply-key']);
+    await expect(registry.get('feishu-send')!.executor.invoke(input('send'), 'send-key'))
+      .rejects.toMatchObject({ code: 'TOPIC_SEND_CHECK_FAILED' });
+    expect(mocks.create).not.toHaveBeenCalled();
+    if (policy === 'legacy') expect(mocks.request).not.toHaveBeenCalled();
+    else expect(mocks.request.mock.calls.every(([r]) => r.url.endsWith('/' + SOURCE))).toBe(true);
+  });
+  it.each(['legacy', 'stop'] as const)('requires a frozen reply root under %s', async policy => {
+    registerBot({ ...bot, topicUnavailablePolicy: policy });
+    const reply = chatBoundWorkflowWriteOptions({ params: {}, context: { larkAppId: APP, chatId: CHAT } }, 'reply');
+    await expect(createDefaultHostExecutorRegistry(undefined, reply).get('feishu-reply')!.executor.invoke(input('reply'), 'no-root'))
+      .rejects.toMatchObject({ code: 'TOPIC_SEND_CHECK_FAILED' });
+    expect(mocks.reply).not.toHaveBeenCalled();
+  });
+
   it.each(['send', 'reply'] as const)('%s protects both live and recovery attempts', async kind => {
     unavailable = true;
     const options = sourceOptions();
@@ -104,13 +132,16 @@ describe('workflow IM source factories', () => {
 });
 
 function newBase() { const root = mkdtempSync(join(tmpdir(), 'workflow-source-')); roots.push(root); return root; }
-function seed(base: string, runId: string) {
+function seed(base: string, runId: string, kind: 'send' | 'reply' = 'send') {
   const { runDir } = birthRun({ goal: 'g', baseDir: base, runId,
     chatBinding: { larkAppId: APP, chatId: CHAT, rootMessageId: SOURCE } });
   const dagPath = join(runDir, 'dag.json');
-  writeFileSync(dagPath, JSON.stringify({ runId, nodes: [{ id: 'send', type: 'host', executor: 'feishu-send',
-    input: { larkAppId: { $ref: 'context.larkAppId' }, chatId: { $ref: 'context.chatId' }, content: 'approved result' },
+  writeFileSync(dagPath, JSON.stringify({ runId, nodes: [{ id: 'send', type: 'host', executor: 'feishu-' + kind,
+    input: { larkAppId: { $ref: 'context.larkAppId' }, ...(kind === 'send'
+      ? { chatId: { $ref: 'context.chatId' } } : { rootMessageId: { $ref: 'context.rootMessageId' } }), content: 'approved result' },
     depends: [], inputs: [], humanGate: { prompt: 'Approve fixture send?' } }] }));
+  writeFileSync(join(runDir, 'spec.json'), JSON.stringify({ schemaVersion: 1, runId, title: 'Publish result', requirement: 'Publish the approved result',
+    nodes: [{ sketchId: 'send', goal: 'Publish result', input_needs: [], expected_outputs: ['message'], acceptance: 'Result delivered', risk_gate: true, unknowns: [] }] }));
   writeGrillState(runDir, { ...readGrillState(runDir)!, status: 'dag_approved', dagPath });
   return runDir;
 }
@@ -158,5 +189,40 @@ describe('daemon workflow source survives durable recovery', () => {
     expect(events.filter(e => e.type === 'hostEffectIntent')).toHaveLength(1);
     if (withdrawn) expect(events.some(e => e.type === 'hostEffectUncertain')).toBe(true);
     expect(mocks.request.mock.calls.some(([r]) => r.url.endsWith('/' + SOURCE))).toBe(true);
+  });
+});
+
+
+describe('saved reply-only workflow with sparse frozen context', () => {
+  it.each(['legacy', 'stop'] as const)('runs and recovers the actual saved reply under %s', async policy => {
+    registerBot({ ...bot, topicUnavailablePolicy: policy });
+    const sourceBase = newBase(); const sourceId = 'compile-source'; const sourceDir = seed(sourceBase, sourceId, 'reply');
+    await approve(sourceBase, sourceId);
+    expect(await driveV3Run(sourceId, deps(sourceBase))).toMatchObject({ runStatus: 'succeeded' });
+    const compiled = compileSavedWorkflowFromRun(sourceDir);
+    expect(compiled.revision.contextRefs).toEqual(expect.arrayContaining(['larkAppId', 'rootMessageId']));
+    expect(compiled.revision.contextRefs).not.toContain('chatId');
+    const dataDir = newBase();
+    const created = await createSavedWorkflow(dataDir, { displayName: 'reply-only', owner: { openId: 'ou_fixture', larkAppId: APP },
+      scope: { kind: 'chat', chatId: CHAT }, revision: compiled.revision, publish: true });
+    const saved = await loadCurrentSavedWorkflow(dataDir, created.metadata.workflowId);
+    const base = newBase(); const recoveryBase = newBase(); const runId = 'saved-reply';
+    const run = materializeSavedWorkflowRun({ metadata: saved.metadata, revision: saved.revision, rawParams: {},
+      context: { chatBinding: { larkAppId: APP, chatId: CHAT, rootMessageId: SOURCE }, initiatorOpenId: 'ou_fixture' },
+      bots: [bot], baseDir: base, runId });
+    expect(JSON.parse(readFileSync(join(run.runDir, 'params.resolved.json'), 'utf8')).context)
+      .toEqual({ larkAppId: APP, rootMessageId: SOURCE });
+    await approve(base, runId);
+    const recoveryDir = join(recoveryBase, runId);
+    mocks.request.mockClear(); mocks.reply.mockClear();
+    mocks.reply.mockImplementationOnce(async () => {
+      cpSync(run.runDir, recoveryDir, { recursive: true });
+      return { code: 0, data: { message_id: 'om_result' } };
+    });
+    expect(await driveV3Run(runId, deps(base))).toMatchObject({ runStatus: 'succeeded' });
+    expect(await driveV3Run(runId, deps(recoveryBase))).toMatchObject({ runStatus: 'succeeded' });
+    expect(mocks.reply).toHaveBeenCalledTimes(2);
+    expect(mocks.reply.mock.calls[1][0].data.uuid).toBe(mocks.reply.mock.calls[0][0].data.uuid);
+    if (policy === 'legacy') expect(mocks.request).not.toHaveBeenCalled();
   });
 });

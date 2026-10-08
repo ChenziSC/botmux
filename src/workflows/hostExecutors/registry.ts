@@ -25,7 +25,7 @@ export type {
   RegisteredHostExecutor,
 } from '../v3/runtime-host-contract.js';
 
-export function createDefaultHostExecutorRegistry(options?: OutboundMessageOptions): HostExecutorRegistry {
+export function createDefaultHostExecutorRegistry(options?: OutboundMessageOptions, replyOptions = options): HostExecutorRegistry {
   return new Map([
     [
       'botmux-schedule',
@@ -44,16 +44,16 @@ export function createDefaultHostExecutorRegistry(options?: OutboundMessageOptio
     [
       'feishu-reply',
       {
-        executor: options ? createFeishuReplyExecutor(options) : feishuReplyExecutor,
+        executor: replyOptions ? createFeishuReplyExecutor(replyOptions) : feishuReplyExecutor,
         parseInput: parseFeishuReplyInput,
       } satisfies RegisteredHostExecutor,
     ],
   ]);
 }
 
-export function createDefaultProviderReconcilers(options?: OutboundMessageOptions): Map<string, ProviderReconciler> {
+export function createDefaultProviderReconcilers(options?: OutboundMessageOptions, replyOptions = options): Map<string, ProviderReconciler> {
   return new Map([
     [botmuxScheduleReconciler.provider, botmuxScheduleReconciler],
-    [feishuImReconciler.provider, options ? createFeishuImReconciler(options) : feishuImReconciler],
+    [feishuImReconciler.provider, (options || replyOptions) ? createFeishuImReconciler(options, replyOptions) : feishuImReconciler],
   ]);
 }

@@ -377,7 +377,7 @@ function assertCotResponse(larkAppId: string, response: any, state?: CotState): 
     throw new TopicSendError(response.code === 230011 ? 'TOPIC_SEND_BLOCKED' : 'TOPIC_SEND_CHECK_FAILED',
       'CoT 写入未成功，保留恢复记录；不要更换目标。');
   }
-  throw new Error(`CoT write failed: ${response.msg ?? ''} (code: ${response.code})`);
+  // Legacy keeps its existing response handling; strict business-code checks are opt-in.
 }
 
 async function apiCreate(ds: DaemonSession, state: CotState): Promise<void> {

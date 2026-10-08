@@ -51,12 +51,12 @@ export const authorizeChatBoundHostExecution: HostExecutorPolicy = (
 /** Reuse the run's already authorized, persisted identity for every IM attempt.
  * Copy primitive source values now: later context/session mutation must not
  * retarget a queued call or the reconciler's idempotent submission. */
-export function chatBoundWorkflowWriteOptions(snapshot?: ExecutionContextSnapshot): OutboundMessageOptions {
+export function chatBoundWorkflowWriteOptions(snapshot?: ExecutionContextSnapshot, operation: 'send' | 'reply' = 'send'): OutboundMessageOptions {
   const appId = snapshot?.context.larkAppId;
   const chatId = snapshot?.context.chatId;
   const rootMessageId = snapshot?.context.rootMessageId;
   return { beforeWrite: async () => {
-    if (!appId || !chatId) throw new TopicSendError('TOPIC_SEND_CHECK_FAILED', '缺少已授权 workflow 的原会话依据。');
+    if (!appId || (operation === 'send' ? !chatId : !rootMessageId)) throw new TopicSendError('TOPIC_SEND_CHECK_FAILED', '缺少已授权 workflow 的原会话依据。');
     const { getBot } = await import('../../bot-registry.js');
     if (getBot(appId).config.topicUnavailablePolicy !== 'stop' || rootMessageId === undefined) return;
     if (typeof rootMessageId !== 'string' || !rootMessageId) {

@@ -319,7 +319,6 @@ export async function maybeBirthSessionGroup(
       messageId,
       t('sg.birth_failed', { error: String((err as any)?.message ?? err).slice(0, 120) }, locale),
     ).catch(() => { /* best-effort notice */ });
-    await sourceOptions?.beforeWrite();
     return null;
   }
 }

@@ -12,8 +12,8 @@ import { createFeishuSendReconciler } from './feishu-send.js';
  * operation; durable recovery sees the provider, so it dispatches by the
  * verified frozen effect-input shape.
  */
-export function createFeishuImReconciler(options?: OutboundMessageOptions): ProviderReconciler {
-  const feishuReplyReconciler = createFeishuReplyReconciler(options);
+export function createFeishuImReconciler(options?: OutboundMessageOptions, replyOptions = options): ProviderReconciler {
+  const feishuReplyReconciler = createFeishuReplyReconciler(replyOptions);
   const feishuSendReconciler = createFeishuSendReconciler(options);
   return {
     provider: 'feishu-im',

@@ -684,6 +684,7 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     let previousXpi: string | undefined;
     let previousRegistry: ReturnType<typeof getActiveSessionsRegistry>;
     let unavailable: Set<string>;
+    let lookupFailed: Set<string>;
     let writes: string[];
     const SOURCE = 'om_independent_proposal';
     const ROOT = 'om_proposal_root';
@@ -695,10 +696,12 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       process.env.BOTMUX_XPI_ENABLED = 'true';
       getBot(APP).config.topicUnavailablePolicy = 'stop';
       unavailable = new Set();
+      lookupFailed = new Set();
       writes = [];
-      mocks.getMessageDetail.mockReset().mockImplementation(async (_app, id) => ({
-        items: [{ message_id: id, deleted: unavailable.has(id), ...(id === SOURCE ? { root_id: ROOT } : {}) }],
-      }));
+      mocks.getMessageDetail.mockReset().mockImplementation(async (_app, id) => {
+        if (lookupFailed.has(id)) throw new Error('source lookup temporarily unavailable');
+        return { items: [{ message_id: id, deleted: unavailable.has(id), ...(id === SOURCE ? { root_id: ROOT } : {}) }] };
+      });
       mocks.sendMessage.mockImplementation(async (...args: any[]) => {
         await args[6]?.beforeWrite?.();
         writes.push(args[2]);
@@ -734,7 +737,7 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     }
 
     it.each(['withdrawn', 'unknown', 'lookup failed'])(
-      'retains the original request without creating a root when its source is %s', async kind => {
+      'settles blocked sources and parks inconclusive sources without creating a root: %s', async kind => {
         const { ds, record } = seedIndependent();
         if (kind === 'withdrawn') unavailable.add(SOURCE);
         if (kind === 'unknown') mocks.getMessageDetail.mockResolvedValue({ items: [] });
@@ -743,14 +746,20 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
         expect(writes).toEqual([]);
         expect(mocks.createSession).not.toHaveBeenCalled();
         expect(mocks.forkWorker).not.toHaveBeenCalled();
-        expect(ds.session.crossPrincipalInterruptions).toEqual([record]);
+        if (kind === 'withdrawn') {
+          expect(record.phase).toBe('terminal_notice_pending');
+          expect(ds.session.crossPrincipalInterruptions ?? []).not.toContain(record);
+        } else {
+          expect(record).toMatchObject({ phase: 'preparing_independent', sourceCheckRetry: { attempts: 1 } });
+          expect(ds.crossPrincipalWaitTimer).toBeDefined();
+        }
       });
 
     it('checks the provider root even while the original reply remains available', async () => {
       const { ds } = seedIndependent();
       unavailable.add(ROOT);
       await driveCrossPrincipalInterruptions(ds);
-      expect(mocks.getMessageDetail.mock.calls.map(([, id]) => id)).toEqual([SOURCE, ROOT]);
+      expect(mocks.getMessageDetail.mock.calls.map(([, id]) => id).slice(0, 2)).toEqual([SOURCE, ROOT]);
       expect(writes).toEqual([]);
       expect(mocks.forkWorker).not.toHaveBeenCalled();
     });
@@ -792,14 +801,15 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       mocks.sendMessage.mockImplementation(async (...args: any[]) => {
         await args[6].beforeWrite();
         writes.push(args[2]);
-        unavailable.add(SOURCE);
+        lookupFailed.add(SOURCE);
         return 'om_top';
       });
       await driveCrossPrincipalInterruptions(ds);
       expect(record).toHaveProperty('independentRootMessageId', 'om_top');
       expect(mocks.createSession).not.toHaveBeenCalled();
       expect(mocks.forkWorker).not.toHaveBeenCalled();
-      unavailable.clear();
+      lookupFailed.clear();
+      record.sourceCheckRetry.retryAt = Date.now() - 1;
       await driveCrossPrincipalInterruptions(ds);
       expect(writes).toHaveLength(1);
       expect(mocks.createSession).toHaveBeenCalledTimes(1);
@@ -808,7 +818,7 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
 
     it('does not stage an executable opening when source fails during bot lookup', async () => {
       const { ds, record } = seedIndependent();
-      mocks.getAvailableBots.mockImplementation(async () => { unavailable.add(SOURCE); return []; });
+      mocks.getAvailableBots.mockImplementation(async () => { lookupFailed.add(SOURCE); return []; });
       await driveCrossPrincipalInterruptions(ds);
       const child = [...activeSessions.values()].find(item => item !== ds)!;
       expect(child).toBeDefined();
@@ -816,7 +826,8 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       expect(child.session.queuedPrompt).toBeUndefined();
       expect(mocks.forkWorker).not.toHaveBeenCalled();
       expect(ds.session.crossPrincipalInterruptions).toEqual([record]);
-      unavailable.clear();
+      lookupFailed.clear();
+      record.sourceCheckRetry.retryAt = Date.now() - 1;
       mocks.getAvailableBots.mockResolvedValue([]);
       await driveCrossPrincipalInterruptions(ds);
       expect(mocks.createSession).toHaveBeenCalledTimes(1);
@@ -840,7 +851,7 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       record.messages[0].turnId = 'execution-turn';
       unavailable.add(ROOT);
       await driveCrossPrincipalInterruptions(ds);
-      expect(mocks.getMessageDetail.mock.calls.map(([, id]) => id)).toEqual([ROOT]);
+      expect(mocks.getMessageDetail.mock.calls.map(([, id]) => id).filter(id => id !== 'om_unrelated_owner_root')).toEqual([ROOT]);
       expect(writes).toEqual([]);
     });
 
@@ -861,6 +872,57 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       expect(mocks.getMessageDetail).not.toHaveBeenCalled();
       expect(writes).toEqual([]);
       expect(ds.session.crossPrincipalInterruptions).toEqual([record]);
+    });
+
+    it.each(['before-resources', 'after-root', 'before-worker'] as const)(
+      'closes a blocked request at %s without later replaying its resources', async checkpoint => {
+        const { ds, record } = seedIndependent();
+        if (checkpoint === 'before-resources') unavailable.add(SOURCE);
+        if (checkpoint === 'after-root') mocks.sendMessage.mockImplementation(async (...args: any[]) => {
+          await args[6].beforeWrite(); writes.push(args[2]); unavailable.add(SOURCE); return 'om_top';
+        });
+        if (checkpoint === 'before-worker') mocks.getAvailableBots.mockImplementation(async () => { unavailable.add(SOURCE); return []; });
+        await driveCrossPrincipalInterruptions(ds);
+        expect(record.phase).toBe('terminal_notice_pending');
+        expect(mocks.forkWorker).not.toHaveBeenCalled();
+        const rootCount = writes.length;
+        const childCount = mocks.createSession.mock.calls.length;
+        unavailable.clear();
+        await driveCrossPrincipalInterruptions(ds);
+        expect(writes).toHaveLength(rootCount);
+        expect(mocks.createSession).toHaveBeenCalledTimes(childCount);
+        expect(mocks.forkWorker).not.toHaveBeenCalled();
+      },
+    );
+    it('bounds source-check retries across restored records and respects their wake time', async () => {
+      const { ds, record } = seedIndependent();
+      lookupFailed.add(SOURCE);
+      await driveCrossPrincipalInterruptions(ds);
+      const checks = mocks.getMessageDetail.mock.calls.length;
+      await driveCrossPrincipalInterruptions(ds);
+      expect(mocks.getMessageDetail).toHaveBeenCalledTimes(checks);
+      for (let attempt = 2; attempt <= 3; attempt++) {
+        ds.session.crossPrincipalInterruptions = JSON.parse(JSON.stringify(ds.session.crossPrincipalInterruptions));
+        ds.session.crossPrincipalInterruptions[0].sourceCheckRetry.retryAt = Date.now() - 1;
+        await driveCrossPrincipalInterruptions(ds);
+      }
+      expect(ds.session.crossPrincipalInterruptions ?? []).toEqual([]);
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      expect(writes).toEqual([]);
+      expect(JSON.stringify(mocks.replyMessage.mock.calls)).toContain('无法核验');
+      expect(record.sourceCheckRetry.attempts).toBe(1);
+    });
+    it.each(['closed', 'replaced'] as const)('does not revive a %s source after an awaited check', async change => {
+      const { ds, record } = seedIndependent();
+      mocks.getMessageDetail.mockImplementationOnce(async () => {
+        if (change === 'closed') ds.session.status = 'closed';
+        else ds.session.crossPrincipalInterruptions = [];
+        throw new Error('lookup lost its session');
+      });
+      await driveCrossPrincipalInterruptions(ds);
+      expect(record.sourceCheckRetry).toBeUndefined();
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      expect(writes).toEqual([]);
     });
 
     it('preserves legacy behavior without source lookups', async () => {

@@ -1012,6 +1012,25 @@ describe('CoT stop policy', () => {
     });
     return (value: boolean) => { unavailable = value; };
   }
+  it.each(['legacy', 'stop'] as const)('limits strict business-response handling to the %s policy', async policy => {
+    stopPolicy();
+    vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: true, topicUnavailablePolicy: policy } } as any);
+    const ds = makeDs(); handleCotThinkingUpdate(ds, upd([think('first')]));
+    await vi.waitFor(() => expect(pushedEvents().some(e => e.content.delta === 'first')).toBe(true));
+    const original = request.getMockImplementation()!;
+    request.mockImplementation(async (req: any) => req.method === 'GET'
+      ? original(req) : { code: 230011, msg: 'withdrawn' });
+    handleCotThinkingUpdate(ds, upd([think('first'), think('next')]));
+    if (policy === 'stop') {
+      await vi.waitFor(() => expect(handleCotThinkingUpdate(ds, upd([think('first'), think('next')]))).toBe(false));
+    } else {
+      await flush();
+      expect(handleCotThinkingUpdate(ds, upd([think('first'), think('next')]))).toBe(true);
+    }
+    await settleCotMessageForShutdown(ds);
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(policy === 'stop');
+    if (policy === 'legacy') expect(request.mock.calls.some(([r]) => r.method === 'GET')).toBe(false);
+  });
   it('does not create a thinking bubble for a withdrawn source topic', async () => {
     const unavailable = stopPolicy(); unavailable(true);
     const ds = makeDs(); handleCotThinkingUpdate(ds, upd([think('private')]));

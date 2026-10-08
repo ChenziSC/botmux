@@ -87,6 +87,8 @@ import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/g
 import { readPeerCrossRef, writePeerCrossRef } from '../../services/peer-cross-ref-store.js';
 import { resolveCardActionAckTimeoutMs } from '../../core/card-action-ack.js';
 import { DROPPED_REACTION_EMOJI_TYPE } from '../../core/pending-response.js';
+import type { DurableInboxStore } from '../../services/durable-coordination.js';
+import { enqueueDurableLarkMessage } from '../../services/durable-inbox-shadow.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
 const hallEchoReplied = new Set<string>();
@@ -2847,6 +2849,9 @@ export function markForwardFollowupsSessionsReady(larkAppId: string): void {
 }
 
 export interface EventHandlers {
+  /** Exact host-installed capture. Must synchronously persist before returning
+   * true; thrown persistence errors must not fall through to ordinary routing. */
+  captureHumanInput?: (data: any) => boolean;
   handleCardAction: (data: any, larkAppId: string) => Promise<any>;
   handleNewTopic: (data: any, ctx: RoutingContext) => Promise<void>;
   handleThreadReply: (data: any, ctx: RoutingContext) => Promise<void>;
@@ -3863,7 +3868,13 @@ async function processCommentEvent(
  * Create and start the Lark WSClient with event dispatching.
  * Returns the WSClient instance for lifecycle management.
  */
-export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: string, handlers: EventHandlers, brand: Brand = 'feishu'): Lark.WSClient {
+export function startLarkEventDispatcher(
+  larkAppId: string,
+  larkAppSecret: string,
+  handlers: EventHandlers,
+  brand: Brand = 'feishu',
+  durableInboxShadow?: DurableInboxStore,
+): Lark.WSClient {
   const forwardFollowups = new ForwardFollowupBuffer<PendingForwardTopicPayload>(
     config.daemon.forwardFollowupWaitMs,
     err => logger.error(`Error flushing delayed topic seed: ${err}`),
@@ -5204,6 +5215,12 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
     'im.message.reaction.created_v1': () => {},
     'im.message.reaction.deleted_v1': () => {},
     'im.message.receive_v1': (data: any) => {
+      // The SDK acknowledges when this callback returns. Capture before the
+      // ordinary ACK-safe async scheduler, or a crash could lose accepted input.
+      if (handlers.captureHumanInput?.(data)) {
+        if (data?.message?.message_id) markMessageTriggered(larkAppId, data.message.message_id);
+        return;
+      }
       // Dedupe by message_id (stable across re-pushes / event_id re-mints /
       // daemon restarts), persisted so the 6h re-push tier or a restart can't
       // replay an already-handled message. Fall back to the in-memory event-id
@@ -5221,10 +5238,33 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // execution fence after aliases and chat mode are resolved.
       const scheduled = scheduleAckSafeEvent(
         eventKey,
-        () => serializeByAnchor(
-          ingressAnchor,
-          () => processMessageEvent(data, seedRoutingGate),
-        ),
+        () => {
+          // Shadow ingestion begins only after the callback has returned to the
+          // SDK ACK path. It runs beside the existing SQLite route and cannot
+          // suppress or delay that route on failure. `primary` remains blocked
+          // until a durable claim loop owns processing instead of this mirror.
+          if (durableInboxShadow) {
+            void enqueueDurableLarkMessage(durableInboxShadow, {
+              larkAppId,
+              eventId: eventKey,
+              partitionKey: ingressAnchor,
+              data,
+            }).then(result => {
+              if (result.kind === 'conflict') {
+                logger.error(`[durable-inbox:${larkAppId}] conflicting duplicate event ${eventKey}`);
+              }
+            }).catch(error => {
+              logger.error(
+                `[durable-inbox:${larkAppId}] shadow enqueue failed for ${eventKey}: `
+                + `${error instanceof Error ? error.message : String(error)}`,
+              );
+            });
+          }
+          return serializeByAnchor(
+            ingressAnchor,
+            () => processMessageEvent(data, seedRoutingGate),
+          );
+        },
         'message event',
         claim,
       );

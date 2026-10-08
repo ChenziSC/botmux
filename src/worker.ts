@@ -107,6 +107,13 @@ import {
   READ_ONLY_REMOTE_SCROLL_WINDOW_MS,
   ReadOnlyRemoteScrollLimiter,
 } from './utils/web-terminal-scroll.js';
+import {
+  formatMobileInputModeOsc,
+  getWebTerminalInputMode,
+  MOBILE_INPUT_MODE_OSC_REGEX,
+  setWebTerminalInputMode,
+  type WebTerminalInputMode,
+} from './services/web-terminal-settings-store.js';
 import { aidenCodexResumeNeedsRedraw, CodexUpdateDialogGuard, codexUpdateDialogSafeKeys } from './utils/codex-update-dialog.js';
 import { EffortConfirmDialogGuard, isEffortLevelCommand } from './utils/effort-confirm-dialog.js';
 import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
@@ -153,6 +160,7 @@ import {
   readScheduledTaskAnchors,
   upsertScheduledTaskAnchor,
 } from './services/bridge-scheduled-anchors.js';
+import { checkpointCodexAdoptTurns, restoreCodexAdoptTurns } from './services/codex-adopt-recovery.js';
 import { defaultGatewayEntry, ensureGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
 import {
   sessionMcpGatewayPathRegex,
@@ -3278,7 +3286,10 @@ let currentBotmuxTurnId: string | undefined;
 let currentBotmuxDispatchAttempt: number | undefined;
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
 let durableTurnInFlight = false;
-const activeTurnAuthority = new ActiveTurnAuthority();
+const activeTurnAuthority = new ActiveTurnAuthority((previousTurnId, turnId) => {
+  // Ordered IPC reaches the daemon before any output attributed to the steer.
+  send({ type: 'active_turn_envelope_changed', previousTurnId, turnId });
+});
 
 function turnAuthorityIdentity(input: {
   turnId?: string;
@@ -5020,6 +5031,7 @@ let codexBridgeOffset = 0;
 let codexBridgeDrainState: CodexDrainState | undefined;
 let codexBridgePendingTail = '';
 let codexBridgeBaselineDone = false;
+let codexAdoptRecoveryAttempted = false;
 let publishedActiveRuntime: TraexRuntimeSnapshot = {};
 let activeRuntimePublished = false;
 const codexBridgeQueue = new CodexBridgeQueue(Date.now, notifyTerminalTurnStarted);
@@ -5216,6 +5228,20 @@ function bridgeTurnJournalFilePath(): string | undefined {
   return join(process.env.SESSION_DATA_DIR, 'turn-marks', `${sessionId}.json`);
 }
 
+function codexAdoptJournalPath(): string | undefined {
+  const base = bridgeTurnJournalFilePath();
+  return base && lastInitConfig?.adoptMode && structuredBridgeIsCodex() ? `${base}.codex-adopt` : undefined;
+}
+
+function checkpointCodexAdoptRecovery(): void {
+  const path = codexAdoptJournalPath();
+  // The first attach must consume the previous generation's journal before a
+  // new pre-path input or an early empty drain can replace it.
+  if (!path || !codexBridgeRolloutPath || !codexAdoptRecoveryAttempted) return;
+  try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue); }
+  catch (error: unknown) { log(`Codex adopt checkpoint failed: ${error instanceof Error ? error.message : String(error)}`); }
+}
+
 /** Per-session durable file of built-in CronCreate task → topic anchors.
  *  Sibling of the pending-turn journal; lets a re-attached worker keep
  *  routing scheduled reports to the topic each task was created in. */
@@ -5298,6 +5324,7 @@ function clearBridgeTurnJournalFile(): void {
   const path = bridgeTurnJournalFilePath();
   if (!path) return;
   try { clearBridgeTurnJournal(path); } catch { /* best-effort — session is closing */ }
+  try { clearBridgeTurnJournal(`${path}.codex-adopt`); } catch { /* best-effort */ }
 }
 
 function readSendMarkers(): BridgeSendMarker[] {
@@ -7436,9 +7463,15 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     // "iTerm 手动输入飞书没收到" symptom under late-attach.
     const result = structuredBridgeIngestPath(rolloutPath, 0);
     const cutoff = (codexAdoptStartMs ?? Date.now()) - 5_000;
-    const { history, live } = splitCodexEventsByCutoff(result.events, cutoff);
+    const journalPath = codexAdoptJournalPath();
+    const recover = journalPath && !codexAdoptRecoveryAttempted;
+    const { history, live, restored } = recover
+      ? restoreCodexAdoptTurns(journalPath, rolloutPath, codexBridgeQueue, result.events, cutoff)
+      : { ...splitCodexEventsByCutoff(result.events, cutoff), restored: 0 };
+    if (journalPath) codexAdoptRecoveryAttempted = true;
     codexBridgeQueue.absorb(history);
     codexBridgeQueue.ingest(live);
+    if (restored > 0) log(`Codex adopt restored ${restored} pending turn(s) without re-submitting input`);
     pruneExpiredStructuredHeadsAndEmit('structured split-live attach');
     // Late attach can discover an already-completed live turn in the same
     // drain. Re-drive prompt readiness from that terminal event immediately;
@@ -8329,6 +8362,7 @@ function codexBridgeMarkPendingTurn(
   if (!codexBridgeFallbackActive()) return undefined;
   const turnId = preferredTurnId ?? `codex-${randomBytes(8).toString('hex')}`;
   codexBridgeQueue.mark(turnId, messageText, markTimeMs, dispatchAttempt);
+  checkpointCodexAdoptRecovery();
   return turnId;
 }
 
@@ -8733,6 +8767,7 @@ function drainReliableTerminalBeforeInterrupt(): void {
 
 function emitReadyCodexTurns(): void {
   const ready = codexBridgeQueue.drainEmittable();
+  checkpointCodexAdoptRecovery();
   if (ready.length === 0) return;
   // Turns suppressed as GENUINE SILENCE (model terminated with a bare
   // nothing-to-send sentinel, no `botmux send`). Tracked by object identity —
@@ -9139,6 +9174,26 @@ function applyHerdrWebBindingResult(
       !herdrWebBackend.isWebTerminalOwner(client)
     ) {
       client.send(`\x1b]1989;follower;${size.cols};${size.rows}\x07`);
+    }
+  }
+}
+
+/** Keep already-connected read-only viewers aligned with an owned tmux grid.
+ *
+ * A read-only socket never drives the shared pane, but a writable socket may
+ * resize it later. Without a fresh pin those existing followers keep rendering
+ * at their connection-time dimensions until they reload the page. TmuxPipeBackend
+ * resize/getPaneSize are synchronous, so publish the authoritative post-resize
+ * grid rather than trusting the browser request.
+ */
+function broadcastOwnedTmuxReadOnlyFollowerGrid(): void {
+  if (effectiveBackendType !== 'tmux' || !isPipeMode || lastInitConfig?.adoptMode) return;
+  const size = backend?.getPaneSize?.();
+  if (!size) return;
+  const payload = `\x1b]1989;follower;${size.cols};${size.rows}\x07`;
+  for (const client of wsClients) {
+    if (client.readyState === WebSocket.OPEN && !authedClients.has(client)) {
+      client.send(payload);
     }
   }
 }
@@ -13912,7 +13967,14 @@ async function flushPending(): Promise<void> {
       // Keep that optimization only within one authenticated principal: a
       // different sender must wait for this turn's terminal boundary.
       if (activeTurnBlocks(pendingMessages[0] ?? {})) break;
-      if (shouldStopPendingBatch(item, pendingMessages[0], runtimeSupportsTypeAhead)) break;
+      // Only adapters that explicitly couple serial delivery to their
+      // post-terminal composer fence stop after one ordinary write. Preserve
+      // master's same-batch behavior for every other non-type-ahead adapter.
+      if (shouldStopPendingBatch(
+        item,
+        pendingMessages[0],
+        cliAdapter.postTerminalPromptFence !== true,
+      )) break;
     }
   } finally {
     isFlushing = false;
@@ -19880,7 +19942,11 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       const localTerminalBackend = effectiveBackendType === 'pty'
         || effectiveBackendType === 'tmux'
         || effectiveBackendType === 'zellij';
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      // 避免手机 Webview 或浏览器缓存包含动态首态（如动态 initialMobileInputMode）的 HTML
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+      });
       res.end(getTerminalHtml(hasWrite, platformReadonly || platformReadonlyHint, loginUrl, forceRemoteScroll, localTerminalBackend, allowReadOnlyRemoteScroll));
     });
 
@@ -19963,6 +20029,16 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       // frame #1 of a connection as control, so PTY output can never be mistaken
       // for it. Nothing awaits between `wsClients.add` above and this send.
       try { ws.send(terminalWriteFrame(hasWrite)); } catch { /* already closing */ }
+      const currentInputMode = getWebTerminalInputMode(sessionId);
+      if (hasWrite) {
+        // 带内 OSC 1989 序列：仅下发移动端输入模式 UI 呈现（缓冲上屏 vs 实时输入）。
+        // 安全边界说明：
+        // ① 该帧仅控制客户端工具栏/输入框交互逻辑，不携带或授予任何服务端写权限；
+        // ② 服务端终端输入转发严格受 authedClients 门禁保护；终端内进程若伪造该字节流，
+        //    最多改变前端输入面板交互形态，无法越权写入或绕过授权检查；
+        // ③ 模式帧格式与现有 _hh/_hf/_ho/_fs 同族，遵循相同 OSC 1989 设计规范。
+        try { ws.send(formatMobileInputModeOsc(currentInputMode)); } catch { /* already closing */ }
+      }
       // A signed Dashboard grant is fixed-expiry — for READ scope as much as
       // for write (P1-5). Even if the central proxy's socket invalidation is
       // delayed or bypassed, the worker independently removes any granted
@@ -20162,6 +20238,14 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         ));
         herdrWebBindings.set(ws, herdrWebBinding);
         const initialHerdrSize = herdrWebBinding.sync().initialSize;
+        // A view capability is observational: it must not resize a shared
+        // terminal. Remote Runner already follows the provider grid; owned
+        // tmux pipe sessions need the same rule because their live pane also
+        // drives the Lark screenshot. Letting a narrow read-only browser resize
+        // that pane leaves later screenshots permanently wrapped at its width.
+        const readOnlyFollowsBackendGrid = !hasWrite
+          && (effectiveBackendType === 'remote-runner'
+            || (effectiveBackendType === 'tmux' && isPipeMode && !lastInitConfig?.adoptMode));
         if (initialHerdrSize) {
           ws.send(`\x1b]1989;follower;${initialHerdrSize.cols};${initialHerdrSize.rows}\x07`);
         }
@@ -20181,12 +20265,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
           const sz = (backend as ObserveBackend).getPaneSize();
           if (sz && sz.cols > 0 && sz.rows > 0) ws.send(`\x1b]1989;${sz.cols};${sz.rows}\x07`);
         }
-        // Remote Runner exposes one shared provider-side TUI. A read-only view
-        // follows that grid instead of becoming a resize owner; otherwise merely
-        // opening a narrow card link can shrink the remote tmux and every later
-        // screenshot. A write-capability client keeps the existing responsive
-        // resize semantics.
-        if (!hasWrite && effectiveBackendType === 'remote-runner') {
+        // Pin a read-only viewer to the authoritative grid before sending the
+        // seed. Its FitAddon may still report the browser viewport below, but
+        // that resize stays display-local and is not forwarded to the backend.
+        if (readOnlyFollowsBackendGrid) {
           const sz = backend?.getPaneSize?.() ?? { cols: renderCols, rows: renderRows };
           ws.send(`\x1b]1989;${sz.cols};${sz.rows}\x07`);
         }
@@ -20217,8 +20299,9 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
             if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
               const result = herdrWebBinding.resize(msg.cols, msg.rows);
               applyHerdrWebBindingResult(ws, result);
-              if (!result.backend && (hasWrite || effectiveBackendType !== 'remote-runner')) {
+              if (!result.backend && !readOnlyFollowsBackendGrid) {
                 backend?.resize(msg.cols, msg.rows);
+                broadcastOwnedTmuxReadOnlyFollowerGrid();
               }
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
               // Mouse protocols can encode approvals/actions as well as wheel input.
@@ -20239,6 +20322,14 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               if (!readOnlyRemoteScrollLimiter.tryConsume(parsed.eventCount)) return;
               if (usesHerdrSnapshotWebHistory()) herdrWebScrollDirection = parsed.direction;
               backend?.write(msg.data);
+            } else if (msg.type === 'mobile_input_mode' && (msg.mode === 'buffer' || msg.mode === 'live')) {
+              if (!authedClients.has(ws)) return;
+              setWebTerminalInputMode(msg.mode, sessionId);
+              for (const client of wsClients) {
+                if (client !== ws && authedClients.has(client) && client.readyState === WebSocket.OPEN) {
+                  try { client.send(formatMobileInputModeOsc(msg.mode)); } catch { /* ignore */ }
+                }
+              }
             }
           } catch { /* ignore non-JSON or bad messages */ }
         });
@@ -20272,6 +20363,7 @@ function getTerminalHtml(
   forceRemoteScroll = false,
   localTerminalBackend = false,
   allowReadOnlyRemoteScroll = false,
+  initialMobileInputMode: WebTerminalInputMode = getWebTerminalInputMode(sessionId),
 ): string {
   const label = sessionId.substring(0, 8);
   return `<!DOCTYPE html>
@@ -20477,7 +20569,7 @@ ${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopene
     </div>
   </div>
 </div>
-<form id="mobile-input-bar" autocomplete="off" data-mode="buffer" aria-label="手机输入">
+<form id="mobile-input-bar" autocomplete="off" data-mode="${initialMobileInputMode}" aria-label="手机输入">
   <div id="mobile-bar-keys">
     <button type="button" data-sk="paste">Paste</button>
     <button type="button" data-sk="ctrlc">Ctrl+C</button>
@@ -20527,6 +20619,10 @@ var platformReadonly=${platformReadonly};
 var remoteScroll=${forceRemoteScroll};
 var localTerminalBackend=${localTerminalBackend};
 var readOnlyRemoteScroll=${allowReadOnlyRemoteScroll};
+var _wbInitialMobileInputMode=${JSON.stringify(initialMobileInputMode)};
+var _wbSetMobileInputMode=null;
+var _wbMimRegex=new RegExp(${JSON.stringify(MOBILE_INPUT_MODE_OSC_REGEX.source)});
+var _wbSyncMobileInputMode=function(m){try{if(ws_&&ws_.readyState===1){ws_.send(JSON.stringify({type:'mobile_input_mode',mode:m}));}}catch(_e){}};
 if(!hasToken){
   if(platformReadonly){var _lb=document.getElementById('login-banner');_lb.classList.add('show');}
   else{var _rb=document.getElementById('readonly-banner');_rb.classList.add('show');_rb.addEventListener('click',function(){_rb.classList.remove('show')});}
@@ -21036,6 +21132,10 @@ if(typeof ResizeObserver!=='undefined'){
     // can't be resized, so FitAddon-to-browser would wrap the snapshot lines).
     var _fs=data.match(/\\x1b\\]1989;(\\d+);(\\d+)\\x07/);
     if(_fs){_setFixedGrid(true);var _c=+_fs[1],_r=+_fs[2];if(_c>0&&_r>0){try{term.resize(_c,_r)}catch(ex){}}data=data.replace(_fs[0],'')}
+    // botmux OSC 1989: 移动端输入模式呈现同步（buffer 缓冲 / live 实时）。
+    // 纯显示/交互态控制帧，不改变服务端权限门禁。使用服务端共享正则编译实例。
+    var _mim=data.match(_wbMimRegex);
+    if(_mim){data=data.replace(_mim[0],'');if(_wbSetMobileInputMode){try{_wbSetMobileInputMode(_mim[1]);}catch(ex){}}if(!data)return;}
     // Intercept OSC 52 clipboard sequence from tmux (set-clipboard on)
     var m=data.match(/\\x1b\\]52;[^;]*;([A-Za-z0-9+/=]+)(?:\\x07|\\x1b\\\\)/);
     if(m){try{_clipBuf=new TextDecoder().decode(Uint8Array.from(atob(m[1]),function(c){return c.charCodeAt(0)}));_doCopy(_clipBuf);_showCopied()}catch(ex){}}
@@ -21509,8 +21609,22 @@ if(isTouch&&hasToken){(function(){
   var sendBtn=document.getElementById('mobile-send');
   var hint=document.getElementById('mobile-live-hint');
   var LIVE='live',BUFFER='buffer';
-  var mode=BUFFER;
+  var mode=(typeof _wbInitialMobileInputMode==='string'&&_wbInitialMobileInputMode===LIVE)?LIVE:BUFFER;
   var controls=bar.querySelectorAll('button,textarea');
+
+  function _syncMode(m){try{if(typeof _wbSyncMobileInputMode==='function')_wbSyncMobileInputMode(m);}catch(_e){}}
+  function setExternalMode(m){
+    if(m!==LIVE&&m!==BUFFER)return;
+    if(m===mode)return;
+    if(mode===LIVE&&!sendLiveKey(''))return;
+    if(mode!==LIVE&&ta.value){
+      if(!sendInput(ta.value.replace(/\\x1b/g,'')))return;
+      ta.value='';resizeTa();
+    }
+    setMode(m);
+    if(m===LIVE){mirror.sent=mirror.held='';hint.textContent='实时输入 · 点击显示键盘';}
+  }
+  _wbSetMobileInputMode=setExternalMode;
 
   function setWriteState(v){
     var disabled=v!==true;
@@ -21684,9 +21798,11 @@ if(isTouch&&hasToken){(function(){
     if(mode!==LIVE&&ta.value){
       if(!sendInput(ta.value.replace(/\\x1b/g,'')))return;
       ta.value='';resizeTa();}
-    setMode(mode===LIVE?BUFFER:LIVE);
-    if(mode===LIVE){mirror.sent=mirror.held='';hint.textContent='实时输入 · 点击显示键盘';}
-    showKeyboard();});
+    var nextMode=mode===LIVE?BUFFER:LIVE;
+    setMode(nextMode);
+    if(nextMode===LIVE){mirror.sent=mirror.held='';hint.textContent='实时输入 · 点击显示键盘';}
+    showKeyboard();
+    _syncMode(nextMode);});
 
   bar.addEventListener('submit',function(e){e.preventDefault();submit();});
 
@@ -21719,7 +21835,9 @@ if(isTouch&&hasToken){(function(){
       sendInput('\\x7f');return;}
     if(e.key==='Enter'&&!e.shiftKey&&!mirror.composing&&!e.isComposing){e.preventDefault();submit();}});
 
-  setMode(BUFFER);resizeTa();setWriteState(wsHasWrite);
+  setMode(mode);
+  if(mode===LIVE){mirror.sent=mirror.held='';hint.textContent='实时输入 · 点击显示键盘';}
+  resizeTa();setWriteState(wsHasWrite);
   if(typeof ResizeObserver!=='undefined'){
     try{new ResizeObserver(measureBar).observe(bar)}catch(_e){}
   }

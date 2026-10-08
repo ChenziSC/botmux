@@ -12,6 +12,22 @@ function functionSlice(name: string, nextName: string): string {
 }
 
 describe('worker structured-turn status wiring', () => {
+  it('checkpoints adopted Codex attribution at mark and terminal boundaries and restores once at attach', () => {
+    const scope = functionSlice('codexAdoptJournalPath', 'checkpointCodexAdoptRecovery');
+    expect(scope).toContain('lastInitConfig?.adoptMode && structuredBridgeIsCodex()');
+    const mark = functionSlice('codexBridgeMarkPendingTurn', 'finalizeRpcTurnTerminal');
+    expect(mark.indexOf('checkpointCodexAdoptRecovery()')).toBeGreaterThan(mark.indexOf('codexBridgeQueue.mark('));
+    const emit = source.slice(source.indexOf('function emitReadyCodexTurns()'), source.indexOf('function emitReadyCodexTurns()') + 300);
+    expect(emit.indexOf('checkpointCodexAdoptRecovery()')).toBeGreaterThan(emit.indexOf('drainEmittable()'));
+    expect(emit.indexOf('checkpointCodexAdoptRecovery()')).toBeLessThan(emit.indexOf('if (ready.length === 0)'));
+    const attach = source.slice(source.indexOf('function codexBridgeAttach('), source.indexOf('function codexBridgeAttach(') + 4_000);
+    expect(attach).toContain('!codexAdoptRecoveryAttempted');
+    expect(attach).toContain('codexAdoptRecoveryAttempted = true');
+    expect(attach.indexOf('codexAdoptRecoveryAttempted = true')).toBeGreaterThan(attach.indexOf('restoreCodexAdoptTurns('));
+    expect(attach.indexOf('restoreCodexAdoptTurns(')).toBeLessThan(attach.indexOf('codexBridgeQueue.absorb(history)'));
+    const checkpoint = functionSlice('checkpointCodexAdoptRecovery', 'scheduledTaskAnchorsFilePath');
+    expect(checkpoint).toContain('!codexAdoptRecoveryAttempted');
+  });
   it('rejects a prompt heuristic before publishing ready or clearing in-flight input', () => {
     const body = functionSlice('markPromptReady', 'persistCliSessionId');
     const lifecycleGate = body.indexOf('hasStructuredLifecycleBlock()');
@@ -558,6 +574,19 @@ describe('worker structured-turn status wiring', () => {
     const adoptFence = adopt.indexOf('postTerminalPromptFenceHolds(evidenceSource, idleBackend)');
     expect(adoptDrain).toBeGreaterThanOrEqual(0);
     expect(adoptFence).toBeGreaterThan(adoptDrain);
+  });
+
+  it('limits ordinary flush batches only for post-terminal-fence adapters', () => {
+    const flush = functionSlice('flushPending', 'sendToPty');
+    const batchStop = flush.indexOf('if (shouldStopPendingBatch(');
+    const serialOptIn = flush.indexOf(
+      'cliAdapter.postTerminalPromptFence !== true',
+      batchStop,
+    );
+    expect(batchStop).toBeGreaterThanOrEqual(0);
+    expect(serialOptIn).toBeGreaterThan(batchStop);
+    expect(flush.slice(batchStop, serialOptIn))
+      .not.toContain('runtimeSupportsTypeAhead');
   });
 
   it('quarantines unconfirmed adapter submits without replaying them or their successors', () => {

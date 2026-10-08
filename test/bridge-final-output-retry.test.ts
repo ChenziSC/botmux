@@ -18,6 +18,7 @@ import { dashboardEventBus } from '../src/core/dashboard-events.js';
 
 const topicDetailMock = vi.fn(async () => ({ items: [{ message_id: 'om_root', deleted: true }] }));
 const updateMessageMock = vi.fn(async () => {});
+const uploadImageMock = vi.fn(async (_appId: string, _image: string | Buffer) => 'img_v3_uploaded_preview');
 const addReactionMock = vi.fn(async () => 'reaction_id');
 const replyToDocCommentMock = vi.fn(async () => {});
 const removeCommentReactionMock = vi.fn(async () => {});
@@ -30,6 +31,7 @@ const resolveAllowedUsersWithMapMock = vi.fn(async (_appId: string, entries: str
 vi.mock('../src/im/lark/client.js', () => ({
   getMessageDetail: (...args: any[]) => topicDetailMock(...args),
   updateMessage: (...args: any[]) => updateMessageMock(...args),
+  uploadImage: (appId: string, image: string | Buffer) => uploadImageMock(appId, image),
   addReaction: (...args: any[]) => addReactionMock(...args),
   resolveAllowedUsersWithMap: (...args: any[]) => resolveAllowedUsersWithMapMock(...args),
   removeReaction: vi.fn(async () => {}),
@@ -118,6 +120,12 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
   saveFrozenCards: vi.fn(),
 }));
 
+vi.mock('../src/services/session-lifecycle-hooks.js', () => ({
+  emitSessionLifecycleHook: vi.fn(() => true),
+  emitSessionStateTransitionHook: vi.fn(() => true),
+  setSessionLifecycleShutdown: vi.fn(),
+}));
+
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class { constructor() {} },
   WSClient: class { start() {} },
@@ -136,6 +144,7 @@ import {
   setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
+import { emitSessionLifecycleHook } from '../src/services/session-lifecycle-hooks.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { EventEmitter } from 'node:events';
@@ -272,6 +281,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await __testOnly_closeSkillFeedbackStores();
     vi.useFakeTimers();
     vi.clearAllMocks();
+    uploadImageMock.mockReset().mockResolvedValue('img_v3_uploaded_preview');
     resolveAllowedUsersWithMapMock.mockImplementation(async (_appId: string, entries: string[]) => ({
       resolved: entries,
       map: new Map(entries.map(entry => [entry, entry])),
@@ -299,6 +309,285 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     clearMessageListenerRunPreviewStore();
     vi.useRealTimers();
   });
+
+  it.each(['bridge', 'local-turn', 'local-turn-headless'] as const)(
+    'forwards %s screenshot replies without exposing a local path as an image key', async kind => {
+      const sessionReply = vi.fn(async (_anchor: string, card: string) => {
+        if (card.includes('![Preview](/tmp/preview.png)')) {
+          throw new Error('card contains invalid image keys');
+        }
+        return 'om_reply';
+      });
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.session.cliId = 'codex';
+      if (kind === 'bridge') ds.adoptedFrom = undefined;
+      const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+      deliver(ds, { ...finalOutputMsg(), kind, content: 'Ready.\n\n![Preview](/tmp/preview.png)', userText: 'Show preview' }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(sessionReply).toHaveBeenCalledOnce();
+      expect(sessionReply.mock.calls[0][1]).toContain('Ready.');
+      expect(sessionReply.mock.calls[0][1]).toContain('[Image omitted]');
+      expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    },
+  );
+
+  it.each(['bridge', 'local-turn', 'local-turn-headless'] as const)('uploads an adopted session screenshot before delivering the %s card', async kind => {
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=', 'base64');
+    const image = `${config.session.dataDir}/preview.png`;
+    writeFileSync(image, png);
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.workingDir = config.session.dataDir;
+    ds.session.cliId = 'codex';
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), kind, content: `Ready.\n\n![Preview](${image})` }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledOnce());
+    expect(uploadImageMock).toHaveBeenCalledExactlyOnceWith('app_test', png);
+    expect(sessionReply.mock.calls[0][1]).toContain('![Preview](img_v3_uploaded_preview)');
+    expect(sessionReply.mock.calls[0][1]).not.toContain('[Image omitted]');
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('uploads a Claude adopt preamble screenshot but never uploads paths from its quoted user text', async () => {
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=', 'base64');
+    writeFileSync(`${config.session.dataDir}/preview.png`, png);
+    writeFileSync(`${config.session.dataDir}/input.png`, png);
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.workingDir = config.session.dataDir;
+    if (!ds.worker) throw new Error('Missing fixture worker');
+    __testOnly_setupWorkerHandlers(ds, ds.worker);
+    ds.worker.emit('message', {
+      type: 'adopt_preamble', turnId: 'turn-adopt',
+      userText: 'Check ![Input](input.png)', assistantText: 'Ready. ![Preview](preview.png)',
+    });
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledOnce());
+    expect(uploadImageMock).toHaveBeenCalledExactlyOnceWith('app_test', png);
+    expect(sessionReply.mock.calls[0][1]).toContain('![Preview](img_v3_uploaded_preview)');
+    expect(sessionReply.mock.calls[0][1]).toContain('[Image omitted] [Input]');
+  });
+
+  it.each(['non-adopted', 'sandbox', 'read-isolation', 'remote', 'api-only'])(
+    'does not add host image uploads to %s sessions', async mode => {
+      writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
+      const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.workingDir = config.session.dataDir;
+      if (mode === 'non-adopted') ds.adoptedFrom = undefined;
+      if (mode === 'sandbox') ds.session.sandbox = true;
+      if (mode === 'remote') ds.session.backendType = 'remote-runner';
+      const bot = getBot('app_test');
+      if (mode === 'read-isolation') bot.config.readIsolation = true;
+      if (mode === 'api-only') bot.config.apiOnly = true;
+      vi.mocked(getBot).mockReturnValue(bot);
+      const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+      deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](preview.png)' }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(uploadImageMock).not.toHaveBeenCalled();
+      expect(sessionReply).toHaveBeenCalledOnce();
+      expect(sessionReply.mock.calls[0][1]).toContain('Ready.');
+    },
+  );
+
+  it('reuses the uploaded key and UUID after a final-output send failure', async () => {
+    writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error('network error')).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.workingDir = config.session.dataDir;
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](preview.png)' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(uploadImageMock).toHaveBeenCalledOnce();
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls[0][1]).toContain('img_v3_uploaded_preview');
+    expect(sessionReply.mock.calls[1][1]).toBe(sessionReply.mock.calls[0][1]);
+    expect(sessionReply.mock.calls[1][5].uuid).toBe(sessionReply.mock.calls[0][5].uuid);
+  });
+
+  it('delivers the body when the automatic image upload fails', async () => {
+    writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
+    uploadImageMock.mockRejectedValueOnce(new Error('upload failed'));
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.workingDir = config.session.dataDir;
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](preview.png)' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(uploadImageMock).toHaveBeenCalledOnce();
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(sessionReply.mock.calls[0][1]).toContain('Ready.');
+    expect(sessionReply.mock.calls[0][1]).toContain('[Image omitted]');
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('does not send a completed upload after the adopted worker loses ownership', async () => {
+    writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
+    let owned = true;
+    uploadImageMock.mockImplementationOnce(async () => {
+      owned = false;
+      return 'img_v3_uploaded_preview';
+    });
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.workingDir = config.session.dataDir;
+    const complete = vi.fn();
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](preview.png)' }, 'tag', 0, complete, () => owned);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(uploadImageMock).toHaveBeenCalledOnce();
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    expect(complete).toHaveBeenCalledExactlyOnceWith(false);
+  });
+
+  it('forwards an adopt preamble with local screenshots in both sides of the exchange', async () => {
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.cliId = 'codex';
+    if (!ds.worker) throw new Error('Missing fixture worker');
+    __testOnly_setupWorkerHandlers(ds, ds.worker);
+    ds.worker.emit('message', {
+      type: 'adopt_preamble', turnId: 'turn-adopt',
+      userText: 'Check ![Input](/tmp/input.png)',
+      assistantText: 'Ready. ![Preview](/tmp/preview.png)',
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    const card = sessionReply.mock.calls[0][1];
+    expect(card).toContain('Ready.');
+    expect(card).toContain('Check');
+    expect(card).not.toContain('![Input]');
+    expect(card).not.toContain('![Preview]');
+  });
+
+  it('downgrades only rejected image keys and retries the image-free card with the same UUID', async () => {
+    const invalidImage = { response: { status: 400, data: {
+      code: 230099, msg: 'Failed to create card content, ErrCode: 200570; ErrMsg: card contains invalid image keys',
+    } } };
+    const sessionReply = vi.fn()
+      .mockRejectedValueOnce(invalidImage)
+      .mockRejectedValueOnce(new Error('network error'))
+      .mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    const complete = vi.fn();
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](img_v3_rejected)' }, 'tag', 0, complete);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledTimes(3);
+    expect(sessionReply.mock.calls[0][1]).toContain('![Preview](img_v3_rejected)');
+    for (const call of sessionReply.mock.calls.slice(1)) {
+      expect(call[1]).toContain('Ready.');
+      expect(call[1]).toContain('[Image omitted]');
+      expect(call[1]).not.toContain('![Preview]');
+      expect(call[2]).toBe('interactive');
+      expect(call[5].uuid).toBe(sessionReply.mock.calls[0][5].uuid);
+    }
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    expect(complete).toHaveBeenCalledExactlyOnceWith(true, 'om_reply');
+  });
+
+  it.each([
+    { response: { status: 400, data: { code: 230099, msg: 'Invalid card schema' } } },
+    { response: { status: 400, data: { code: 230001, msg: 'Invalid request' } } },
+    { response: { status: 400, data: { code: 230099, msg: 'ErrCode: 200571; card contains invalid image keys' } } },
+    new Error('Request failed with status code 400'),
+    new Error('card contains invalid image keys'),
+  ])('does not treat an unrelated rejection as permission to downgrade images: %j', async error => {
+    const sessionReply = vi.fn().mockRejectedValueOnce(error).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](img_v3_key)' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls[1][1]).toBe(sessionReply.mock.calls[0][1]);
+  });
+
+  it('uses the same image-free fallback for an adopt preamble and a flattened SDK error', async () => {
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error(
+      'Failed to reply message: ErrCode: 200570; ErrMsg: card contains invalid image keys (code: 230099)',
+    )).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    if (!ds.worker) throw new Error('Missing fixture worker');
+    __testOnly_setupWorkerHandlers(ds, ds.worker);
+    ds.worker.emit('message', {
+      type: 'adopt_preamble', turnId: 'turn-adopt', userText: 'Show preview',
+      assistantText: 'Ready. ![Preview](img_v3_rejected)',
+    });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls[1][1]).toContain('[Image omitted]');
+    expect(sessionReply.mock.calls[1][1]).toContain('Ready.');
+    expect(sessionReply.mock.calls[1][1]).not.toContain('![Preview]');
+    expect(sessionReply.mock.calls[1][4]).toBe('turn-adopt');
+  });
+
+  it('does not send the image fallback after the worker loses ownership', async () => {
+    let owned = true;
+    const sessionReply = vi.fn(async () => {
+      owned = false;
+      throw new Error('Failed to reply message: ErrCode: 200570; card contains invalid image keys (code: 230099)');
+    });
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    const complete = vi.fn();
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](img_v3_key)' }, 'tag', 0, complete, () => owned);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    expect(complete).toHaveBeenCalledExactlyOnceWith(false);
+  });
+
+  it.each([['codex', false], ['claude-code', true]] as const)(
+    'persists the actual downgraded %s bridge card with an existing message=%s', async (cliId, existing) => {
+      vi.useRealTimers();
+      getBot('app_test').config.replyCardMode = 'unified';
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.session.cliId = cliId;
+      ds.currentTurnId = 'om_image_turn';
+      const sessionReply = vi.fn(async () => 'om_image_reply');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const { updateTurnReplyCard } = await import('../src/core/turn-reply-card.js');
+      if (existing) await updateTurnReplyCard(ds, ds.currentTurnId, { kind: 'start' }, sessionReply);
+      const error = new Error('ErrCode: 200570; card contains invalid image keys (code: 230099)');
+      if (existing) updateMessageMock.mockRejectedValueOnce(error);
+      else sessionReply.mockRejectedValueOnce(error);
+      const complete = vi.fn();
+      const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+      deliver(ds, { ...finalOutputMsg(), turnId: ds.currentTurnId, kind: 'bridge', content: 'Answer. ![Preview](img_v3_rejected)' }, 'tag', 0, complete);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledExactlyOnceWith(true, 'om_image_reply'));
+      const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+      const record = new TurnReplyCardStore(config.session.dataDir).read({
+        larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
+      });
+      expect(record?.finalCard).toContain('[Image omitted]');
+      expect(record?.lastCard).not.toContain('![Preview]');
+      expect(record?.finalDelivered).toBe(true);
+      await updateTurnReplyCard(ds, ds.currentTurnId, { kind: 'terminal', phase: 'completed' }, sessionReply);
+      expect(updateMessageMock.mock.calls.at(-1)?.[2]).toContain('Answer.');
+      expect(updateMessageMock.mock.calls.at(-1)?.[2]).not.toContain('![Preview]');
+      expect(sessionReply).toHaveBeenCalledTimes(existing ? 1 : 2);
+      expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    },
+  );
 
   it.each(['bridge', 'explicit'] as const)('keeps the %s answer and Oncall source in the existing reply card', async source => {
     vi.useRealTimers();
@@ -3353,6 +3642,72 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(sessionReply).toHaveBeenCalledTimes(3);
     expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    expect(closeSession).not.toHaveBeenCalled();
+  });
+
+  it('treats a Lark content-audit rejection as permanent: no retries, visible notice, settled', async () => {
+    const auditError = {
+      isAxiosError: true,
+      name: 'AxiosError',
+      message: 'Request failed with status code 400',
+      config: { method: 'post', url: 'https://open.feishu.cn/open-apis/im/v1/messages' },
+      response: { status: 400, data: { code: 230028, msg: 'contain sensitive data: EMAIL_ADDRESS' } },
+    };
+    // Primary reply is audit-rejected; the follow-up notice (same reply channel) succeeds.
+    const sessionReply = vi
+      .fn()
+      .mockRejectedValueOnce(auditError)
+      .mockResolvedValueOnce('om_notice');
+    const closeSession = vi.fn();
+    const complete = vi.fn();
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession,
+    });
+
+    const ds = makeDs();
+    // Use PRODUCTION-LENGTH ids: randomUUID sessionId (36) + om_ turnId (~35).
+    // Naive concatenation would build an 80+ char dedupe uuid, which Feishu
+    // hard-rejects at 50 — defeating this very notice. The fixture's short ids
+    // (sid-final-out/turn-1) hid that in the first iteration.
+    ds.session.sessionId = '01234567-89ab-4def-8234-56789abcdef0';
+    const productionMsg = { ...finalOutputMsg(), turnId: 'om_x100b63519db838a4b32f' };
+    vi.mocked(emitSessionLifecycleHook).mockClear();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, productionMsg, 'tag', 0, complete);
+
+    await vi.advanceTimersByTimeAsync(0);
+    // Even after the full backoff window elapses, attempts stay at 2:
+    // rejected primary + one audit notice, never a same-payload retry.
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+
+    // The second call is the audit-safe notice (plain text), carrying the code
+    // and a dedup uuid that respects Feishu's 50-char hard cap — never the
+    // rejected answer body.
+    const noticeCall = sessionReply.mock.calls[1];
+    expect(noticeCall[2]).toBe('text');
+    expect(String(noticeCall[1])).toContain('230028');
+    expect(String(noticeCall[1])).not.toContain('final answer');
+    const noticeUuid = noticeCall[5].uuid as string;
+    expect(noticeUuid.startsWith('ab_')).toBe(true);
+    expect(noticeUuid.length).toBe(50);
+
+    // The turn settles (identical retransmits cannot pass the audit) and the
+    // dashboard attention row is lit.
+    expect(ds.lastBridgeEmittedUuid).toBe('01234567-89ab-4def-8234-56789abcdef0:uuid-1');
+    expect(complete).toHaveBeenCalledWith(true);
+    expect(ds.agentAttention).toMatchObject({ kind: 'blocked' });
+    // External lifecycle channel must see the block, matching the
+    // TOPIC_SEND_BLOCKED branch (operators may route on session.requires_attention).
+    expect(emitSessionLifecycleHook).toHaveBeenCalledWith(
+      ds,
+      'session.requires_attention',
+      expect.objectContaining({ reason: 'content_audit_blocked', turnId: productionMsg.turnId }),
+    );
     expect(closeSession).not.toHaveBeenCalled();
   });
 

@@ -1,7 +1,8 @@
 import { trackStartingCardPublication } from './starting-card-publication.js';
+import { privateReplyEnabled } from './private-reply.js';
 import { handoffCardClosed, handoffCardBlocksStreaming, applyHandoffCardEvent, type HandoffCardEvent } from './handoff-card-lifecycle.js';
 import { assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../cli/topic-send-guard.js';
-import { getMessageDetail as getTopicMessageDetail } from '../im/lark/client.js';
+import { getMessageDetail as getTopicMessageDetail, uploadImage } from '../im/lark/client.js';
 import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTriggerStreamingCard } from './trigger-streaming-card.js';
 import { sessionPromptInjection } from './prompt-injection.js';
 import { sandboxBoolValue, normalizeSandboxMode, normalizeScratchStorage } from '../adapters/cli/sandbox-mode.js';
@@ -100,6 +101,8 @@ import {
   type CardUsageSnapshot,
   type LocalHomeLinkMode,
 } from '../im/lark/md-card.js';
+import { replyWithImageFallback } from '../im/lark/card-image-fallback.js';
+import { resolveReplyImages, type ReplyImageState } from '../im/lark/reply-images.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
 import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, abortCotMessage } from '../im/lark/cot-message.js';
@@ -130,6 +133,7 @@ import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
+import { isLarkContentAuditError, larkErrorCode } from '../im/lark/content-audit.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from '../services/model-pricing.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
@@ -351,6 +355,25 @@ function daemonCardLocalHomeLinkMode(ds: DaemonSession): LocalHomeLinkMode {
     || sandboxEnabled()
     ? 'lexical'
     : 'filesystem';
+}
+
+function prepareAdoptedReplyImages(
+  ds: DaemonSession,
+  markdown: string,
+  state: ReplyImageState,
+  owns: () => boolean,
+): Promise<string> {
+  const botCfg = getBot(ds.larkAppId).config;
+  const workingDir = ds.workingDir ?? ds.session.workingDir ?? ds.adoptedFrom?.cwd;
+  if (!(ds.adoptedFrom || ds.session.adoptedFrom) || !workingDir || ds.session.vcMeetingReceiver
+    || botCfg.apiOnly || daemonCardLocalHomeLinkMode(ds) !== 'filesystem'
+    || sandboxBoolValue(ds.session.sandbox ?? ds.initConfig?.sandbox ?? botCfg.sandbox)
+    || (ds.initConfig?.readIsolation ?? botCfg.readIsolation)) return Promise.resolve(markdown);
+  return resolveReplyImages(markdown, {
+    workingDir, state,
+    owns: () => owns() && ds.session.status !== 'closed',
+    upload: bytes => uploadImage(ds.larkAppId, bytes),
+  });
 }
 
 /** Read one frozen native-usage snapshot at the reply boundary. Card delivery
@@ -1085,6 +1108,7 @@ export function isDisposableCommandScratch(ds: DaemonSession): boolean {
 // takes effect without a daemon restart. The `/card` command can override it
 // per-session via `ds.streamingCardForced` (manually summon a live card).
 function streamingCardDisabled(ds: DaemonSession, turnId?: string): boolean {
+  if (privateReplyEnabled(ds.session)) return true;
   if (isDocNativeSession(ds) || handoffCardBlocksStreaming(ds, turnId)) return true;
   if (ds.streamingCardForced) return false;
   try {
@@ -1710,6 +1734,9 @@ export function ensureOrdinaryTurnRecoveryAttached(
     cancel: timer => clearTimeout(timer),
     persist: () => sessionStore.updateSession(ds.session),
     mintContinuationTurnId: logicalTurnId => mintScheduledContinuationTurnId(logicalTurnId),
+    prepare: dispatch => parseScheduledTurnId(dispatch.logicalTurnId)
+      ? callbacks?.prepareRawInputTurn?.(ds, dispatch.turnId)
+      : undefined,
     enqueue: (dispatch: OrdinaryTurnRecoveryDispatch) => {
       if (!ordinaryTurnRecoveryEligible(ds) || !ordinaryTurnRecoveryStillOwnsSession(ds)) return false;
       // A scheduled logical turn continues as the same scheduled turn: same
@@ -4910,9 +4937,10 @@ export function ensureCliEnv(cliId: CliId, cliPathOverride?: string): void {
 const GLOBAL_CLAUDE_SKILLS_DIR = '~/.claude/skills';
 const GLOBAL_PI_SKILLS_DIR = '~/.pi/agent/skills';
 const GLOBAL_OMP_SKILLS_DIR = '~/.omp/agent/skills';
+const GLOBAL_CURSOR_SKILLS_DIR = '~/.cursor/skills';
 
 /** Unconditionally sweep botmux-owned skills out of the user's global
- *  `~/.claude/skills`, `~/.pi/agent/skills`, and `~/.omp/agent/skills`. botmux owns the `botmux-` namespace
+ *  `~/.claude/skills`, `~/.pi/agent/skills`, `~/.omp/agent/skills`, and `~/.cursor/skills`. botmux owns the `botmux-` namespace
  *  there and injects its skills per-session dynamically, so anything matching is a
  *  leak that would otherwise surface (and mis-fire) in the user's standalone CLI.
  *  Idempotent & best-effort — safe to call repeatedly. */
@@ -4920,6 +4948,7 @@ export function sweepGlobalBotmuxSkills(): void {
   removeGlobalBotmuxSkills(GLOBAL_CLAUDE_SKILLS_DIR);
   removeGlobalBotmuxSkills(GLOBAL_PI_SKILLS_DIR);
   removeGlobalBotmuxSkills(GLOBAL_OMP_SKILLS_DIR);
+  removeGlobalBotmuxSkills(GLOBAL_CURSOR_SKILLS_DIR);
 }
 
 let globalBotmuxSkillsCleaned = false;
@@ -16750,11 +16779,13 @@ function setupWorkerHandlers(
         }
         if (managedAuxUiSuppressed(msg.turnId)) break;
         if (!msg.userText.trim() && !msg.assistantText.trim()) break;
+        const assistantText = await prepareAdoptedReplyImages(ds, msg.assistantText, { omitImages: false }, ownsLifecycleMutation);
+        if (!ownsLifecycleMutation()) break;
         const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
         const cardJson = buildContextualReplyCard({
           title: tr('card.adopt_last_round', undefined, localeForBot(ds.larkAppId)),
           userText: msg.userText,
-          assistantText: msg.assistantText,
+          assistantText,
           assistantLabel: sessionCliDisplayName(ds, botCfg),
           recipientOpenId,
           brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
@@ -16763,8 +16794,11 @@ function setupWorkerHandlers(
           localHomeLinkMode: daemonCardLocalHomeLinkMode(ds),
           usage: getDaemonReplyCardUsageSnapshot(ds, effectiveCliId),
         });
-        scopedReply(cardJson, 'interactive', msg.turnId).catch((err: any) => {
-          logger.warn(`[${t}] Failed to deliver adopt_preamble to Lark: ${err.message}`);
+        replyWithImageFallback(cardJson, 'interactive', content => {
+          if (!ownsLifecycleMutation()) return Promise.reject(new Error('Adopt worker ownership changed'));
+          return scopedReply(content, 'interactive', msg.turnId);
+        }).catch((err: unknown) => {
+          logger.warn(`[${t}] Failed to deliver adopt_preamble to Lark: ${err instanceof Error ? err.message : String(err)}`);
         });
         break;
       }
@@ -17421,6 +17455,7 @@ function deliverFinalOutput(
   frozenReplyTarget?: FrozenSessionReplyTarget,
   frozenUsage?: CardUsageSnapshot,
   frozenInitiator?: ZeroPromptFinalInitiator | null,
+  imageFallback: ReplyImageState = { omitImages: false },
 ): void {
   if (!isStillOwned()) {
     onComplete?.(false);
@@ -17553,17 +17588,22 @@ function deliverFinalOutput(
     msgType?: string,
     turnId?: string,
     opts?: Omit<WorkerSessionReplyOptions, 'sourceSessionId'>,
-  ) => cb.sessionReply(
-    sessionAnchorId(ds),
-    content,
-    msgType,
-    ds.larkAppId,
-    fallbackTurnId(ds, turnId),
-    { ...opts, sourceSessionId: ds.session.sessionId, ...(topicMessageLookup ? { topicMessageLookup } : {}), beforeWrite: async () => {
-      if (opts?.beforeWrite) await opts.beforeWrite();
-      if (!isStillOwned()) throw new Error('Final output no longer owns delivery');
-    } },
-  );
+  ) => {
+    if (!isStillOwned() || ds.session.status === 'closed') {
+      return Promise.reject(new Error('Final output ownership changed or session closed'));
+    }
+    return cb.sessionReply(
+      sessionAnchorId(ds),
+      content,
+      msgType,
+      ds.larkAppId,
+      fallbackTurnId(ds, turnId),
+      { ...opts, sourceSessionId: ds.session.sessionId, ...(topicMessageLookup ? { topicMessageLookup } : {}), beforeWrite: async () => {
+        if (opts?.beforeWrite) await opts.beforeWrite();
+        if (!isStillOwned() || ds.session.status === 'closed') throw new Error('Final output no longer owns delivery');
+      } },
+    );
+  };
   setTimeout(async () => {
     if (!isStillOwned()) {
       logger.info(`[${t}] Bridge final_output abandoned — worker/session ownership changed`);
@@ -17755,6 +17795,8 @@ function deliverFinalOutput(
       const safeUserText = managedReceiver && msg.userText !== undefined
         ? neutralizeLarkAtTags(msg.userText)
         : msg.userText;
+      const renderedAssistantText = await prepareAdoptedReplyImages(ds, safeAssistantText, imageFallback, isStillOwned);
+      if (!isStillOwned()) { onComplete?.(false); return; }
       const recipientOpenId = managedReceiver
         ? undefined
         : imOrigin?.replyTargetSenderOpenId
@@ -17766,8 +17808,8 @@ function deliverFinalOutput(
         ? failureNoticeFallbackMentionOpenId(ds)
         : undefined;
       const deliveredAssistantText = failureMentionOpenId
-        ? `<at id=${failureMentionOpenId}></at> ${safeAssistantText}`
-        : safeAssistantText;
+        ? `<at id=${failureMentionOpenId}></at> ${renderedAssistantText}`
+        : renderedAssistantText;
       const localHomeLinkMode = daemonCardLocalHomeLinkMode(ds);
       // forkWorker snapshots the effective policy for this worker lifetime.
       // Keep daemon fallback delivery aligned with the same frozen policy the
@@ -17822,7 +17864,7 @@ function deliverFinalOutput(
         ? buildContextualReplyCard({
             title: localTurnTitle,
             userText: msg.kind === 'local-turn' ? safeUserText ?? '' : undefined,
-            assistantText: safeAssistantText,
+            assistantText: renderedAssistantText,
             assistantLabel: storedSessionCliDisplayName(ds),
             recipientOpenId,
             brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
@@ -17998,14 +18040,19 @@ function deliverFinalOutput(
             frozenReplyTarget ? { uuid, beforeWrite, replyTarget: frozenReplyTarget } : { uuid, beforeWrite }),
           { dispatchAttempt: msg.dispatchAttempt, owns: isStillOwned })
         : undefined;
-      const messageId = unifiedReply?.messageId ?? await scopedReply(
-        canonicalOutput.content,
+      const sendFinal = (content: string) => scopedReply(
+        content,
         canonicalOutput.msgType,
         msg.replyTurnId ?? msg.turnId,
         frozenReplyTarget && !managedReceiver
           ? { ...deliveryReplyOptions, replyTarget: frozenReplyTarget }
           : deliveryReplyOptions,
       );
+      // Unified cards persist their own image downgrade. Managed VC replies
+      // retain their audited payload; only legacy replies use this fallback.
+      const messageId = unifiedReply?.messageId ?? await (managedReceiver
+        ? sendFinal(canonicalOutput.content)
+        : replyWithImageFallback(canonicalOutput.content, canonicalOutput.msgType, sendFinal, imageFallback));
       if (!isStillOwned()) { onComplete?.(true); return; }
       recordPrimaryOutput(messageId);
       const explicit = unifiedReply?.record.finalSource === 'explicit' ? unifiedReply.record : undefined;
@@ -18064,6 +18111,51 @@ function deliverFinalOutput(
         onComplete?.(true);
         return;
       }
+      if (isLarkContentAuditError(err)) {
+        // The platform PERMANENTLY rejected this payload (tenant DLP / content
+        // audit: e.g. an email address or phone number in the answer). Retrying
+        // unchanged cannot succeed and only burns 22s of backoff while leaving
+        // the thread with zero signal — the CoT bubble already says "done".
+        // Post a fixed, audit-safe notice (never the rejected body), settle the
+        // turn, and light the dashboard attention row.
+        const auditCode = larkErrorCode(err);
+        logger.error(
+          `[${t}] Bridge final_output rejected by Lark content audit code=${auditCode ?? 'unknown'} `
+          + `(turn ${msg.turnId.substring(0, 8)}); not retrying`,
+        );
+        const locale = localeForBot(ds.larkAppId);
+        const notice = tr('worker.final_output_content_audit_blocked', { code: String(auditCode ?? 'unknown') }, locale);
+        // Feishu IM uuid hard cap is 50 chars; raw sessionId(36)+turnId(~35)
+        // concatenation is 80+ and would itself be rejected (silently defeating
+        // this very notice) or truncated so multiple blocks share one dedupe key.
+        // Hash the composite to a stable 50-char token.
+        const noticeUuid = `ab_${createHash('sha256')
+          .update(`audit-blocked:${ds.session.sessionId}:${msg.turnId}`)
+          .digest('hex')
+          .slice(0, 47)}`;
+        try {
+          await scopedReply(
+            notice,
+            'text',
+            msg.replyTurnId ?? msg.turnId,
+            { uuid: noticeUuid },
+          );
+        } catch (noticeError) {
+          logger.warn(`[${t}] content-audit notice delivery failed: ${noticeError instanceof Error ? noticeError.message : String(noticeError)}`);
+        }
+        ds.agentAttention = { kind: 'blocked', reason: `content audit ${auditCode ?? 'unknown'}`, at: Date.now() };
+        publishAttentionPatch(ds);
+        emitSessionLifecycleHook(ds, 'session.requires_attention', {
+          reason: 'content_audit_blocked',
+          message: `Lark content audit ${auditCode ?? 'unknown'} rejected the final reply`,
+          turnId: msg.turnId,
+        });
+        // Same content can never be delivered as-is; settle like an explicit
+        // withdrawal instead of leaving the turn open for identical retransmits.
+        ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+        onComplete?.(true);
+        return;
+      }
       if (err instanceof TopicSendError && err.code === 'TOPIC_SEND_BLOCKED') {
         // The original topic cannot receive a notice. Surface the failure on the
         // existing Dashboard attention channel without changing the send route.
@@ -18109,7 +18201,7 @@ function deliverFinalOutput(
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage, initiator);
+      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage, initiator, imageFallback);
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
 }

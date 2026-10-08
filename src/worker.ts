@@ -16924,8 +16924,8 @@ async function spawnCli(
   else delete childEnv.BOTMUX_API_ONLY;
   // Scope and topic identity come from this Worker, after configurable envs.
   childEnv.BOTMUX_SESSION_SCOPE = cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat';
-  if (childEnv.BOTMUX_SESSION_SCOPE === 'thread') childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
-  else delete childEnv.BOTMUX_ROOT_MESSAGE_ID;
+  // Ask/browser approval require this anchor for both thread and chat sessions.
+  childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
   applySessionOwnerEnv(childEnv, cfg.ownerOpenId);
   // This bot's resolved brandLabel template, injected so a SANDBOXED `botmux
   // send` renders the role-name footer without reading bots.json (deny-by-

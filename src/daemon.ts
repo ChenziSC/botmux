@@ -29122,6 +29122,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         if (!ds || ds.session.vcMeetingReceiver || !['chat', 'thread'].includes(ds.scope)) return undefined;
         return { sessionId: id, larkAppId: ds.larkAppId, chatId: ds.chatId,
           anchor: ds.scope === 'chat' ? ds.chatId : ds.session.rootMessageId,
+          scope: ds.scope, chatType: ds.chatType,
           ownerOpenId: ds.ownerOpenId ?? ds.session.ownerOpenId ?? '', active: ds.session.status === 'active' };
       },
       pluginEnabled: id => resolveEffectivePluginIds(getBot(cfg.larkAppId).config, readGlobalConfig()).includes(id)

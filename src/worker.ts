@@ -18647,7 +18647,8 @@ async function spawnCli(
   // MARKER inference is unaffected (the launcher-pid marker is still a valid
   // ancestor of an in-CLI `botmux send`, and the env fallback covers it too).
   const startWrapperRealPidResolve = (launcherPid: number): void => {
-    if (!cfg.wrapperCli || !cfg.wrapperCli.trim() || sandboxRequested || !claudeDataDir) return;
+    // Codex also needs the real execution root, even without a Claude JSONL bridge.
+    if (!cfg.wrapperCli || !cfg.wrapperCli.trim() || sandboxRequested || (!claudeDataDir && cfg.cliId !== 'codex')) return;
     const targetCliId = cfg.cliId as CliId;
     scheduleWrapperRealCliPid(launcherPid, {
       findRealPid: (lp) => findLaunchedCliPid(lp, targetCliId),

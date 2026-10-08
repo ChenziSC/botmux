@@ -3,6 +3,7 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { config } from '../config.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
+import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
 import { getBot } from '../bot-registry.js';
 import { normalizeUsageDisplay } from '../bot-registry.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
@@ -18,6 +19,7 @@ import {
 } from '../services/turn-reply-card.js';
 import { isSubstituteTurn } from './reply-target.js';
 import { isSilentScheduledTurn } from './silent-schedule-turns.js';
+import { privateReplyEnabled } from './private-reply.js';
 import { isDocNativeSession, larkTransportEnabled, sessionAnchorId, type DaemonSession } from './types.js';
 
 export type ReplyCardSender = (content: string, msgType: string, uuid: string) => Promise<string>;
@@ -36,8 +38,14 @@ export function replyCardSandboxBlocked(ds: DaemonSession): boolean {
   // outside the sandbox allow-list. Check before cached or persisted modes;
   // otherwise the daemon creates a card the sandboxed sender cannot update.
   // Live workers keep their frozen isolation state when bot settings change.
-  return (ds.session.sandbox ?? ds.initConfig?.sandbox ?? cfg.sandbox) === true
-    || ds.initConfig?.sandbox === true
+  // Tri-state with FROZEN PRECEDENCE preserved (the ?? chain): an explicit
+  // false/'off' on the session or initConfig means this session was created
+  // unsandboxed and must not retroactively block when the live bot toggle is
+  // later turned on. Only when no frozen value exists do we fall back to the
+  // live cfg. sandboxBoolValue accepts 'scratch' as well as oncall/true.
+  const frozenSandbox = ds.session.sandbox ?? ds.initConfig?.sandbox ?? cfg.sandbox;
+  return sandboxBoolValue(frozenSandbox)
+    || sandboxBoolValue(ds.initConfig?.sandbox)
     || (ds.initConfig?.readIsolation ?? cfg.readIsolation) === true
     || sandboxEnabled();
 }
@@ -45,7 +53,7 @@ export function replyCardSandboxBlocked(ds: DaemonSession): boolean {
 /** Freeze display mode per accepted turn. Unsupported entry points keep their
  * established delivery contract, including sandbox, API-only, v3, adoption and VC. */
 export function replyCardModeFor(ds: DaemonSession, turnId = ds.currentTurnId): TurnReplyCardMode {
-  if (!turnId || replyCardSandboxBlocked(ds)) return 'legacy';
+  if (!turnId || privateReplyEnabled(ds.session) || replyCardSandboxBlocked(ds)) return 'legacy';
   let snapshot = modes.get(ds);
   if (!snapshot) { snapshot = new Map(); modes.set(ds, snapshot); }
   const prior = snapshot.get(turnId);

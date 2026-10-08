@@ -14,6 +14,18 @@ describe('current host interaction context', () => {
     expect(JSON.stringify(result)).not.toMatch(/private|secret|forged/);
     expect(talk).toHaveBeenCalledWith('app1', 'oc_chat', 'ou_owner', 'group');
   });
+  it.each([
+    { chatId: 'doc:doc_token', scope: 'chat', rootMessageId: 'doc:doc_token' },
+    { chatId: 'doc:doc_token', scope: 'chat', rootMessageId: 'om_doc_anchor' },
+    ...['http_async_fixture', 'http_wait_fixture', 'headless_fixture'].map(chatId => ({ chatId, scope: 'chat' })),
+  ])('rejects virtual origins with a valid owner before asking canTalk: %j', origin => {
+    const canTalk = vi.fn(() => true);
+    expect(observeInteractionContext(request, { findActive: () => ({ ...session, ...origin }), canTalk }).status).toBe(409);
+    expect(canTalk).not.toHaveBeenCalled();
+  });
+  it.each(['chat', 'thread'])('preserves ordinary group %s queries', scope => {
+    expect(observeInteractionContext(request, { findActive: () => ({ ...session, scope }), canTalk: () => true }).status).toBe(200);
+  });
   it('does not let a snapshot grant future access', () => {
     let allowed = true; const deps = { findActive: () => session, canTalk: () => allowed };
     expect(observeInteractionContext(request, deps).body.context).toMatchObject({ canTalk: true });

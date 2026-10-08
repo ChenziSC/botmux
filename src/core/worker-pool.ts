@@ -13925,13 +13925,15 @@ function setupWorkerHandlers(
             resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
           );
           if (!ownsLifecycleMutation() || !stillOwnsFreshReadyPost()) break;
-          const postedCardId = await scopedReplyTo(
+          const readyPost = scopedReplyTo(
             postingDisplayAnchor,
             postingAppId,
             streamCardJson,
             'interactive',
             cardReplyTarget.turnId,
           );
+          trackStartingCardPublication(ds, readyPost);
+          const postedCardId = await readyPost;
           if (!ownsLifecycleMutation() || !stillOwnsFreshReadyPost()) {
             void deleteMessage(postingAppId, postedCardId).catch(() => { /* best-effort stale-card cleanup */ });
             restoreFreshReadyPrePostIdentityForRetirement();
@@ -14004,7 +14006,9 @@ function setupWorkerHandlers(
               localCliReadyAtBuild,
               sessionRuntimeDisplayName(ds, botCfg),
             );
-            const fallbackCardId = await scopedReply(cardJson, 'interactive', msg.turnId);
+            const fallbackPost = scopedReply(cardJson, 'interactive', msg.turnId);
+            trackStartingCardPublication(ds, fallbackPost);
+            const fallbackCardId = await fallbackPost;
             if (!ownsLifecycleMutation()) {
               void deleteMessage(ds.larkAppId, fallbackCardId).catch(() => { /* best-effort stale-card cleanup */ });
               break;
@@ -14615,13 +14619,15 @@ function setupWorkerHandlers(
             && retainsLarkStreamingCardTransport(ds);
           const cardReplyTarget = captureStreamingCardReplyTarget(ds, msg.turnId);
           if (!ownsLifecycleMutation() || !stillOwnsFreshScreenPost()) break;
-          scopedReplyTo(
+          const screenPost = scopedReplyTo(
             postingDisplayAnchor,
             postingAppId,
             cardJson,
             'interactive',
             cardReplyTarget.turnId,
-          )
+          );
+          trackStartingCardPublication(ds, screenPost);
+          screenPost
             .then(async msgId => {
               if (!ownsLifecycleMutation() || !stillOwnsFreshScreenPost()) {
                 void deleteMessage(postingAppId, msgId).catch(() => { /* best-effort stale-card cleanup */ });

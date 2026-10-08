@@ -1,3 +1,5 @@
+import { __testOnly_handleDocComment } from '../src/daemon.js';
+import { putDocSubscription, type DocSubscription } from '../src/services/doc-subs-store.js';
 /**
  * 普通消息处理链终态失败的可行动提示（ingress failure notice）。
  *
@@ -372,6 +374,43 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     ).rejects.toThrow('boom: new topic ingest');
 
     expect(repliedText()).toContain(expectedNotice());
+  });
+
+  it('clears the previous failed label before reforking for a new thread reply', async () => {
+    const anchor = 'om_thread_refork_failure';
+    const ds = seedThreadSession(anchor, 'seeded');
+    ds.failedIdleTurnId = 'om_old_failed';
+    ds.silentIdleTurnId = 'om_old_silent';
+    ds.completedIdleTurnId = 'om_old_completed';
+    await handleThreadReply(makeEventData('om_refork_new', 'new task', anchor), makeCtx(anchor, 'om_refork_new'));
+    expect(mocks.forkWorker).toHaveBeenCalled();
+    expect(ds.currentTurnId).toBe('om_refork_new');
+    expect(ds.failedIdleTurnId).toBeUndefined();
+    expect(ds.silentIdleTurnId).toBeUndefined();
+    expect(ds.completedIdleTurnId).toBeUndefined();
+  });
+
+  it('clears the previous failed label before reforking for a document comment', async () => {
+    const anchor = 'om_doc_refork_failure';
+    const ds = seedThreadSession(anchor, 'seeded');
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    ds.failedIdleTurnId = 'old-doc-failure';
+    ds.silentIdleTurnId = 'old-doc-silence';
+    ds.completedIdleTurnId = 'old-doc-completion';
+    const sub: DocSubscription = { fileToken: 'doc_refork_fixture', fileType: 'docx', sessionAnchor: anchor,
+      sessionId: ds.session.sessionId, scope: 'thread', chatId: CHAT, commentTriggerMode: 'mention-only', ownerOpenId: OWNER, createdAt: Date.now() };
+    putDocSubscription(mocks.dataDir, APP, sub);
+    mocks.forkWorker.mockImplementationOnce((target: any, _input: unknown, _options: unknown, admission: any) => {
+      target.worker = { killed: false, send: vi.fn() };
+      admission.onAdmission('accepted');
+      return target.worker;
+    });
+    expect(await __testOnly_handleDocComment({ larkAppId: APP, sub, commentId: 'comment_refork_new', text: 'new comment', authorOpenId: OWNER })).toBe(true);
+    expect(mocks.forkWorker).toHaveBeenCalled();
+    expect(ds.currentTurnId).toBe('comment_refork_new');
+    expect(ds.failedIdleTurnId).toBeUndefined();
+    expect(ds.silentIdleTurnId).toBeUndefined();
+    expect(ds.completedIdleTurnId).toBeUndefined();
   });
 
   it('successful delivery sends no failure notice', async () => {

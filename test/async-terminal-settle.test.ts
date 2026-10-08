@@ -81,6 +81,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 }));
 
 // Spy the durable store so we assert persistence intent without touching disk.
+const sessionReplyMock = vi.fn(async () => 'om_reply');
 const recordCompletedMock = vi.fn();
 const recordTerminalFailureStrictMock = vi.fn(() => 'written_failed');
 vi.mock('../src/services/async-trigger-store.js', async importOriginal => {
@@ -180,7 +181,7 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
     recordTerminalFailureStrictMock.mockClear();
     recordTerminalFailureStrictMock.mockReturnValue('written_failed');
     initWorkerPool({
-      sessionReply: vi.fn(async () => 'om_reply'),
+      sessionReply: sessionReplyMock,
       getSessionWorkingDir: () => '/tmp',
       getActiveCount: () => 1,
       closeSession: vi.fn(),
@@ -243,6 +244,27 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
     await Promise.resolve();
     expect(ds.asyncTriggerResults!.get('failure')?.status).toBe('failed');
     expect(recordCompletedMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps a failed result closed after its in-process terminal tombstone is evicted', async () => {
+    const ds = makeDs();
+    ds.asyncTriggerResults = new Map([['old-failure', { status: 'pending' } as any]]);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', terminalMsg('old-failure', { status: 'failed', errorCode: 'provider_unexpected_eof' }));
+    await vi.waitFor(() => expect(ds.asyncTriggerResults!.get('old-failure')?.status).toBe('failed'));
+    for (let index = 0; index < 256; index++) {
+      const turnId = `later-${index}`;
+      ds.asyncTriggerResults.set(turnId, { status: 'pending' } as any);
+      (ds.worker as any).emit('message', terminalMsg(turnId, { status: 'failed', errorCode: 'provider_unexpected_eof' }));
+    }
+    await vi.waitFor(() => expect(ds.settledHttpTerminalTurns?.size).toBe(256));
+    expect(ds.settledHttpTerminalTurns?.has('old-failure')).toBe(false);
+    (ds.worker as any).emit('message', { type: 'final_output', sessionId: ds.session.sessionId,
+      turnId: 'old-failure', lastUuid: 'late-after-eviction', content: 'must never become a successful answer' });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(ds.asyncTriggerResults.get('old-failure')).toMatchObject({ status: 'failed', terminalErrorCode: 'provider_unexpected_eof' });
+    expect(recordCompletedMock).not.toHaveBeenCalled();
+    expect(sessionReplyMock).not.toHaveBeenCalled();
   });
 
   it('retains failure semantics for an older worker without a structured failure code', async () => {

@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { transpileModule, ModuleKind, ScriptTarget } from 'typescript';
 import { describe, it, expect, vi } from 'vitest';
+import { cliAdapterBindsOwnershipPid } from '../src/adapters/cli/ownership-pid.js';
 import { findLaunchedCliPid, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
 
 // Manual scheduler so the retry loop runs deterministically without real timers.
@@ -36,6 +37,7 @@ function runWorkerWiring(late: boolean, options: {
     credentialOnlyBwrap: false, backend, cliPid: late ? null : 100, bridgeCliPid: undefined,
     lastSpawnOuterBwrapActive: false, lastSpawnTraexLauncherActive: false,
     process: { env: {} }, cliPidMarker: undefined,
+    cliAdapterBindsOwnershipPid,
     findLaunchedCliPid: vi.fn(() => 200), scheduleWrapperRealCliPid,
     publishLocalProcessAttestation: vi.fn(), observeCursorCliSessionId: vi.fn(), observeAntigravityCliSessionId: vi.fn(),
     setTimeout: scheduler.schedule, log: vi.fn(),
